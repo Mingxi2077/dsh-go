@@ -263,6 +263,12 @@ class DshProcess(
             } finally {
                 try {
                     if (p.isAlive) p.destroyForcibly()
+                    // Android's destroyForcibly() is SIGTERM, which proot ignores, and a guest stuck in
+                    // a busy loop never runs its SIGTERM handler: SIGKILL before waiting, or waitFor() never returns.
+                    if (!waitExit(p, 1000)) {
+                        listener.onLog("[dsh-app] still running after SIGTERM / SIGQUIT; killing its processes", "system")
+                        killStrays()
+                    }
                     p.waitFor()
                 } finally {
                     killStrays()

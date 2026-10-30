@@ -2,6 +2,7 @@ package io.github.ccch1mneyyy.dsh_app.runtime
 
 import io.github.ccch1mneyyy.dsh_app.i18n.AppStrings
 import io.github.ccch1mneyyy.dsh_app.R
+import android.app.ActivityManager
 import android.content.Context
 import io.github.ccch1mneyyy.dsh_app.performance.PerformancePolicy
 import android.content.Intent
@@ -86,6 +87,12 @@ class RuntimeController private constructor(private val app: Context) : DshProce
     @Volatile private var readyAt: Long? = null
     @Volatile private var healthyAt: Long? = null
 
+    /** Run generation stopped by the startup limit ([SafePolicy.STARTUP_LIMIT_MS]). */
+    @Volatile private var hungGen = -1
+
+    /** A notice raised before any sink subscribed (an interrupted run counted at process start). */
+    @Volatile private var pendingNotice: String? = null
+
     /** The main profile as it was when the current normal run booted; becomes the LKG when healthy. */
     @Volatile private var bootProfile: ProfileSnapshot? = null
     private val runTail = ArrayDeque<String>()
@@ -105,9 +112,17 @@ class RuntimeController private constructor(private val app: Context) : DshProce
             error = "manifest: ${e.message}"
             Phase.ERROR
         }
+        // Before LaunchStart / RootGate read the status: their auto start must see this strike.
+        if (phase == Phase.INSTALLED) checkInterruptedRun() else prefs.edit().remove(K_LAUNCH).apply()
     }
 
-    fun addSink(sink: EventSink) = synchronized(sinks) { sinks += sink }
+    fun addSink(sink: EventSink) {
+        synchronized(sinks) { sinks += sink }
+        pendingNotice?.let { text ->
+            pendingNotice = null
+            main.post { sink.emit(mapOf("type" to "notice", "text" to text)) }
+        }
+    }
     fun removeSink(sink: EventSink) = synchronized(sinks) { sinks -= sink }
 
     fun status(): Map<String, Any?> = mapOf(
@@ -190,7 +205,7 @@ class RuntimeController private constructor(private val app: Context) : DshProce
                 // A new runtime may well fix what failed before.
                 strikes = 0
                 failure = null
-                prefs.edit().putInt(K_STRIKES, 0).remove(K_FAILURE).apply()
+                prefs.edit().putInt(K_STRIKES, 0).remove(K_FAILURE).remove(K_LAUNCH).apply()
                 setPhase(Phase.INSTALLED)
                 main.post { onDone(null) }
             } catch (e: Throwable) {
@@ -320,6 +335,13 @@ class RuntimeController private constructor(private val app: Context) : DshProce
                     PhoneControl.get(app).onEngineStopped()
                     return@execute
                 }
+                // Written before the spawn and on disk before it: if the app process dies under this
+                // run, onExit never comes and the next process start counts it (checkInterruptedRun).
+                if (safe) {
+                    prefs.edit().remove(K_LAUNCH).commit()
+                } else {
+                    prefs.edit().putString(K_LAUNCH, JSONObject().put("pid", android.os.Process.myPid()).toString()).commit()
+                }
                 val p = DshProcess(app, manifest, installer.rootfs, this)
                 launched = p
                 lastLaunch = p.launchDiagnostics
@@ -330,7 +352,9 @@ class RuntimeController private constructor(private val app: Context) : DshProce
                     GuestSetup.writeAgentsMd(installer.rootfs, storage, phone, pendingVisualReplies, actualDirect)
                 }
                 if (phone) PhoneControl.get(app).launched(p.phoneMounted)
+                main.postDelayed({ onStartupLimit(p, gen) }, SafePolicy.STARTUP_LIMIT_MS)
             } catch (e: Throwable) {
+                prefs.edit().remove(K_LAUNCH).apply()
                 // Keep ownership while the old UID sweep runs, including a
                 // failure after spawning but before the waiter was allocated.
                 launched?.launchDiagnostics?.failed("startFailed")
@@ -367,6 +391,14 @@ class RuntimeController private constructor(private val app: Context) : DshProce
         }
         setPhase(Phase.STOPPING)
         p.stop()
+    }
+
+    /** A start that hangs (a plugin stuck while loading) would sit in STARTING forever: stop it as a failed start. */
+    @Synchronized private fun onStartupLimit(p: DshProcess, gen: Int) {
+        if (gen != runGen || process !== p || readyAt != null || phase != Phase.STARTING || stopGen >= gen) return
+        hungGen = gen
+        log("[dsh-app] DSH printed no login address within ${SafePolicy.STARTUP_LIMIT_MS / 1000}s; stopping it", "system")
+        p.stop(expected = false)
     }
 
     /** The default network changed: point the guest's resolv.conf at its DNS. */
@@ -423,7 +455,7 @@ class RuntimeController private constructor(private val app: Context) : DshProce
                 safeState = SafeState.OFF
                 safeReason = null
                 prefs.edit().remove(K_SAFE_STATE).remove(K_SAFE_REASON).remove(K_STRIKES).remove(K_FAILURE)
-                    .remove(K_MAIN_FAILURE).remove(K_MOVED).apply()
+                    .remove(K_MAIN_FAILURE).remove(K_MOVED).remove(K_LAUNCH).apply()
                 setPhase(Phase.NOT_INSTALLED)
                 main.post { onDone(null) }
             } catch (e: Throwable) {
@@ -583,7 +615,7 @@ class RuntimeController private constructor(private val app: Context) : DshProce
         strikes = 0
         failure = null
         mainFailure = null
-        prefs.edit().putInt(K_STRIKES, 0).remove(K_FAILURE).remove(K_MAIN_FAILURE).apply()
+        prefs.edit().putInt(K_STRIKES, 0).remove(K_FAILURE).remove(K_MAIN_FAILURE).remove(K_LAUNCH).apply()
         if (safeState != SafeState.OFF) setSafeState(SafeState.OFF, null)
         val booted = bootProfile
         worker.execute {
@@ -631,6 +663,76 @@ class RuntimeController private constructor(private val app: Context) : DshProce
             if (main) File(logDir, MAIN_FAILURE_LOG).writeText(text)
         } catch (_: Exception) {
         }
+    }
+
+    /**
+     * The previous app process died under a normal run that was not healthy yet, so [onExit] never
+     * ran for it (DSH dies with the app). Count it like a failed start when Android reports a crash,
+     * ANR or (before ready) a memory kill; otherwise reopening the app would boot the same plugin again.
+     */
+    private fun checkInterruptedRun() {
+        val text = prefs.getString(K_LAUNCH, null) ?: return
+        prefs.edit().remove(K_LAUNCH).apply()
+        try {
+            val launch = JSONObject(text)
+            val readyWall = if (launch.has("readyAt")) launch.optLong("readyAt") else null
+            val exit = lastExit(launch.optInt("pid"))
+            val reason = exit?.reason
+            val name = SafePolicy.exitReasonName(reason)
+            if (exit == null || !SafePolicy.appDeathCounts(reason, readyWall != null)) {
+                log("[dsh-app] the app process ended while DSH was ${if (readyWall == null) "starting" else "warming up"} ($name); not counted", "system")
+                return
+            }
+            val at = exit.timestamp
+            val tail = lastRunLog()
+            val parsed = CrashClassifier.classify(-1, null, 0L, at, tail, false)
+            val f = parsed.copy(
+                kind = when {
+                    parsed.kind == FailureKind.NO_SPACE -> FailureKind.NO_SPACE
+                    readyWall == null -> FailureKind.STARTUP_FAILED
+                    else -> FailureKind.CRASHED_EARLY
+                },
+                summary = "app process ended by Android ($name) " +
+                    if (readyWall == null) "before DSH was ready" else "${((at - readyWall).coerceAtLeast(0)) / 1000}s after DSH was ready",
+                recent = recentChanges(),
+                upSeconds = readyWall?.let { ((at - it).coerceAtLeast(0)) / 1000 },
+            )
+            val outcome = SafePolicy.onFailure(safeState, strikes, f, autoSafe(),
+                AppStrings.get(app, R.string.safe_probation_failed), AppStrings.get(app, R.string.safe_auto_started))
+            recordFailure(f, tail)
+            strikes = outcome.strikes
+            prefs.edit().putInt(K_STRIKES, strikes).apply()
+            if (outcome.state != safeState) setSafeState(outcome.state, outcome.reason ?: safeReason)
+            pendingNotice = outcome.notice
+            log("[dsh-app] the app process ended under DSH ($name); classified as ${f.kind.wire}; consecutive failures: $strikes", "system")
+        } catch (e: Exception) {
+            log("[dsh-app] could not check the previous run: ${e.message}", "system")
+        }
+    }
+
+    private class AppExit(val reason: Int, val timestamp: Long)
+
+    /** Android's record of how process [pid] of this app ended; null before Android 11 or when unknown. */
+    private fun lastExit(pid: Int): AppExit? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || pid <= 0 || pid == android.os.Process.myPid()) return null
+        return try {
+            app.getSystemService(ActivityManager::class.java)
+                ?.getHistoricalProcessExitReasons(app.packageName, pid, 1)
+                ?.firstOrNull()
+                ?.let { AppExit(it.reason, it.timestamp) }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Engine output of the last launch from dsh.log (already redacted), for the failure log and suspects. */
+    private fun lastRunLog(): List<String> = try {
+        val lines = logFile.readLines()
+        // Not anchored: the file copy may carry a timestamp prefix.
+        val start = lines.indexOfLast { it.contains("[dsh-app] launching ") }
+        (if (start < 0) lines else lines.subList(start, lines.size)).takeLast(CrashClassifier.TAIL_LINES)
+    } catch (_: Exception) {
+        emptyList()
     }
 
     private fun readFailure(key: String): RunFailure? = try {
@@ -699,7 +801,13 @@ class RuntimeController private constructor(private val app: Context) : DshProce
             // RUNNING lets the app change it; a later disk read would not describe this boot.
             bootProfile = LastKnownGood.bootedAtReady(bootProfile) { LastKnownGood.read(installer.rootfs) }
         }
-        if (!runSafe) healthyAt = System.currentTimeMillis() + SafePolicy.HEALTHY_MS
+        if (!runSafe) {
+            healthyAt = System.currentTimeMillis() + SafePolicy.HEALTHY_MS
+            prefs.edit().putString(
+                K_LAUNCH,
+                JSONObject().put("pid", android.os.Process.myPid()).put("readyAt", System.currentTimeMillis()).toString(),
+            ).apply()
+        }
         log("[dsh-app] DSH is listening at $baseUrl${if (runSafe) " (safe mode)" else ""}", "system")
         timeline.ready()?.let { log(it, "system") }
         setPhase(Phase.RUNNING)
@@ -714,6 +822,7 @@ class RuntimeController private constructor(private val app: Context) : DshProce
             source.launchDiagnostics.failed(if (source.startupError != null) "startFailed" else "exit:$code")
         }
         process = null
+        prefs.edit().remove(K_LAUNCH).apply()
         PhoneControl.get(app).onEngineStopped()
         baseUrl = null
         token = null
@@ -735,6 +844,10 @@ class RuntimeController private constructor(private val app: Context) : DshProce
         }
         val tail = synchronized(runTail) { runTail.toList() }
         var f = CrashClassifier.classify(code, readyAt, SystemClock.elapsedRealtime(), System.currentTimeMillis(), tail, runSafe, source.direct)
+        if (hungGen == runGen && f.kind == FailureKind.KILLED) {
+            // Our own stop at the startup limit, not an outside kill: a failed start, no auto restart.
+            f = f.copy(kind = FailureKind.STARTUP_FAILED, summary = "no login address within ${SafePolicy.STARTUP_LIMIT_MS / 1000}s; stopped by the app")
+        }
         if (SafePolicy.directLaunchFailed(f, source.direct)) {
             // Direct can't launch on this device: PRoot from now on with this runtime, no failure card,
             // no strike. A new runtime, or the user turning Direct on again, gives it another try.
@@ -844,6 +957,8 @@ class RuntimeController private constructor(private val app: Context) : DshProce
         private const val K_MAIN_FAILURE = "mainFailure"
         private const val K_MOVED = "movedAside"
         private const val K_AUTO_SAFE = "autoSafe"
+        /** `{pid, readyAt?}` of a normal run not yet healthy; see [checkInterruptedRun]. */
+        private const val K_LAUNCH = "normalRunInFlight"
         private const val K_DIRECT_ENGINE = "directEngine"
         /** Runtime version Direct failed to launch with (see [SafePolicy.directLaunchFailed]). */
         private const val K_DIRECT_FAILED = "directEngineFailedRuntime"

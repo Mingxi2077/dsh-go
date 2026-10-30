@@ -44,4 +44,26 @@ class SafePolicyTest {
         assertTrue(second.restartSafe)
         assertFalse(SafePolicy.onFailure(SafeState.OFF, 1, failure(), false).restartSafe)
     }
+
+    @Test fun appDeathCountsOnlyForCrashesAndEarlyResourceKills() {
+        for (ready in listOf(false, true)) {
+            assertTrue(SafePolicy.appDeathCounts(SafePolicy.EXIT_CRASH, ready))
+            assertTrue(SafePolicy.appDeathCounts(SafePolicy.EXIT_CRASH_NATIVE, ready))
+            assertTrue(SafePolicy.appDeathCounts(SafePolicy.EXIT_ANR, ready))
+            // Unknown (before Android 11), exit self, signaled, user requested / stopped, other.
+            for (reason in listOf(null, 0, 1, 2, 10, 11, 13)) assertFalse(SafePolicy.appDeathCounts(reason, ready))
+        }
+        assertTrue(SafePolicy.appDeathCounts(SafePolicy.EXIT_LOW_MEMORY, ready = false))
+        assertFalse(SafePolicy.appDeathCounts(SafePolicy.EXIT_LOW_MEMORY, ready = true))
+        assertTrue(SafePolicy.appDeathCounts(SafePolicy.EXIT_EXCESSIVE_RESOURCE_USAGE, ready = false))
+        assertFalse(SafePolicy.appDeathCounts(SafePolicy.EXIT_EXCESSIVE_RESOURCE_USAGE, ready = true))
+    }
+
+    @Test fun twoCountedAppDeathsEnterSafeMode() {
+        // checkInterruptedRun feeds an app death through the same policy as an observed exit.
+        val first = SafePolicy.onFailure(SafeState.OFF, 0, failure(FailureKind.STARTUP_FAILED), true)
+        val second = SafePolicy.onFailure(first.state, first.strikes, failure(FailureKind.CRASHED_EARLY), true)
+        assertEquals(SafeState.ON, second.state)
+        assertEquals(SafePolicy.REASON_AUTO, second.reason)
+    }
 }

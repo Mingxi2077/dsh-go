@@ -2,8 +2,10 @@ package io.github.ccch1mneyyy.dsh_app.runtime
 
 /**
  * Why the local DSH stopped when nobody asked it to.
- * Only DSH's own fatal markers count as a plugin/config problem; an exit without one
- * (low-memory kill, battery saver, Android's child-process limits) never does.
+ * Only DSH's own fatal markers (and a V8 heap abort near startup) count as a plugin/config problem;
+ * an exit without one (low-memory kill, battery saver, Android's child-process limits) never does.
+ * Two more counted cases come from the controller: a start that never reports ready, and the app
+ * process dying under a normal run that was not yet healthy (see [SafePolicy.appDeathCounts]).
  */
 enum class FailureKind(val wire: String) {
     /** The shell/loader or direct preload could not start DSH before ready. */
@@ -80,6 +82,9 @@ object CrashClassifier {
         Regex("^[A-Za-z]*Error: dsh: "),
         Regex("^dsh: profile startup and cleanup failed"),
     )
+    // V8 aborts on its own: no `dsh:` marker. Counted only during startup or the early window, where a
+    // plugin's load is the likely cause; later it may be a long session, so it stays an uncounted kill.
+    private val HEAP_OOM = Regex("^FATAL ERROR: .*JavaScript heap out of memory")
     private val NO_SPACE = Regex("ENOSPC|No space left on device")
     // Fixed executable and shell prefix: a plugin's generic error is not launch evidence.
     private val EXEC_FAILED = Regex(
@@ -124,7 +129,8 @@ object CrashClassifier {
         safeMode: Boolean,
         directEngine: Boolean = false,
     ): RunFailure {
-        val fatal = tail.firstOrNull(::isFatal)
+        val early = readyAt == null || now - readyAt <= EARLY_WINDOW_MS
+        val fatal = tail.firstOrNull(::isFatal) ?: (if (early) tail.firstOrNull { HEAP_OOM.containsMatchIn(it) } else null)
         val launch = if (readyAt == null && exitCode != 0) tail.firstOrNull {
             EXEC_FAILED.matches(it) || (directEngine && DIRECT_FAILED.any { pattern -> pattern.matches(it) })
         } ?: (if (directEngine && exitCode == SIGSYS_EXIT) SECCOMP_KILLED else null) else null

@@ -79,6 +79,38 @@ object SafePolicy {
     fun directLaunchFailed(failure: RunFailure, direct: Boolean): Boolean =
         direct && failure.kind == FailureKind.LAUNCH_FAILED
 
+    /** A start that has not printed its login address by then is stopped and counted. */
+    const val STARTUP_LIMIT_MS = 300_000L
+
+    // `ApplicationExitInfo.REASON_*` (API 30), copied so this stays JVM-only.
+    const val EXIT_LOW_MEMORY = 3
+    const val EXIT_CRASH = 4
+    const val EXIT_CRASH_NATIVE = 5
+    const val EXIT_ANR = 6
+    const val EXIT_EXCESSIVE_RESOURCE_USAGE = 9
+
+    /**
+     * Whether the app process ending under a normal run that was not yet healthy counts as a
+     * failure of that run. A crash or ANR counts until healthy; memory / resource kills only before
+     * ready (later they say more about the phone than the profile). Swipes, force stops, updates
+     * and unknown reasons never count, nor does anything when Android cannot tell ([reason] null).
+     */
+    fun appDeathCounts(reason: Int?, ready: Boolean): Boolean = when (reason) {
+        EXIT_CRASH, EXIT_CRASH_NATIVE, EXIT_ANR -> true
+        EXIT_LOW_MEMORY, EXIT_EXCESSIVE_RESOURCE_USAGE -> !ready
+        else -> false
+    }
+
+    fun exitReasonName(reason: Int?): String = when (reason) {
+        null -> "unknown"
+        EXIT_LOW_MEMORY -> "low memory"
+        EXIT_CRASH -> "crash"
+        EXIT_CRASH_NATIVE -> "native crash"
+        EXIT_ANR -> "not responding"
+        EXIT_EXCESSIVE_RESOURCE_USAGE -> "excessive resource use"
+        else -> "reason $reason"
+    }
+
     const val REASON_MANUAL = "manual"
     const val REASON_AUTO = "auto"
     const val REASON_PROBATION = "probation"

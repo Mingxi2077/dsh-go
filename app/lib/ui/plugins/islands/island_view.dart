@@ -5,9 +5,9 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import '../../../browser/browser_links.dart';
 import '../../../l10n/l10n.dart';
 import '../../../plugins/seams/seat_models.dart';
 import '../../common/smooth_size.dart';
@@ -242,7 +242,7 @@ class _IslandViewState extends ConsumerState<IslandView> {
     switch (message) {
       case IslandLink(:final url):
         if (await _confirmLink(context, url)) {
-          await launchUrl(url, mode: LaunchMode.externalApplication).catchError((_) => false);
+          await BrowserLinks.open(url).catchError((_) => false);
         }
       case IslandOpenSession(:final sessionId):
         await widget.onOpenSession?.call(sessionId);

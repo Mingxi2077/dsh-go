@@ -3,8 +3,8 @@ import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../browser/browser_links.dart';
 import '../l10n/l10n.dart';
 import '../remote/link_status.dart';
 import '../remote/relay/dsh_remote_backend.dart';
@@ -390,17 +390,14 @@ final relayBackendProvider = Provider<RelayBackend>((ref) {
   return backend;
 });
 
-/// Opens the login page: a Custom Tab on Android (Google sign-in refuses
-/// WebViews), the browser elsewhere.
+/// Opens a temporary authorization page; a system-browser action remains
+/// available for providers that reject embedded browsers.
 typedef UrlOpener = Future<bool> Function(Uri url);
 
 final urlOpenerProvider = Provider<UrlOpener>(
-  (ref) => (url) async {
-    try {
-      return await launchUrl(url, mode: LaunchMode.inAppBrowserView);
-    } catch (_) {
-      return launchUrl(url, mode: LaunchMode.externalApplication);
-    }
+  (ref) => (url) {
+    final request = ref.read(relayAccountProvider.notifier)._browserAuthorization(url);
+    return request == null ? BrowserLinks.open(url) : BrowserLinks.authorize(request);
   },
 );
 
@@ -472,6 +469,7 @@ class RelayAccountState {
 /// DSH Remote account: login via browser + polling, host list with presence.
 class RelayAccountController extends AsyncNotifier<RelayAccountState> {
   RelayLoginSession? _login;
+  String? _loginProvider;
   int _epoch = 0;
 
   RelayBackend get _backend => ref.read(relayBackendProvider);
@@ -506,6 +504,7 @@ class RelayAccountController extends AsyncNotifier<RelayAccountState> {
     _epoch++;
     final session = _login;
     _login = null;
+    _loginProvider = null;
     session?.cancel();
   }
 
@@ -532,11 +531,12 @@ class RelayAccountController extends AsyncNotifier<RelayAccountState> {
   Future<void> login({String? providerId}) async {
     if (_now.loggingIn) return;
     final backend = _backend;
+    final selectedProvider = providerId ?? _now.providers.firstOrNull?.id;
     final epoch = ++_epoch;
     ref.read(readListCredentialEpochProvider.notifier).advance();
     state = AsyncData(_now.copyWith(loggingIn: true, error: () => null));
     try {
-      final session = await backend.login(providerId: providerId);
+      final session = await backend.login(providerId: selectedProvider);
       // Cancellation may finish this future before the browser returns, or
       // while an obsolete login is still creating its server session.
       session.completed.ignore();
@@ -545,6 +545,7 @@ class RelayAccountController extends AsyncNotifier<RelayAccountState> {
         return;
       }
       _login = session;
+      _loginProvider = selectedProvider;
       state = AsyncData(_now.copyWith(loginUrl: () => session.loginUrl));
       final opened = await ref.read(urlOpenerProvider)(session.loginUrl);
       if (!_isCurrent(epoch, backend)) return;
@@ -572,8 +573,28 @@ class RelayAccountController extends AsyncNotifier<RelayAccountState> {
         ),
       );
     } finally {
-      if (_isCurrent(epoch, backend)) _login = null;
+      if (_isCurrent(epoch, backend)) {
+        _login = null;
+        _loginProvider = null;
+      }
     }
+  }
+
+  BrowserAuthorization? _browserAuthorization(Uri url) {
+    final session = _login;
+    final epoch = _epoch;
+    final backend = _backend;
+    if (session == null || session.loginUrl != url || !_now.loggingIn) return null;
+    return BrowserAuthorization(
+      id: session,
+      url: url,
+      preferSystem: _loginProvider?.toLowerCase() == 'google',
+      completed: session.completed.then<void>((_) {}, onError: (Object _, StackTrace _) {}),
+      isCurrent: () => ref.mounted && _isCurrent(epoch, backend) && identical(_login, session) && _now.loggingIn,
+      cancel: () async {
+        if (ref.mounted && _isCurrent(epoch, backend) && identical(_login, session)) cancelLogin();
+      },
+    );
   }
 
   void cancelLogin() {

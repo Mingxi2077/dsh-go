@@ -76,7 +76,7 @@ void main() {
     await pumpFrames(tester);
     final container = ProviderScope.containerOf(tester.element(find.byType(ChatScreen)));
     final image = DraftAttachment.sniff('图片.png', tinyPng);
-    container.read(draftStoreProvider.notifier).save('b', 'B 草稿', [image]);
+    container.read(draftStoreProvider.notifier).save(localDraft('b'), 'B 草稿', [image]);
     await tester.enterText(find.byType(TextField), 'A 草稿');
     container.read(currentSessionProvider.notifier).select('b');
     await tester.pump();

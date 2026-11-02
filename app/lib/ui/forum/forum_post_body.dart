@@ -7,8 +7,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../../forum/forum_share.dart';
 import '../../forum/forum_state.dart';
@@ -23,11 +23,11 @@ import '../theme/app_icons.dart';
 import '../theme/theme.dart';
 import 'forum_widgets.dart';
 
-/// Opens a web address outside the app (http/https only).
+/// Opens a web address through the shared browser entry (http/https only).
 Future<void> openForumLink(Uri url) async {
   if (url.scheme != 'http' && url.scheme != 'https') return;
   try {
-    await launchUrl(url, mode: LaunchMode.externalApplication);
+    await BrowserLinks.open(url);
   } catch (_) {
     // No browser: nothing to do.
   }

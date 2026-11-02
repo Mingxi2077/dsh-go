@@ -3,8 +3,8 @@ import 'dart:async';
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../../plugins/native/native_state.dart';
 import '../../plugins/seams/seams.dart' show PluginSeat, SeatPlacement, Slots, seatPlanProvider;
@@ -56,7 +56,7 @@ Future<void> _openLink(BuildContext context, String url) async {
   final l10n = context.l10n;
   final messenger = ScaffoldMessenger.maybeOf(context);
   final uri = Uri.tryParse(url);
-  final ok = uri != null && await launchUrl(uri, mode: LaunchMode.externalApplication);
+  final ok = uri != null && await BrowserLinks.open(uri);
   if (!ok) {
     messenger?.showSnackBar(SnackBar(content: Text(l10n.hubPluginBrowserFailed(uri?.host ?? url))));
   }
@@ -402,8 +402,7 @@ class BundleSheet extends ConsumerWidget {
     final market = shareable ? ref.watch(marketCatalogProvider.select((c) => c.value?.byName[bundle.name])) : null;
     // The official market's entry: a newer pinned version, or this one withdrawn.
     final listed = gone ? null : ref.watch(officialMarketProvider.select((c) => c.value?.byName[bundle.name]));
-    final update =
-        listed != null && marketInstallStatus(listed.plugin, [bundle]) == MarketInstallStatus.updateAvailable
+    final update = listed != null && marketInstallStatus(listed.plugin, [bundle]) == MarketInstallStatus.updateAvailable
         ? listed
         : null;
     final blocked = listed != null && marketBlockedInstall(listed, bundle);
@@ -416,8 +415,7 @@ class BundleSheet extends ConsumerWidget {
         SheetHeader(
           title ?? l10n.hubPluginDetails,
           actions: [
-            if (shareable)
-              _ShareKey(onPressed: () => unawaited(shareInstalledPlugin(context, bundle, card: market))),
+            if (shareable) _ShareKey(onPressed: () => unawaited(shareInstalledPlugin(context, bundle, card: market))),
           ],
         ),
         Expanded(

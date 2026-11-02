@@ -726,5 +726,25 @@
         "type": "String"
       }
     }
+  },
+  "chatLegacyDrafts": "恢复旧草稿",
+  "chatLegacyDraftsHint": "旧版保存的草稿，不属于任何主机",
+  "chatLegacyDraftNew": "旧版的新对话",
+  "chatLegacyDraftChat": "旧版对话的草稿",
+  "chatLegacyDraftTarget": "放在这个对话已有内容的后面，不会发送",
+  "chatLegacyDraftAppend": "加入当前草稿",
+  "chatLegacyDraftRestored": "已加入草稿",
+  "chatLegacyDraftStale": "对话已经切换，没有恢复",
+  "chatWebQuote": "网页引用",
+  "chatWebQuoteSelection": "选中内容",
+  "chatWebQuotePage": "页面内容",
+  "chatWebQuotePreview": "网页引用预览",
+  "chatRemoveWebQuote": "移除网页引用「{title}」",
+  "@chatRemoveWebQuote": {
+    "placeholders": {
+      "title": {
+        "type": "String"
+      }
+    }
   }
 }

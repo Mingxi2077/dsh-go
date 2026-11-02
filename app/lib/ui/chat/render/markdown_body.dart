@@ -6,11 +6,13 @@ import 'package:dsh_client/dsh_client.dart' show DshRemoteException;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../../../browser/browser_links.dart';
 import '../../../l10n/l10n.dart';
 import '../../../links/page_links.dart' show openReplyPageLink;
+import '../../browser/browser_entry.dart' show openReplyBrowserLink;
 import '../../../state/artifacts.dart';
+import '../../../state/hosts_state.dart' show activeHostProvider;
 import '../../../state/table_tint_state.dart';
 import '../../../state/workspace_state.dart';
 import '../../common/edge_fade.dart';
@@ -218,12 +220,15 @@ class MarkdownBody extends StatefulWidget {
     if (!context.mounted) return;
     // `dshgo://open/<page>`: the guide's links to the app's own pages.
     if (openReplyPageLink(context, url)) return;
+    final scope = MarkdownImageScope.maybeOf(context);
     final uri = linkToOpen(url);
     if (uri != null) {
-      launchUrl(uri, mode: LaunchMode.externalApplication);
+      // Preserve a reply's conversation; detached text opens without borrowing
+      // the currently selected conversation. App routes were handled above.
+      if (openReplyBrowserLink(context, url, sessionId: scope?.sessionId)) return;
+      unawaited(BrowserLinks.open(uri));
       return;
     }
-    final scope = MarkdownImageScope.maybeOf(context);
     // `[官网](example.com)`: a site written without https, unless the
     // workspace really has a file by that name.
     final site = bareDomainLink(url);
@@ -254,8 +259,15 @@ class MarkdownBody extends StatefulWidget {
   /// too: its preview says so); otherwise [site], after the browser prompt.
   static Future<void> _openFileOrSite(BuildContext context, String sessionId, String path, Uri site) async {
     WorkspaceSource? source;
+    bool Function() stillCurrent = () => context.mounted;
     try {
-      source = ProviderScope.containerOf(context, listen: false).read(workspaceSourceProvider(sessionId));
+      final container = ProviderScope.containerOf(context, listen: false);
+      final host = container.read(activeHostProvider);
+      stillCurrent = () =>
+          context.mounted &&
+          container.read(activeHostProvider) == host &&
+          MarkdownImageScope.maybeOf(context)?.sessionId == sessionId;
+      source = container.read(workspaceSourceProvider(sessionId));
     } catch (_) {
       // No provider scope above this text: nothing to look the file up in.
     }
@@ -270,11 +282,18 @@ class MarkdownBody extends StatefulWidget {
         // Offline or the Host failed: the site is what the link most likely meant.
       }
     }
-    if (!context.mounted) return;
+    if (!context.mounted || !stillCurrent()) return;
     if (file) {
       _preview(context, sessionId, path);
     } else {
-      await openConfirmedLink(context, site);
+      await openConfirmedLink(
+        context,
+        site,
+        stillCurrent: stillCurrent,
+        opener: (url) async {
+          if (!openReplyBrowserLink(context, url.toString(), sessionId: sessionId)) await BrowserLinks.open(url);
+        },
+      );
     }
   }
 
@@ -610,10 +629,8 @@ class _MarkdownBodyState extends State<MarkdownBody> {
       unOrderedListBuilder: MarkdownLists.unordered,
     );
 
-    Widget withTint(TableTint tint) => GptMarkdownTheme(
-      gptThemeData: MarkdownBody._themeFor(theme, widget.secondary, l10n, tint),
-      child: text,
-    );
+    Widget withTint(TableTint tint) =>
+        GptMarkdownTheme(gptThemeData: MarkdownBody._themeFor(theme, widget.secondary, l10n, tint), child: text);
 
     // Golden 和几何测试不套 ProviderScope:那时按默认那一档画。
     Widget markdown = _scoped

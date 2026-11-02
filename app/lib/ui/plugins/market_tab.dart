@@ -2,8 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../../state/plugins_state.dart';
 import '../common/app_sheet.dart' show groupTitleStyle;
@@ -287,7 +287,7 @@ class _SubmitPlugin extends StatelessWidget {
     final l10n = context.l10n;
     final messenger = ScaffoldMessenger.maybeOf(context);
     final uri = Uri.parse(marketSubmitUrl);
-    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+    if (!await BrowserLinks.open(uri)) {
       messenger?.showSnackBar(SnackBar(content: Text(l10n.hubPluginBrowserFailed(uri.host))));
     }
   }

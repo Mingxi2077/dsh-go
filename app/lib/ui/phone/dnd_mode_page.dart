@@ -3,8 +3,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../../state/phone_state.dart';
 import '../common/brief_notice.dart';
@@ -149,7 +149,7 @@ class _PhoneDndPageState extends ConsumerState<PhoneDndPage> {
   Future<void> _openShizukuSite() async {
     var ok = false;
     try {
-      ok = await launchUrl(Uri.parse(shizukuDownloadUrl), mode: LaunchMode.externalApplication);
+      ok = await BrowserLinks.open(Uri.parse(shizukuDownloadUrl));
     } catch (_) {}
     if (!ok && mounted) {
       _toast(context.l10n.phoneDndBrowserFailed(shizukuDownloadUrl));

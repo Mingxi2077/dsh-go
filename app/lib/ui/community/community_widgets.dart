@@ -6,8 +6,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../../state/community_state.dart';
 import '../../state/plugins_state.dart';
@@ -27,14 +27,14 @@ abstract final class CommunityHues {
   static const forum = 2;
 }
 
-/// Opens [url] outside the app; false when nothing could.
+/// Opens [url] through the shared browser entry; false when nothing could.
 Future<bool> openCommunityLink(BuildContext context, String url) async {
   final l10n = context.l10n;
   final messenger = ScaffoldMessenger.maybeOf(context);
   final uri = Uri.tryParse(url);
   var ok = false;
   try {
-    ok = uri != null && await launchUrl(uri, mode: LaunchMode.externalApplication);
+    ok = uri != null && await BrowserLinks.open(uri);
   } catch (_) {}
   if (!ok) messenger?.showSnackBar(SnackBar(content: Text(l10n.botsLinkOpenFailed(uri?.host ?? l10n.botsLink))));
   return ok;

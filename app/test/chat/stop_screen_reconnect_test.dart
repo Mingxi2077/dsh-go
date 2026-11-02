@@ -101,7 +101,7 @@ void main() {
       result.complete(false);
       await pumpFrames(tester);
       expect(_composer(tester), replace ? isEmpty : _text);
-      if (replace) expect(container.read(draftStoreProvider).drafts['same-id']?.text, isNot(_text));
+      if (replace) expect(container.read(draftStoreProvider).drafts[localDraft('same-id')]?.text, isNot(_text));
       await _dispose(tester);
     });
   }
@@ -128,7 +128,7 @@ void main() {
       chat.lost.complete([_prompt]);
       await pumpFrames(tester);
       expect(_composer(tester), isEmpty);
-      expect(container.read(draftStoreProvider).drafts['same-id']?.text, isNot(_text));
+      expect(container.read(draftStoreProvider).drafts[localDraft('same-id')]?.text, isNot(_text));
       await _dispose(tester);
     });
   }

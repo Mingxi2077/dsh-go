@@ -64,9 +64,10 @@ String quoteLine(String quote) => quote
     .replaceAll(RegExp(r'\s+'), ' ')
     .trim();
 
-/// The passage waiting above each conversation's composer, by draft key (the
-/// session id; `new` for the new-chat screen). Kept for the app run, like
-/// draft attachments.
+/// The passage waiting above each conversation's composer, keyed by
+/// `draftStorageKey(hostKey: ..., sessionId: ...)` from draft_store.dart, just like drafts.
+/// Callers use the same scoped key for reads, set, clear and both ends of move.
+/// Kept for the app run, like draft attachments; bare session ids are not scoped.
 class ComposerQuotes extends Notifier<Map<String, String>> {
   @override
   Map<String, String> build() => const {};

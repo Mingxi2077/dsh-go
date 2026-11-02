@@ -8,6 +8,8 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
+import android.view.MotionEvent
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterEngineCache
@@ -19,6 +21,7 @@ import io.github.ccch1mneyyy.dsh_app.launch.LaunchThemeSync
 import io.github.ccch1mneyyy.dsh_app.links.LinksPlugin
 import io.github.ccch1mneyyy.dsh_app.notify.NotifyPlugin
 import io.github.ccch1mneyyy.dsh_app.phone.PhonePlugin
+import io.github.ccch1mneyyy.dsh_app.performance.RefreshRateController
 import io.github.ccch1mneyyy.dsh_app.runtime.LaunchStart
 import io.github.ccch1mneyyy.dsh_app.runtime.RuntimePlugin
 import io.github.ccch1mneyyy.dsh_app.share.SharePlugin
@@ -30,6 +33,7 @@ import java.util.TimeZone
 
 class MainActivity : FlutterActivity() {
     private var appChannel: MethodChannel? = null
+    private val refreshRate by lazy { RefreshRateController(this, refreshMode) }
 
     /**
      * One engine per process, outliving this activity: swiping the app away from recents keeps
@@ -59,6 +63,8 @@ class MainActivity : FlutterActivity() {
             engine.plugins.add(io.github.ccch1mneyyy.dsh_app.nativemedia.NativeMediaPlugin())
             engine.plugins.add(io.github.ccch1mneyyy.dsh_app.nativefiles.NativeFilesPlugin())
             engine.plugins.add(io.github.ccch1mneyyy.dsh_app.web.WebFilesPlugin())
+            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.web.BrowserSelectionPlugin())
+            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.web.BrowserDownloadsPlugin())
             engine.plugins.add(io.github.ccch1mneyyy.dsh_app.launch.LaunchPlugin())
             engine.plugins.add(io.github.ccch1mneyyy.dsh_app.launch.LaunchClipPlugin())
             engine.plugins.add(io.github.ccch1mneyyy.dsh_app.icons.PictureShortcutPlugin())
@@ -108,49 +114,44 @@ class MainActivity : FlutterActivity() {
         super.onConfigurationChanged(newConfig)
         // Light / dark: a custom launch screen's plain splash colour (the page's) may change with it.
         LaunchThemeSync.sync(this)
+        refreshRate.apply()
     }
 
     override fun onResume() {
         super.onResume()
         inForeground = true
-        // Coming back counts as activity: the first frames may not be scheduled yet.
-        framesActive = true
-        applyRefreshRate()
+        refreshRate.resume()
     }
 
-    /**
-     * The window's preferred display mode, from the in-app refresh-rate setting.
-     *
-     * `preferredDisplayModeId = 0` means "no preference": the system picks, and its own
-     * refresh-rate setting and power saving still decide. Apps that never ask stay at 60 or
-     * 90 Hz on some 120 Hz phones (OriginOS, HyperOS, ColorOS); once an app does ask, those
-     * systems show their per-app switch as an in-app setting – hence the setting in 设置 › 性能.
-     *
-     * auto: fastest mode while Flutter is producing frames, released after the last one.
-     * max: pinned. system: never declared.
-     */
-    private fun applyRefreshRate() {
-        @Suppress("DEPRECATION")
-        val display = windowManager.defaultDisplay
-        val now = display.mode
-        val fastest = display.supportedModes
-            .filter { it.physicalWidth == now.physicalWidth && it.physicalHeight == now.physicalHeight }
-            .maxByOrNull { it.refreshRate }
-        val want = when (refreshMode) {
-            "max" -> fastest
-            "system" -> null
-            else -> if (framesActive) fastest else null
-        }
-        val target = want?.modeId ?: 0
-        if (window.attributes.preferredDisplayModeId == target) return
-        window.attributes = window.attributes.apply { preferredDisplayModeId = target }
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        refreshRate.touch(event)
+        return super.dispatchTouchEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_SCROLL) refreshRate.nativeActivity()
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) refreshRate.nativeActivity()
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onPause() {
         inForeground = false
-        framesActive = false
-        applyRefreshRate()
+        refreshRate.pause()
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        refreshRate.dispose()
+        super.onDestroy()
+    }
+
+    override fun onActionModeStarted(mode: android.view.ActionMode) {
+        super.onActionModeStarted(mode)
+        io.github.ccch1mneyyy.dsh_app.web.BrowserSelectionPlugin.onActionModeStarted(mode)
     }
 
     /** Per activity: the handler acts on this activity, so it goes with it (see [cleanUpFlutterEngine]). */
@@ -167,14 +168,14 @@ class MainActivity : FlutterActivity() {
                     when (call.argument<String>("mode")) {
                         "auto", "max", "system" -> refreshMode = call.argument<String>("mode")!!
                     }
-                    applyRefreshRate()
+                    refreshRate.setMode(refreshMode)
                     result.success(null)
                 }
                 "setFrameActive" -> {
-                    framesActive = call.argument<Boolean>("active") ?: framesActive
-                    applyRefreshRate()
+                    call.argument<Boolean>("active")?.let { refreshRate.setFlutterActive(it) }
                     result.success(null)
                 }
+                "getRefreshRateDiagnostics" -> result.success(refreshRate.diagnostics())
                 "bringToFront" -> {
                     startActivity(
                         Intent(this, MainActivity::class.java)
@@ -197,14 +198,11 @@ class MainActivity : FlutterActivity() {
     // (Android 12's default for launcher roots): coming back finds it as it was.
     override fun popSystemNavigator(): Boolean = moveTaskToBack(true)
 
-    /** 设置 › 性能 › 刷新率; the Flutter side owns the stored choice. */
-    private var refreshMode = "auto"
-
-    /** Flutter produced a frame recently (see RefreshRateService): auto mode follows it. */
-    private var framesActive = true
-
     companion object {
         private const val ENGINE_ID = "dsh-main"
+
+        /** Preserve the engine's choice across activity recreation; Dart owns persistence. */
+        private var refreshMode = "auto"
 
         /** The app is on screen (resumed). */
         @Volatile var inForeground = false

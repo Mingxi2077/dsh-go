@@ -13,6 +13,7 @@ import 'hosts_state.dart';
 import 'notify_state.dart' show appForegroundProvider;
 import 'run_pulse.dart';
 import 'sessions_state.dart';
+import 'web_quote.dart';
 
 /// How a message sent while a turn is running reaches the agent.
 enum SendMode {
@@ -91,6 +92,7 @@ class PendingPrompt {
     this.resendable = true,
     this.sourceKind = 'user',
     this.sourceForm,
+    this.webComposition,
   });
 
   final String requestId;
@@ -116,6 +118,7 @@ class PendingPrompt {
   /// retain their existing pending behavior.
   final String sourceKind;
   final String? sourceForm;
+  final WebQuoteComposition? webComposition;
 
   bool get isBackgroundTask => sourceKind == 'tool-jobs';
 
@@ -140,6 +143,7 @@ class PendingPrompt {
     resendable: resendable,
     sourceKind: sourceKind,
     sourceForm: sourceForm,
+    webComposition: webComposition,
   );
 
   PendingPrompt placed(String? inboxId, InboxSlot? slot, {MessageSource? source}) => PendingPrompt(
@@ -152,6 +156,7 @@ class PendingPrompt {
     slot: slot,
     resendable: resendable,
     sourceKind: source?.kind ?? sourceKind,
+    webComposition: webComposition,
     sourceForm: source == null
         ? sourceForm
         : switch (source.raw['form']) {
@@ -1113,7 +1118,12 @@ class ChatController extends Notifier<ChatState> {
   ///
   /// While a turn runs, [mode] picks how the message reaches the agent; when
   /// idle every mode just starts a turn.
-  Future<bool> send(String text, {List<DraftAttachment> attachments = const [], SendMode mode = SendMode.now}) async {
+  Future<bool> send(
+    String text, {
+    List<DraftAttachment> attachments = const [],
+    SendMode mode = SendMode.now,
+    WebQuoteComposition? webComposition,
+  }) async {
     final client = _client;
     final trimmed = text.trim();
     if (client == null || (trimmed.isEmpty && attachments.isEmpty)) {
@@ -1135,6 +1145,7 @@ class ChatController extends Notifier<ChatState> {
         time: DateTime.now(),
         mode: effective,
         attachments: List.unmodifiable(attachments),
+        webComposition: webComposition,
       ),
     ]);
     state = state.copyWith(
@@ -1353,11 +1364,7 @@ class ChatController extends Notifier<ChatState> {
   /// could not be put back (the screen returns it to the composer).
   Future<List<PendingPrompt>> sendNow(PendingPrompt prompt) async {
     final client = _client;
-    if (client == null ||
-        !_canControl ||
-        prompt.isAutomatic ||
-        prompt.inboxId == null ||
-        !prompt.resendable) {
+    if (client == null || !_canControl || prompt.isAutomatic || prompt.inboxId == null || !prompt.resendable) {
       return const [];
     }
     final operation = _ChatOperation(ref, client, _syncScope);
@@ -1396,6 +1403,8 @@ class ChatController extends Notifier<ChatState> {
           mode: prompt.mode,
           sourceKind: prompt.sourceKind,
           sourceForm: prompt.sourceForm,
+          attachments: prompt.attachments,
+          webComposition: prompt.webComposition,
         ),
       ]);
     }

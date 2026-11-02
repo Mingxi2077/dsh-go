@@ -5,8 +5,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../../state/balance_state.dart';
 import '../common/app_sheet.dart';
@@ -24,10 +24,10 @@ String formatThreshold(double value, [String symbol = '¥']) {
   return '$symbol$text';
 }
 
-/// 打开 DeepSeek 开放平台的充值页(外部浏览器)。
+/// 通过统一网页入口打开 DeepSeek 开放平台的充值页。
 Future<void> openTopUp() async {
   try {
-    await launchUrl(Uri.parse(deepSeekTopUpUrl), mode: LaunchMode.externalApplication);
+    await BrowserLinks.open(Uri.parse(deepSeekTopUpUrl));
   } catch (_) {
     // No browser: nothing sensible to add.
   }

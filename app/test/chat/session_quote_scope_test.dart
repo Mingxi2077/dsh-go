@@ -179,8 +179,8 @@ void main() {
       r.observe(tester, 'added-before-next-gesture');
       expect(ui.writes(r.h), isEmpty);
       expect(r.input(tester), 'same typed body');
-      expect(r.drafts['S']!.text, 'same typed body');
-      expect(r.h.container.read(composerQuoteProvider), {'S': 'new quoted passage'});
+      expect(r.drafts[localDraft('S')]!.text, 'same typed body');
+      expect(r.h.container.read(composerQuoteProvider), {localDraft('S'): 'new quoted passage'});
       await r.send(tester, 'same typed body');
       await ui.settleIo(tester, () => ui.writes(r.h).isNotEmpty);
       _prompt(r.h, 'S', '> new quoted passage\n\nsame typed body');
@@ -201,14 +201,17 @@ void main() {
       final r = await _QuoteFlow.start(tester, hold: hold);
       try {
         final quotes = r.h.container.read(composerQuoteProvider.notifier);
-        quotes.set('new', 'original new quote');
-        quotes.set('T', 'other session quote');
+        quotes.set(localDraft('new'), 'original new quote');
+        quotes.set(localDraft('T'), 'other session quote');
         final observed = <Map<String, String>>[];
         final subscription = r.h.container.listen(composerQuoteProvider, (_, next) => observed.add(next));
         await _reachModel(tester, r, hold, 'current body');
-        expect(r.h.container.read(composerQuoteProvider), {'S': 'original new quote', 'T': 'other session quote'});
+        expect(r.h.container.read(composerQuoteProvider), {
+          localDraft('S'): 'original new quote',
+          localDraft('T'): 'other session quote',
+        });
         expect(observed, [
-          {'S': 'original new quote', 'T': 'other session quote'},
+          {localDraft('S'): 'original new quote', localDraft('T'): 'other session quote'},
         ], reason: 'Migration has no observable cleared or duplicated intermediate quote');
         subscription.close();
         expect(tester.widget<QuoteChip>(find.byType(QuoteChip)).quote, 'original new quote');
@@ -223,7 +226,7 @@ void main() {
         }
         await ui.settleIo(tester, () => ui.writes(r.h).isNotEmpty);
         _prompt(r.h, 'S', '> original new quote\n\ncurrent body');
-        expect(r.h.container.read(composerQuoteProvider), {'T': 'other session quote'});
+        expect(r.h.container.read(composerQuoteProvider), {localDraft('T'): 'other session quote'});
         r.observe(tester, 'unchanged-sent-$readyBeforeModel');
         expect(tester.takeException(), isNull);
       } finally {
@@ -240,10 +243,10 @@ void main() {
       final hold = ReplyHold()..arm('session/selectModel');
       final r = await _QuoteFlow.start(tester, hold: hold);
       try {
-        r.h.container.read(composerQuoteProvider.notifier).set('new', 'original new quote');
+        r.h.container.read(composerQuoteProvider.notifier).set(localDraft('new'), 'original new quote');
         await _reachModel(tester, r, hold, 'body kept');
         await r.baseline(tester, 'S');
-        expect(r.h.container.read(composerQuoteProvider)['S'], 'original new quote');
+        expect(r.h.container.read(composerQuoteProvider)[localDraft('S')], 'original new quote');
         if (remove) {
           tester.widget<QuoteChip>(find.byType(QuoteChip)).onRemove();
         } else {
@@ -255,8 +258,8 @@ void main() {
         await pumpFrames(tester);
         expect(ui.writes(r.h), isEmpty);
         expect(r.input(tester), 'body kept');
-        expect(r.drafts['S']!.text, 'body kept');
-        expect(r.h.container.read(composerQuoteProvider)['S'], remove ? null : 'replacement quote');
+        expect(r.drafts[localDraft('S')]!.text, 'body kept');
+        expect(r.h.container.read(composerQuoteProvider)[localDraft('S')], remove ? null : 'replacement quote');
         await r.send(tester, 'body kept');
         await ui.settleIo(tester, () => ui.writes(r.h).isNotEmpty);
         _prompt(r.h, 'S', remove ? 'body kept' : '> replacement quote\n\nbody kept');
@@ -284,7 +287,7 @@ void main() {
       expect(r.h.methods.where((method) => method == 'commands/execute'), isEmpty);
       expect(ui.writes(r.h), isEmpty);
       expect(r.input(tester), '/compact');
-      expect(r.h.container.read(composerQuoteProvider)['S'], 'command context');
+      expect(r.h.container.read(composerQuoteProvider)[localDraft('S')], 'command context');
       await r.send(tester, '/compact');
       await ui.settleIo(tester, () => ui.writes(r.h).isNotEmpty);
       _prompt(r.h, 'S', '> command context\n\n/compact');
@@ -308,7 +311,7 @@ void main() {
       await pumpFrames(tester);
       expect(ui.writes(r.h), isEmpty);
       expect(r.input(tester), 'body after model failure');
-      expect(r.drafts['S']!.text, 'body after model failure');
+      expect(r.drafts[localDraft('S')]!.text, 'body after model failure');
       expect(r.h.container.read(chatProvider('S')).error, isNotNull);
       _QuoteFlow.installHandlers(r.h);
       bool? changed;
@@ -345,7 +348,7 @@ void main() {
       expect(changed, isNull);
       expect(ui.writes(r.h), isEmpty);
       expect(r.input(tester), 'body for chosen model');
-      expect(r.drafts['S']!.text, 'body for chosen model');
+      expect(r.drafts[localDraft('S')]!.text, 'body for chosen model');
       expect(r.h.container.read(chatProvider('S')).model!.toJson(), _currentB.toJson());
       hold.finish();
       await ui.settleIo(tester, () => changed != null);

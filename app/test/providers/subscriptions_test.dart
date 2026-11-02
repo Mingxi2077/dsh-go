@@ -2,8 +2,11 @@
 // step of the sign-in sheet against a fake bridge, polling that stops with
 // the sheet, and the signed-in page's sign-out.
 
+import 'dart:async';
+
+import 'package:dsh_app/browser/browser_links.dart';
 import 'package:dsh_app/l10n/l10n.dart';
-import 'package:dsh_app/state/account_state.dart' show accountBrowserProvider;
+import 'package:dsh_app/state/account_state.dart' show EmbeddedAccountBrowser, accountBrowserProvider;
 import 'package:dsh_app/state/models_state.dart';
 import 'package:dsh_app/state/subscriptions_state.dart';
 import 'package:dsh_app/ui/common/list_page_row.dart';
@@ -101,6 +104,34 @@ List<String> _mockClipboard(WidgetTester tester) {
   });
   addTearDown(() => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, null));
   return copied;
+}
+
+Future<List<BrowserAuthorization>> _openEmbeddedSheet(
+  WidgetTester tester,
+  FakeSubscriptionBackend bridge, {
+  Future<bool> Function(BrowserAuthorization)? authorize,
+}) async {
+  final requests = <BrowserAuthorization>[];
+  final oldPage = BrowserLinks.openPage;
+  final oldAuth = BrowserLinks.openAuthorization;
+  BrowserLinks.openPage = (_) async {
+    fail('subscription authorization must never open in the persistent browser');
+  };
+  BrowserLinks.openAuthorization = (request) async {
+    requests.add(request);
+    return authorize == null ? true : authorize(request);
+  };
+  addTearDown(() {
+    BrowserLinks.openPage = oldPage;
+    BrowserLinks.openAuthorization = oldAuth;
+  });
+  await _pump(tester, const _Opener(), [
+    ...providerOverrides(FakeProviderBackend(), subscriptions: bridge),
+    accountBrowserProvider.overrideWithValue(const EmbeddedAccountBrowser()),
+  ]);
+  await tester.tap(find.text('open'));
+  await settle(tester);
+  return requests;
 }
 
 void main() {
@@ -316,6 +347,162 @@ void main() {
       await _openSheet(tester, bridge);
       expect(find.text('登录没有完成'), findsOneWidget);
       expect(find.text('连不上登录服务，检查网络后重试'), findsOneWidget);
+    });
+  });
+
+  group('temporary subscription browser', () {
+    testWidgets('returning with a code keeps the session alive and permits reopening', (tester) async {
+      final bridge = FakeSubscriptionBackend(
+        steps: const [LoginStep(phase: LoginPhase.open, url: _url)],
+      );
+      final requests = await _openEmbeddedSheet(tester, bridge);
+      final first = requests.single;
+      expect(first.url, Uri.parse(_url));
+      expect(first.callbackOrigin, isNull);
+      expect(first.isCurrent(), isTrue);
+      await tester.tap(find.text('重新打开'));
+      await tester.pump();
+      expect(requests, hasLength(1), reason: 'an active temporary page is not duplicated');
+
+      await first.cancel();
+      await first.completed;
+      expect(first.isCurrent(), isFalse);
+      await tester.pump(const Duration(seconds: 1));
+      expect(bridge.calls, isNot(contains('cancel:att-1')));
+      expect(requests, hasLength(1), reason: 'polling must not reopen a page that the person just closed');
+
+      await tester.tap(find.text('重新打开'));
+      await tester.pump();
+      final second = requests.last;
+      expect(requests, hasLength(2));
+      expect(second.id, isNot(same(first.id)));
+      await first.cancel();
+      expect(second.isCurrent(), isTrue, reason: 'a late close belongs only to its own page');
+
+      bridge.steps = const [LoginStep(phase: LoginPhase.prompt, message: 'Paste the authorization code')];
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      await second.completed;
+      expect(second.isCurrent(), isFalse);
+      expect(find.text('粘贴授权码'), findsOneWidget);
+      bridge.steps = const [LoginStep(phase: LoginPhase.done)];
+      await tester.enterText(find.byType(TextField), 'copied-code');
+      await tester.pump();
+      await tester.tap(find.widgetWithText(FilledButton, '确定'));
+      await settle(tester);
+      expect(bridge.calls, contains('answer:att-1:copied-code'));
+      expect(bridge.calls, isNot(contains('cancel:att-1')));
+      await tester.pump(SubscriptionLoginSheet.doneDwell);
+      await settle(tester);
+      expect(find.text('result: true'), findsOneWidget);
+    });
+
+    testWidgets('device pages open on request; disposing the sheet ends the page and session', (tester) async {
+      final bridge = FakeSubscriptionBackend(
+        steps: const [LoginStep(phase: LoginPhase.device, url: _url, userCode: 'ABCD-EFGH')],
+      );
+      final requests = await _openEmbeddedSheet(tester, bridge);
+      expect(requests, isEmpty);
+      await tester.tap(find.text('打开验证页'));
+      await tester.pump();
+      await tester.tap(find.text('打开验证页'));
+      await tester.pump();
+      expect(requests, hasLength(1));
+      final request = requests.single;
+      await tester.tap(find.byTooltip('关闭'));
+      await settle(tester);
+      await request.completed;
+      expect(request.isCurrent(), isFalse);
+      expect(bridge.calls, contains('cancel:att-1'));
+      expect(find.text('result: false'), findsOneWidget);
+    });
+
+    for (final phase in [LoginPhase.failed, LoginPhase.cancelled]) {
+      testWidgets('$phase ends the temporary page and retry gets a new session', (tester) async {
+        final bridge = FakeSubscriptionBackend(
+          steps: const [LoginStep(phase: LoginPhase.open, url: _url)],
+        );
+        final requests = await _openEmbeddedSheet(tester, bridge);
+        final first = requests.single;
+        bridge.steps = [LoginStep(phase: phase)];
+        await tester.pump(const Duration(seconds: 1));
+        await settle(tester);
+        await first.completed;
+        expect(first.isCurrent(), isFalse);
+        expect(find.text('再试一次'), findsOneWidget);
+        bridge.steps = const [LoginStep(phase: LoginPhase.open, url: _url)];
+        await tester.tap(find.text('再试一次'));
+        await settle(tester);
+        expect(requests, hasLength(2));
+        expect(requests.last.isCurrent(), isTrue);
+        expect(bridge.calls, contains('poll:att-2'));
+        await first.cancel();
+        expect(requests.last.isCurrent(), isTrue);
+        await tester.tap(find.byTooltip('关闭'));
+        await settle(tester);
+        await requests.last.completed;
+        expect(bridge.calls, contains('cancel:att-2'));
+      });
+    }
+
+    testWidgets('failed browser opening can retry without restarting the engine login', (tester) async {
+      var succeeds = false;
+      final bridge = FakeSubscriptionBackend(
+        steps: const [LoginStep(phase: LoginPhase.open, url: _url)],
+      );
+      final requests = await _openEmbeddedSheet(tester, bridge, authorize: (_) async => succeeds);
+      await requests.single.completed;
+      expect(requests.single.isCurrent(), isFalse);
+      expect(find.text('没能打开浏览器'), findsOneWidget);
+      succeeds = true;
+      await tester.tap(find.text('重新打开'));
+      await tester.pump();
+      expect(requests, hasLength(2));
+      expect(requests.last.isCurrent(), isTrue);
+      expect(bridge.calls.where((c) => c.startsWith('begin:')), hasLength(1));
+      await tester.tap(find.byTooltip('关闭'));
+      await settle(tester);
+    });
+
+    testWidgets('system handoff can reopen the same login without cancelling the engine session', (tester) async {
+      final bridge = FakeSubscriptionBackend(
+        steps: const [LoginStep(phase: LoginPhase.open, url: _url)],
+      );
+      final requests = await _openEmbeddedSheet(tester, bridge);
+      final first = requests.single;
+      first.onSystemBrowserOpened!();
+      await first.completed;
+      expect(first.isCurrent(), isFalse);
+      expect(bridge.calls, isNot(contains('cancel:att-1')));
+      await tester.tap(find.text('重新打开'));
+      await tester.pump();
+      expect(requests, hasLength(2));
+      expect(requests.last.isCurrent(), isTrue);
+      expect(bridge.calls.where((call) => call.startsWith('begin:')), hasLength(1));
+      await tester.tap(find.byTooltip('关闭'));
+      await settle(tester);
+    });
+
+    testWidgets('done ends authorization and closes only its sheet below another route', (tester) async {
+      final bridge = FakeSubscriptionBackend(
+        steps: const [LoginStep(phase: LoginPhase.open, url: _url)],
+      );
+      final requests = await _openEmbeddedSheet(tester, bridge);
+      final navigator = Navigator.of(tester.element(find.byType(SubscriptionLoginSheet)));
+      unawaited(navigator.push<void>(MaterialPageRoute<void>(builder: (_) => const Scaffold(body: Text('cover')))));
+      await tester.pump();
+      bridge.steps = const [LoginStep(phase: LoginPhase.done)];
+      await tester.pump(const Duration(seconds: 1));
+      await requests.single.completed;
+      expect(requests.single.isCurrent(), isFalse);
+      await tester.pump(SubscriptionLoginSheet.doneDwell);
+      await settle(tester);
+      expect(find.text('cover'), findsOneWidget, reason: 'done must not pop a newer route');
+      expect(find.byType(SubscriptionLoginSheet, skipOffstage: false), findsNothing);
+      navigator.pop();
+      await settle(tester);
+      expect(find.text('result: true'), findsOneWidget);
+      expect(bridge.calls, isNot(contains('cancel:att-1')));
     });
   });
 

@@ -258,7 +258,7 @@ void main() {
     picker.selected = [_small('last.txt'), extra];
     await _choose(tester);
     final container = ProviderScope.containerOf(tester.element(find.byType(ChatScreen)));
-    final attachments = container.read(draftStoreProvider).drafts['s1']!.attachments;
+    final attachments = container.read(draftStoreProvider).drafts[localDraft('s1')]!.attachments;
     expect(attachments.length, maxAttachments);
     expect(attachments.last.name, 'last.txt');
     expect(find.text(appL10n.chatAttachmentLimit(maxAttachments)), findsOneWidget);

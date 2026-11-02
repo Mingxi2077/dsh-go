@@ -2,8 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../../state/star_prompt.dart' show starPromptGateProvider, starPromptProvider;
 import '../../state/update_state.dart';
@@ -92,7 +92,7 @@ class UpdateSheet extends ConsumerWidget {
   Future<void> _openPage(BuildContext context, Uri? page) async {
     final messenger = ScaffoldMessenger.maybeOf(context);
     final uri = page ?? githubReleasesPage;
-    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication).catchError((_) => false);
+    final ok = await BrowserLinks.open(uri).catchError((_) => false);
     if (!ok) messenger?.showSnackBar(SnackBar(content: Text(appL10n.updateBrowserOpenFailed(uri.host, uri.path))));
   }
 

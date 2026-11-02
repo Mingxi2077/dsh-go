@@ -368,7 +368,7 @@ void main() {
     await tester.enterText(find.byType(TextField), 'still the same draft');
     await rig.finish(tester);
     expect(find.text('private-selection.txt'), findsOneWidget);
-    expect(rig.container.read(draftStoreProvider).drafts['A']!.text, 'still the same draft');
+    expect(rig.container.read(draftStoreProvider).drafts[localDraft('A')]!.text, 'still the same draft');
   });
 
   testWidgets('a failure still shows feedback for the current selection', (tester) async {
@@ -382,4 +382,5 @@ void main() {
   });
 }
 
-List<DraftAttachment> _containerDraft(_Rig rig) => rig.container.read(draftStoreProvider).drafts['A']!.attachments;
+List<DraftAttachment> _containerDraft(_Rig rig) =>
+    rig.container.read(draftStoreProvider).drafts[localDraft('A')]!.attachments;

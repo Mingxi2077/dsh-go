@@ -69,8 +69,8 @@ void main() {
       await pumpFrames(tester);
       final container = ProviderScope.containerOf(tester.element(find.byType(ChatScreen)));
       try {
-        container.read(draftStoreProvider.notifier).save('B', 'other conversation draft', []);
-        container.read(draftStoreProvider.notifier).save('new', 'new conversation draft', []);
+        container.read(draftStoreProvider.notifier).save(localDraft('B'), 'other conversation draft', []);
+        container.read(draftStoreProvider.notifier).save(localDraft('new'), 'new conversation draft', []);
         await tester.enterText(find.byType(TextField), 'original draft');
         await pumpFrames(tester);
         await tester.longPress(find.byIcon(AppIcons.send));
@@ -90,7 +90,7 @@ void main() {
                 .read(composerInsertProvider.notifier)
                 .request(const ComposerInsert(token: 'inserted', sessionId: 'A'));
           case 'quote':
-            container.read(composerQuoteProvider.notifier).set('A', 'a newly chosen quote');
+            container.read(composerQuoteProvider.notifier).set(localDraft('A'), 'a newly chosen quote');
         }
         await pumpFrames(tester);
         final before = tester.widget<TextField>(find.byType(TextField)).controller!.text;

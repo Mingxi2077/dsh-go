@@ -3038,6 +3038,425 @@ class L10nEn extends L10n {
   String get brandZhihu => 'Zhihu';
 
   @override
+  String get browserTitle => 'Browser';
+
+  @override
+  String get browserSummary => 'Browse and quote into chats';
+
+  @override
+  String get browserAddressHint => 'Search or enter address';
+
+  @override
+  String get browserAddressHintPlaceholders =>
+      'Explore the unknown…\nBegin your deep search—\nRemember to star dsh-go~~\nWhat would you search today?\nSearch or enter address';
+
+  @override
+  String get browserAddressInvalid => 'This address can\'t open here';
+
+  @override
+  String get browserTabs => 'Tabs';
+
+  @override
+  String browserTabCount(int count) {
+    String _temp0 = intl.Intl.pluralLogic(count, locale: localeName, other: '$count tabs', one: '1 tab');
+    return '$_temp0';
+  }
+
+  @override
+  String get browserNoTabs => 'No tabs yet';
+
+  @override
+  String get browserNewTab => 'New tab';
+
+  @override
+  String get browserCloseTab => 'Close tab';
+
+  @override
+  String get browserTabLimit => 'Tabs are full. Close a few first';
+
+  @override
+  String get browserTabsUnsaved => 'Tabs couldn\'t be saved';
+
+  @override
+  String get browserClose => 'Close browser';
+
+  @override
+  String get browserBack => 'Back';
+
+  @override
+  String get browserForward => 'Forward';
+
+  @override
+  String get browserReload => 'Reload';
+
+  @override
+  String get browserOpenExternal => 'Open in system browser';
+
+  @override
+  String get browserQuote => 'Quote into chat';
+
+  @override
+  String get browserQuoteSelection => 'Selected text';
+
+  @override
+  String get browserQuoteSelectionHint => 'Long-press on the page to select';
+
+  @override
+  String get browserQuotePage => 'Page text';
+
+  @override
+  String get browserQuotePageHint => 'Skips forms, scripts and hidden content';
+
+  @override
+  String get browserNoSelection => 'Nothing selected. Long-press on the page to select text';
+
+  @override
+  String get browserEmptyPage => 'This page has no readable text';
+
+  @override
+  String get browserExtractFailed => 'The page changed or couldn\'t be read. Try again';
+
+  @override
+  String get browserPreviewStale => 'The page changed. Read it again';
+
+  @override
+  String get browserTruncated => 'Long page: only the first part is included';
+
+  @override
+  String browserCharCount(int count) {
+    String _temp0 = intl.Intl.pluralLogic(count, locale: localeName, other: '$count characters', one: '1 character');
+    return '$_temp0';
+  }
+
+  @override
+  String get browserAddToDraft => 'Add to draft';
+
+  @override
+  String get browserAddedToDraft => 'Added to draft';
+
+  @override
+  String get browserGoToChat => 'Go to chat';
+
+  @override
+  String get browserNotSent => 'Goes into the composer. Nothing is sent';
+
+  @override
+  String get browserReferenceLimit => 'Too many quotes waiting. Check the chat first';
+
+  @override
+  String get browserBlocked => 'This link can\'t open here';
+
+  @override
+  String get browserLoadFailed => 'Check your network and try again';
+
+  @override
+  String browserSearchWith(String engine) {
+    return 'Search with $engine';
+  }
+
+  @override
+  String get browserHome => 'Home';
+
+  @override
+  String get browserShortcuts => 'Bookmarks';
+
+  @override
+  String get browserRecent => 'Recent';
+
+  @override
+  String get browserOpenPages => 'Open pages';
+
+  @override
+  String get browserAllHistory => 'All history';
+
+  @override
+  String get browserLibrary => 'Bookmarks & history';
+
+  @override
+  String get browserBookmarks => 'Bookmarks';
+
+  @override
+  String get browserHistory => 'History';
+
+  @override
+  String get browserBookmarkAdd => 'Add bookmark';
+
+  @override
+  String get browserBookmarkEdit => 'Edit bookmark';
+
+  @override
+  String get browserBookmarkSaved => 'Bookmark added';
+
+  @override
+  String get browserBookmarkRemoved => 'Bookmark removed';
+
+  @override
+  String get browserBookmarkTitle => 'Name';
+
+  @override
+  String get browserBookmarkUrl => 'Address';
+
+  @override
+  String get browserBookmarkLimit => 'Bookmarks are full. Remove a few first';
+
+  @override
+  String get browserBookmarkMissing => 'This bookmark was removed';
+
+  @override
+  String get browserNoBookmarks => 'No bookmarks yet';
+
+  @override
+  String get browserNoBookmarksHint => 'Choose Add bookmark in a page\'s menu';
+
+  @override
+  String get browserNoHistory => 'No history yet';
+
+  @override
+  String get browserHistoryRemove => 'Remove';
+
+  @override
+  String get browserHistoryClear => 'Clear history';
+
+  @override
+  String get browserHistoryClearConfirm => 'Clear all browsing history?';
+
+  @override
+  String get browserHistoryClearNote => 'Bookmarks and open tabs stay';
+
+  @override
+  String get browserLibraryUnsaved => 'Bookmarks and history couldn\'t be saved';
+
+  @override
+  String get browserTabClosed => 'Tab closed';
+
+  @override
+  String get browserUndo => 'Undo';
+
+  @override
+  String get browserCloseAll => 'Close all tabs';
+
+  @override
+  String browserCloseAllConfirm(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'Close $count tabs in this chat?',
+      one: 'Close 1 tab in this chat?',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get browserCloseAllNote => 'Bookmarks and history stay';
+
+  @override
+  String get browserShare => 'Share';
+
+  @override
+  String get browserTextSize => 'Page text size';
+
+  @override
+  String get browserTextSizeReset => 'Reset';
+
+  @override
+  String get browserEngine => 'Search engine';
+
+  @override
+  String get browserEngineBing => 'Bing';
+
+  @override
+  String get browserSiteGithub => 'DSH Go';
+
+  @override
+  String get browserSiteWikipedia => 'Wikipedia';
+
+  @override
+  String get browserTabsDone => 'Back to page';
+
+  @override
+  String get browserAuthSecure => 'Secure connection';
+
+  @override
+  String get browserAuthLoading => 'Loading sign-in page';
+
+  @override
+  String get browserAuthFinishing => 'Finishing sign-in…';
+
+  @override
+  String get browserAuthFailed => 'Sign-in didn\'t finish. Close and try again';
+
+  @override
+  String get browserAuthCallbackFailed => 'Sign-in result didn\'t arrive. Try again';
+
+  @override
+  String get browserAuthExternalFailed => 'Couldn\'t open the system browser';
+
+  @override
+  String get browserAuthBlocked => 'This address can\'t open here. Try the system browser';
+
+  @override
+  String get browserAuthOpenSystem => 'Open in system browser';
+
+  @override
+  String get browserSearch => 'Search';
+
+  @override
+  String get browserClearHistory => 'Clear history';
+
+  @override
+  String get browserReturnToChat => 'Return to chat';
+
+  @override
+  String get browserReturnToChatRunning => 'Return to chat, task running';
+
+  @override
+  String get browserReturnToChatCompleted => 'Return to chat, task completed';
+
+  @override
+  String get browserRemoveReturn => 'Remove badge';
+
+  @override
+  String get browserReopenBrowser => 'Reopen browser';
+
+  @override
+  String get browserDownloads => 'Downloads';
+
+  @override
+  String get browserDownload => 'Download';
+
+  @override
+  String get browserDownloadFile => 'Download file';
+
+  @override
+  String get browserDownloadConfirm => 'Confirm download';
+
+  @override
+  String get browserDownloadStart => 'Start download';
+
+  @override
+  String get browserDownloadCancel => 'Cancel download';
+
+  @override
+  String get browserDownloadCancelled => 'Download cancelled';
+
+  @override
+  String get browserDownloadCompleted => 'Download complete';
+
+  @override
+  String get browserDownloadFailed => 'Download failed';
+
+  @override
+  String get browserDownloadInProgress => 'Downloading';
+
+  @override
+  String get browserDownloadPaused => 'Download paused';
+
+  @override
+  String get browserDownloadFileName => 'File name';
+
+  @override
+  String get browserDownloadFileSize => 'File size';
+
+  @override
+  String get browserDownloadSizeUnknown => 'Size unknown';
+
+  @override
+  String get browserDownloadSource => 'Source';
+
+  @override
+  String get browserDownloadLocation => 'Save location';
+
+  @override
+  String get browserDownloadFolder => 'Download folder';
+
+  @override
+  String get browserDownloadFolderChoose => 'Choose folder';
+
+  @override
+  String get browserDownloadFolderReset => 'Reset to default';
+
+  @override
+  String get browserDownloadFolderDefault => 'Default download folder';
+
+  @override
+  String get browserDownloadFirstTimeNote => 'Downloads will be saved to the folder below. You can change it anytime';
+
+  @override
+  String get browserDownloadUnsupported => 'Download link or method not supported';
+
+  @override
+  String get browserDownloadExpired => 'Download link has expired';
+
+  @override
+  String get browserDownloadFolderChanged => 'The download folder was changed by another page. Please confirm again';
+
+  @override
+  String get browserDownloadDirectoryError => 'Cannot access download folder';
+
+  @override
+  String get browserDownloadPermissionError => 'No write permission';
+
+  @override
+  String get browserDownloadNetworkError => 'Network connection failed';
+
+  @override
+  String get browserDownloadHttpError => 'Server returned an error';
+
+  @override
+  String get browserDownloadIncomplete => 'Download incomplete';
+
+  @override
+  String get browserDownloadStorageError => 'Write failed or insufficient storage';
+
+  @override
+  String get browserDownloadInterrupted => 'Download was interrupted';
+
+  @override
+  String get browserDownloadNoApp => 'No app can open this file';
+
+  @override
+  String get browserDownloadMissing => 'File was moved or deleted';
+
+  @override
+  String get browserDownloadTooLarge => 'File exceeds the size limit for adding to chat';
+
+  @override
+  String get browserDownloadBusy => 'Download task or record limit reached';
+
+  @override
+  String get browserDownloadError => 'Download failed';
+
+  @override
+  String get browserDownloadOpenFile => 'Open file';
+
+  @override
+  String get browserDownloadAddToChat => 'Add to current chat';
+
+  @override
+  String get browserDownloadAddedToChat => 'Added to draft';
+
+  @override
+  String get browserDownloadNoDownloads => 'No downloads yet';
+
+  @override
+  String get browserDownloadRetry => 'Retry';
+
+  @override
+  String get browserReturnShowAll => 'Show all';
+
+  @override
+  String browserReturnMultiple(int count) {
+    String _temp0 = intl.Intl.pluralLogic(count, locale: localeName, other: '$count tabs', one: '1 tab');
+    return '$_temp0';
+  }
+
+  @override
+  String get browserDownloadChatChanged => 'The target chat has changed';
+
+  @override
+  String get browserDownloadTryFromPage => 'Please return to the original page to download again';
+
+  @override
   String get catalogCurrentChat => 'Current chat';
 
   @override
@@ -4491,6 +4910,47 @@ class L10nEn extends L10n {
   @override
   String chatArtifactSemantics(String name, String description) {
     return '$name, $description';
+  }
+
+  @override
+  String get chatLegacyDrafts => 'Restore old drafts';
+
+  @override
+  String get chatLegacyDraftsHint => 'Saved by an older version, not tied to a host';
+
+  @override
+  String get chatLegacyDraftNew => 'Old new chat';
+
+  @override
+  String get chatLegacyDraftChat => 'Old chat draft';
+
+  @override
+  String get chatLegacyDraftTarget => 'Goes after the text already there. Nothing is sent';
+
+  @override
+  String get chatLegacyDraftAppend => 'Add to draft';
+
+  @override
+  String get chatLegacyDraftRestored => 'Added to draft';
+
+  @override
+  String get chatLegacyDraftStale => 'The chat changed. Nothing was restored';
+
+  @override
+  String get chatWebQuote => 'Web reference';
+
+  @override
+  String get chatWebQuoteSelection => 'Selection';
+
+  @override
+  String get chatWebQuotePage => 'Page';
+
+  @override
+  String get chatWebQuotePreview => 'Web reference preview';
+
+  @override
+  String chatRemoveWebQuote(String title) {
+    return 'Remove web reference \"$title\"';
   }
 
   @override

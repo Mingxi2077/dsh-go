@@ -77,7 +77,7 @@ Future<SyncHarness> beginFirstSend(WidgetTester tester, {FakeSessions? sessions,
   }
   await tester.enterText(find.byType(TextField), 'retained first draft');
   await tester.pump();
-  expect(h.container.read(draftStoreProvider).drafts['new']?.text, 'retained first draft');
+  expect(h.container.read(draftStoreProvider).drafts[localDraft('new')]?.text, 'retained first draft');
   await tester.tap(find.byIcon(AppIcons.send));
   await tester.pump();
   expect(h.container.read(currentSessionProvider), 'S');
@@ -209,9 +209,9 @@ void main() {
     final h = await beginFirstSend(tester, withImage: true);
     try {
       final saved = h.container.read(draftStoreProvider).drafts;
-      expect(saved['new'], isNull);
-      expect(saved['S']!.text, 'retained first draft');
-      expect(saved['S']!.attachments, hasLength(1));
+      expect(saved[localDraft('new')], isNull);
+      expect(saved[localDraft('S')]!.text, 'retained first draft');
+      expect(saved[localDraft('S')]!.attachments, hasLength(1));
       await tester.enterText(find.byType(TextField), 'edited text with two images');
       tester
           .state<EditableTextState>(find.byType(EditableText))
@@ -219,7 +219,7 @@ void main() {
       await tester.pump(const Duration(seconds: 11));
       expect(tester.widget<Composer>(find.byType(Composer)).busy, isFalse);
       expect(h.state.notice, isNotNull, reason: 'A current timeout still explains why it did not send');
-      final attachments = h.container.read(draftStoreProvider).drafts['S']!.attachments;
+      final attachments = h.container.read(draftStoreProvider).drafts[localDraft('S')]!.attachments;
       expect(attachments, hasLength(2));
       expect(writes(h), isEmpty);
       await tester.pumpWidget(const SizedBox());
@@ -230,7 +230,7 @@ void main() {
       expect(tester.widget<ComposerTray>(find.byType(ComposerTray)).items, attachments);
       await tester.tap(find.descendant(of: find.byType(ComposerTray), matching: find.byIcon(AppIcons.close)).first);
       await tester.pump();
-      expect(h.container.read(draftStoreProvider).drafts['S']!.attachments, [attachments.last]);
+      expect(h.container.read(draftStoreProvider).drafts[localDraft('S')]!.attachments, [attachments.last]);
       await tester.pumpWidget(const SizedBox());
       await tester.pump(const Duration(milliseconds: 600));
       await mount(tester, h);
@@ -279,8 +279,8 @@ void main() {
         await tester.pump();
         expect(tester.widget<Composer>(find.byType(Composer)).busy, isTrue);
         expect(tester.widget<TextField>(find.byType(TextField)).controller!.text, 'new T draft');
-        expect(h.container.read(draftStoreProvider).drafts['S']!.text, 'retained first draft');
-        expect(h.container.read(draftStoreProvider).drafts['T']!.text, 'new T draft');
+        expect(h.container.read(draftStoreProvider).drafts[localDraft('S')]!.text, 'retained first draft');
+        expect(h.container.read(draftStoreProvider).drafts[localDraft('T')]!.text, 'new T draft');
         expect(h.container.read(chatProvider('T')).notice, isNull);
         expect(h.container.read(chatProvider('T')).error, isNull);
         expect(writes(h), isEmpty);
@@ -296,7 +296,7 @@ void main() {
         final request = h.boundary.single['request'] as Map;
         expect(request['sessionId'], 'T');
         expect((request['content'] as List).single['text'], 'new T draft');
-        expect(h.container.read(draftStoreProvider).drafts['S']!.text, 'retained first draft');
+        expect(h.container.read(draftStoreProvider).drafts[localDraft('S')]!.text, 'retained first draft');
         expect(tester.takeException(), isNull);
       } finally {
         await disposeHarness(tester, h);
@@ -342,7 +342,7 @@ void main() {
       expect(writes(h), isEmpty);
       expect(tester.widget<Composer>(find.byType(Composer)).busy, isFalse);
       expect(tester.widget<TextField>(find.byType(TextField)).controller!.text, 'remounted draft');
-      expect(h.container.read(draftStoreProvider).drafts['S']!.text, 'remounted draft');
+      expect(h.container.read(draftStoreProvider).drafts[localDraft('S')]!.text, 'remounted draft');
       expect(tester.takeException(), isNull);
     } finally {
       await disposeHarness(tester, h);

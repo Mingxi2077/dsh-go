@@ -1,6 +1,7 @@
 // Onboarding choice, signing-in state and account page, driven through the UI
 // with the real controller against an in-memory Host.
 
+import 'package:dsh_app/browser/browser_links.dart';
 import 'package:dsh_app/state/account_state.dart';
 import 'package:dsh_app/state/onboarding_state.dart';
 import 'package:dsh_app/ui/account/account_page.dart';
@@ -203,6 +204,43 @@ void main() {
       await _settle(tester);
       expect(browser.opened.single.toString(), links.topUpUrl);
       expect(api.calls.where((c) => c == 'getBalance'), hasLength(1));
+    });
+
+    testWidgets('only the opened platform page refreshes wallets on browser return', (tester) async {
+      const topUp = 'https://platform.deepseek.com/top_up?source=account#wallet';
+      final (api, browser) = await pumpPage(
+        tester,
+        FakeAccountApi(
+          initial: AccountView(
+            status: AccountStatus.credentialStored,
+            links: AccountLinks(topUpUrl: topUp, usageUrl: links.usageUrl),
+          ),
+        ),
+      );
+      await tester.tap(find.text('去充值'));
+      await _settle(tester);
+      expect(browser.opened.single.toString(), topUp);
+      final balances = api.calls.where((c) => c == 'getBalance').length;
+      final profiles = api.calls.where((c) => c == 'getProfile').length;
+
+      BrowserLinks.didReturn(Uri.parse(links.usageUrl));
+      await _settle(tester);
+      expect(api.calls.where((c) => c == 'getBalance'), hasLength(balances));
+
+      BrowserLinks.didReturn(Uri.parse('https://platform.deepseek.com/top_up?other=value'));
+      await _settle(tester);
+      expect(api.calls.where((c) => c == 'getBalance'), hasLength(balances + 1));
+      expect(api.calls.where((c) => c == 'getProfile'), hasLength(profiles + 1));
+
+      BrowserLinks.didReturn(Uri.parse(topUp));
+      await _settle(tester);
+      expect(api.calls.where((c) => c == 'getBalance'), hasLength(balances + 1));
+      await tester.tap(find.text('去充值'));
+      await _settle(tester);
+      await tester.pumpWidget(const SizedBox.shrink());
+      BrowserLinks.didReturn(Uri.parse(topUp));
+      await tester.pump();
+      expect(tester.takeException(), isNull, reason: 'disposed pages unsubscribe from browser returns');
     });
 
     testWidgets('sign-out asks first, then lands on the sign-in panel', (tester) async {

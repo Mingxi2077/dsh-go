@@ -6,9 +6,9 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../common/empty_view.dart';
 import '../common/expand_reveal.dart';
@@ -582,7 +582,7 @@ class _WebViewPageState extends State<WebViewPage> {
         _files.attach(controller),
         controller.setNavigationDelegate(
           NavigationDelegate(
-            // DSH Web keeps to its own origin; other pages open in the browser.
+            // DSH Web keeps to its own origin; other pages use the shared browser entry.
             onNavigationRequest: widget.dshWeb ? _onDshWebNavigation : null,
             onPageStarted: (_) {
               if (!mounted || controller != _controller) return;
@@ -666,7 +666,7 @@ class _WebViewPageState extends State<WebViewPage> {
   NavigationDecision _onDshWebNavigation(NavigationRequest request) {
     final decision = dshWebNavigation(widget.url, request.url, request.isMainFrame);
     if (decision == DshWebNavigation.external) {
-      unawaited(launchUrl(Uri.parse(request.url), mode: LaunchMode.externalApplication).catchError((_) => false));
+      unawaited(BrowserLinks.open(Uri.parse(request.url)).catchError((_) => false));
     }
     return decision == DshWebNavigation.stay ? NavigationDecision.navigate : NavigationDecision.prevent;
   }
@@ -901,7 +901,7 @@ class _WebViewPageState extends State<WebViewPage> {
   Future<void> _openExternal() async {
     final current = _gone ? null : await _controller.currentUrl();
     final uri = Uri.tryParse(current ?? '') ?? widget.url;
-    await launchUrl(uri, mode: LaunchMode.externalApplication);
+    await BrowserLinks.external(uri);
   }
 
   @override

@@ -30,6 +30,7 @@ class IslandsPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ComponentC
     private var methods: MethodChannel? = null
     private var context: Context? = null
     private val main = Handler(Looper.getMainLooper())
+    private val browserNavigation = BrowserNavigation()
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         this.binding = binding
@@ -39,6 +40,7 @@ class IslandsPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ComponentC
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        browserNavigation.clear()
         binding.applicationContext.unregisterComponentCallbacks(this)
         methods?.setMethodCallHandler(null)
         methods = null
@@ -57,6 +59,29 @@ class IslandsPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ComponentC
         when (call.method) {
             "device" -> result.success(device())
             "appPss" -> result.success(Debug.getPss().toInt())
+            "browserNavigationRestore", "browserNavigationSave" -> {
+                val view = webView(call)?.second ?: return result.success(false)
+                val key = call.argument<String>("key")
+                val generation = call.argument<Number>("generation")?.toLong()
+                val url = call.argument<String>("url")
+                if (call.method == "browserNavigationRestore") {
+                    result.success(browserNavigation.restore(view, key, generation, url))
+                } else {
+                    browserNavigation.saveWhenDetached(view, key, generation, url) { result.success(it) }
+                }
+            }
+            "browserNavigationDrop" -> {
+                browserNavigation.drop(call.argument<String>("key"))
+                result.success(null)
+            }
+            "browserPreview" -> {
+                val view = webView(call)?.second ?: return result.success(null)
+                result.success(BrowserImages.preview(view, call.argument<String>("url"), call.argument<Int>("width") ?: 420))
+            }
+            "browserSiteIcon" -> {
+                val view = webView(call)?.second ?: return result.success(null)
+                result.success(BrowserImages.icon(view, call.argument<String>("url")))
+            }
             "attach" -> {
                 val (id, view) = webView(call) ?: return result.success(false)
                 Log.i(TAG, "attach $id textZoom(default)=${view.settings.textZoom}")

@@ -2885,6 +2885,415 @@ class L10nZh extends L10n {
   String get brandZhihu => '知乎';
 
   @override
+  String get browserTitle => '网页';
+
+  @override
+  String get browserSummary => '浏览网页,引用到对话';
+
+  @override
+  String get browserAddressHint => '搜索或输入网址';
+
+  @override
+  String get browserAddressHintPlaceholders => '探索未至之境……\n开始深度求索——\n记得给dsh-go点star喵~~\n今天想搜点什么呢？\n搜索或输入网址';
+
+  @override
+  String get browserAddressInvalid => '这个地址不能在这里打开';
+
+  @override
+  String get browserTabs => '标签页';
+
+  @override
+  String browserTabCount(int count) {
+    return '$count 个标签页';
+  }
+
+  @override
+  String get browserNoTabs => '还没有标签页';
+
+  @override
+  String get browserNewTab => '新标签页';
+
+  @override
+  String get browserCloseTab => '关闭标签页';
+
+  @override
+  String get browserTabLimit => '标签页已满，先关掉几个';
+
+  @override
+  String get browserTabsUnsaved => '标签页暂时没能保存';
+
+  @override
+  String get browserClose => '关闭网页';
+
+  @override
+  String get browserBack => '后退';
+
+  @override
+  String get browserForward => '前进';
+
+  @override
+  String get browserReload => '重新加载';
+
+  @override
+  String get browserOpenExternal => '在系统浏览器打开';
+
+  @override
+  String get browserQuote => '引用到对话';
+
+  @override
+  String get browserQuoteSelection => '选中的文字';
+
+  @override
+  String get browserQuoteSelectionHint => '先在网页里长按选中';
+
+  @override
+  String get browserQuotePage => '网页正文';
+
+  @override
+  String get browserQuotePageHint => '不含表单、脚本和隐藏内容';
+
+  @override
+  String get browserNoSelection => '没有选中文字，先在网页里长按选中';
+
+  @override
+  String get browserEmptyPage => '这个网页没有可读的正文';
+
+  @override
+  String get browserExtractFailed => '页面已变化或无法读取，请重试';
+
+  @override
+  String get browserPreviewStale => '页面已经变了，重新提取';
+
+  @override
+  String get browserTruncated => '内容较长，只取了前一部分';
+
+  @override
+  String browserCharCount(int count) {
+    return '$count 字';
+  }
+
+  @override
+  String get browserAddToDraft => '加入草稿';
+
+  @override
+  String get browserAddedToDraft => '已加入草稿';
+
+  @override
+  String get browserGoToChat => '去对话';
+
+  @override
+  String get browserNotSent => '只放进输入框，不会自动发送';
+
+  @override
+  String get browserReferenceLimit => '待加入的引用太多，先回对话看看';
+
+  @override
+  String get browserBlocked => '这个链接不能在这里打开';
+
+  @override
+  String get browserLoadFailed => '检查网络后再试';
+
+  @override
+  String browserSearchWith(String engine) {
+    return '用 $engine 搜索';
+  }
+
+  @override
+  String get browserHome => '首页';
+
+  @override
+  String get browserShortcuts => '书签';
+
+  @override
+  String get browserRecent => '最近浏览';
+
+  @override
+  String get browserOpenPages => '打开的网页';
+
+  @override
+  String get browserAllHistory => '全部历史';
+
+  @override
+  String get browserLibrary => '书签与历史';
+
+  @override
+  String get browserBookmarks => '书签';
+
+  @override
+  String get browserHistory => '历史';
+
+  @override
+  String get browserBookmarkAdd => '加入书签';
+
+  @override
+  String get browserBookmarkEdit => '编辑书签';
+
+  @override
+  String get browserBookmarkSaved => '已加入书签';
+
+  @override
+  String get browserBookmarkRemoved => '已删除书签';
+
+  @override
+  String get browserBookmarkTitle => '名称';
+
+  @override
+  String get browserBookmarkUrl => '网址';
+
+  @override
+  String get browserBookmarkLimit => '书签已满，先删掉几个';
+
+  @override
+  String get browserBookmarkMissing => '这个书签已经删除';
+
+  @override
+  String get browserNoBookmarks => '还没有书签';
+
+  @override
+  String get browserNoBookmarksHint => '在网页的菜单里选「加入书签」';
+
+  @override
+  String get browserNoHistory => '还没有浏览记录';
+
+  @override
+  String get browserHistoryRemove => '删除记录';
+
+  @override
+  String get browserHistoryClear => '清空历史';
+
+  @override
+  String get browserHistoryClearConfirm => '清空全部浏览历史？';
+
+  @override
+  String get browserHistoryClearNote => '书签和打开的标签页不受影响';
+
+  @override
+  String get browserLibraryUnsaved => '书签和历史暂时没能保存';
+
+  @override
+  String get browserTabClosed => '已关闭标签页';
+
+  @override
+  String get browserUndo => '撤销';
+
+  @override
+  String get browserCloseAll => '关闭全部标签页';
+
+  @override
+  String browserCloseAllConfirm(int count) {
+    return '关闭这个对话的 $count 个标签页？';
+  }
+
+  @override
+  String get browserCloseAllNote => '书签和历史会保留';
+
+  @override
+  String get browserShare => '分享';
+
+  @override
+  String get browserTextSize => '网页文字大小';
+
+  @override
+  String get browserTextSizeReset => '恢复默认';
+
+  @override
+  String get browserEngine => '搜索引擎';
+
+  @override
+  String get browserEngineBing => '必应';
+
+  @override
+  String get browserSiteGithub => 'DSH Go';
+
+  @override
+  String get browserSiteWikipedia => '维基百科';
+
+  @override
+  String get browserTabsDone => '返回网页';
+
+  @override
+  String get browserAuthSecure => '安全连接';
+
+  @override
+  String get browserAuthLoading => '正在加载登录页';
+
+  @override
+  String get browserAuthFinishing => '正在完成登录…';
+
+  @override
+  String get browserAuthFailed => '登录没有完成，关闭后再试一次';
+
+  @override
+  String get browserAuthCallbackFailed => '登录结果没有送达，重试一次';
+
+  @override
+  String get browserAuthExternalFailed => '没能打开系统浏览器';
+
+  @override
+  String get browserAuthBlocked => '这个地址不能在这里打开，可以换系统浏览器';
+
+  @override
+  String get browserAuthOpenSystem => '在系统浏览器中打开';
+
+  @override
+  String get browserSearch => '搜索';
+
+  @override
+  String get browserClearHistory => '清除历史';
+
+  @override
+  String get browserReturnToChat => '返回会话';
+
+  @override
+  String get browserReturnToChatRunning => '返回会话，任务进行中';
+
+  @override
+  String get browserReturnToChatCompleted => '返回会话，任务已完成';
+
+  @override
+  String get browserRemoveReturn => '移除标签';
+
+  @override
+  String get browserReopenBrowser => '回到浏览器';
+
+  @override
+  String get browserDownloads => '下载管理';
+
+  @override
+  String get browserDownload => '下载';
+
+  @override
+  String get browserDownloadFile => '下载文件';
+
+  @override
+  String get browserDownloadConfirm => '确认下载';
+
+  @override
+  String get browserDownloadStart => '开始下载';
+
+  @override
+  String get browserDownloadCancel => '取消下载';
+
+  @override
+  String get browserDownloadCancelled => '已取消下载';
+
+  @override
+  String get browserDownloadCompleted => '下载完成';
+
+  @override
+  String get browserDownloadFailed => '下载失败';
+
+  @override
+  String get browserDownloadInProgress => '正在下载';
+
+  @override
+  String get browserDownloadPaused => '下载已暂停';
+
+  @override
+  String get browserDownloadFileName => '文件名';
+
+  @override
+  String get browserDownloadFileSize => '文件大小';
+
+  @override
+  String get browserDownloadSizeUnknown => '大小未知';
+
+  @override
+  String get browserDownloadSource => '来源';
+
+  @override
+  String get browserDownloadLocation => '保存位置';
+
+  @override
+  String get browserDownloadFolder => '下载文件夹';
+
+  @override
+  String get browserDownloadFolderChoose => '选择文件夹';
+
+  @override
+  String get browserDownloadFolderReset => '恢复默认';
+
+  @override
+  String get browserDownloadFolderDefault => '默认下载文件夹';
+
+  @override
+  String get browserDownloadFirstTimeNote => '下载会保存在下面的文件夹，可随时修改';
+
+  @override
+  String get browserDownloadUnsupported => '下载链接或方式暂不支持';
+
+  @override
+  String get browserDownloadExpired => '下载链接已失效';
+
+  @override
+  String get browserDownloadFolderChanged => '下载文件夹已被其他页面修改，请重新确认';
+
+  @override
+  String get browserDownloadDirectoryError => '无法访问下载文件夹';
+
+  @override
+  String get browserDownloadPermissionError => '没有写入权限';
+
+  @override
+  String get browserDownloadNetworkError => '网络连接失败';
+
+  @override
+  String get browserDownloadHttpError => '服务器返回错误';
+
+  @override
+  String get browserDownloadIncomplete => '下载未完成';
+
+  @override
+  String get browserDownloadStorageError => '写入失败或存储空间不足';
+
+  @override
+  String get browserDownloadInterrupted => '下载被中断';
+
+  @override
+  String get browserDownloadNoApp => '没有应用可以打开此文件';
+
+  @override
+  String get browserDownloadMissing => '文件已被移动或删除';
+
+  @override
+  String get browserDownloadTooLarge => '文件超过可加入会话的大小限制';
+
+  @override
+  String get browserDownloadBusy => '下载任务或记录已达上限';
+
+  @override
+  String get browserDownloadError => '下载失败';
+
+  @override
+  String get browserDownloadOpenFile => '打开文件';
+
+  @override
+  String get browserDownloadAddToChat => '加入当前会话';
+
+  @override
+  String get browserDownloadAddedToChat => '已加入草稿';
+
+  @override
+  String get browserDownloadNoDownloads => '还没有下载记录';
+
+  @override
+  String get browserDownloadRetry => '重试';
+
+  @override
+  String get browserReturnShowAll => '查看全部';
+
+  @override
+  String browserReturnMultiple(int count) {
+    return '$count 个标签';
+  }
+
+  @override
+  String get browserDownloadChatChanged => '目标会话已更改';
+
+  @override
+  String get browserDownloadTryFromPage => '请回到原网页重新发起下载';
+
+  @override
   String get catalogCurrentChat => '当前对话';
 
   @override
@@ -4218,6 +4627,47 @@ class L10nZh extends L10n {
   @override
   String chatArtifactSemantics(String name, String description) {
     return '$name，$description';
+  }
+
+  @override
+  String get chatLegacyDrafts => '恢复旧草稿';
+
+  @override
+  String get chatLegacyDraftsHint => '旧版保存的草稿，不属于任何主机';
+
+  @override
+  String get chatLegacyDraftNew => '旧版的新对话';
+
+  @override
+  String get chatLegacyDraftChat => '旧版对话的草稿';
+
+  @override
+  String get chatLegacyDraftTarget => '放在这个对话已有内容的后面，不会发送';
+
+  @override
+  String get chatLegacyDraftAppend => '加入当前草稿';
+
+  @override
+  String get chatLegacyDraftRestored => '已加入草稿';
+
+  @override
+  String get chatLegacyDraftStale => '对话已经切换，没有恢复';
+
+  @override
+  String get chatWebQuote => '网页引用';
+
+  @override
+  String get chatWebQuoteSelection => '选中内容';
+
+  @override
+  String get chatWebQuotePage => '页面内容';
+
+  @override
+  String get chatWebQuotePreview => '网页引用预览';
+
+  @override
+  String chatRemoveWebQuote(String title) {
+    return '移除网页引用「$title」';
   }
 
   @override

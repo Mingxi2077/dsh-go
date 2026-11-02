@@ -5294,6 +5294,804 @@ abstract class L10n {
   /// **'知乎'**
   String get brandZhihu;
 
+  /// No description provided for @browserTitle.
+  ///
+  /// In zh, this message translates to:
+  /// **'网页'**
+  String get browserTitle;
+
+  /// No description provided for @browserSummary.
+  ///
+  /// In zh, this message translates to:
+  /// **'浏览网页,引用到对话'**
+  String get browserSummary;
+
+  /// No description provided for @browserAddressHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'搜索或输入网址'**
+  String get browserAddressHint;
+
+  /// No description provided for @browserAddressHintPlaceholders.
+  ///
+  /// In zh, this message translates to:
+  /// **'探索未至之境……\n开始深度求索——\n记得给dsh-go点star喵~~\n今天想搜点什么呢？\n搜索或输入网址'**
+  String get browserAddressHintPlaceholders;
+
+  /// No description provided for @browserAddressInvalid.
+  ///
+  /// In zh, this message translates to:
+  /// **'这个地址不能在这里打开'**
+  String get browserAddressInvalid;
+
+  /// No description provided for @browserTabs.
+  ///
+  /// In zh, this message translates to:
+  /// **'标签页'**
+  String get browserTabs;
+
+  /// No description provided for @browserTabCount.
+  ///
+  /// In zh, this message translates to:
+  /// **'{count} 个标签页'**
+  String browserTabCount(int count);
+
+  /// No description provided for @browserNoTabs.
+  ///
+  /// In zh, this message translates to:
+  /// **'还没有标签页'**
+  String get browserNoTabs;
+
+  /// No description provided for @browserNewTab.
+  ///
+  /// In zh, this message translates to:
+  /// **'新标签页'**
+  String get browserNewTab;
+
+  /// No description provided for @browserCloseTab.
+  ///
+  /// In zh, this message translates to:
+  /// **'关闭标签页'**
+  String get browserCloseTab;
+
+  /// No description provided for @browserTabLimit.
+  ///
+  /// In zh, this message translates to:
+  /// **'标签页已满，先关掉几个'**
+  String get browserTabLimit;
+
+  /// No description provided for @browserTabsUnsaved.
+  ///
+  /// In zh, this message translates to:
+  /// **'标签页暂时没能保存'**
+  String get browserTabsUnsaved;
+
+  /// No description provided for @browserClose.
+  ///
+  /// In zh, this message translates to:
+  /// **'关闭网页'**
+  String get browserClose;
+
+  /// No description provided for @browserBack.
+  ///
+  /// In zh, this message translates to:
+  /// **'后退'**
+  String get browserBack;
+
+  /// No description provided for @browserForward.
+  ///
+  /// In zh, this message translates to:
+  /// **'前进'**
+  String get browserForward;
+
+  /// No description provided for @browserReload.
+  ///
+  /// In zh, this message translates to:
+  /// **'重新加载'**
+  String get browserReload;
+
+  /// No description provided for @browserOpenExternal.
+  ///
+  /// In zh, this message translates to:
+  /// **'在系统浏览器打开'**
+  String get browserOpenExternal;
+
+  /// No description provided for @browserQuote.
+  ///
+  /// In zh, this message translates to:
+  /// **'引用到对话'**
+  String get browserQuote;
+
+  /// No description provided for @browserQuoteSelection.
+  ///
+  /// In zh, this message translates to:
+  /// **'选中的文字'**
+  String get browserQuoteSelection;
+
+  /// No description provided for @browserQuoteSelectionHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'先在网页里长按选中'**
+  String get browserQuoteSelectionHint;
+
+  /// No description provided for @browserQuotePage.
+  ///
+  /// In zh, this message translates to:
+  /// **'网页正文'**
+  String get browserQuotePage;
+
+  /// No description provided for @browserQuotePageHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'不含表单、脚本和隐藏内容'**
+  String get browserQuotePageHint;
+
+  /// No description provided for @browserNoSelection.
+  ///
+  /// In zh, this message translates to:
+  /// **'没有选中文字，先在网页里长按选中'**
+  String get browserNoSelection;
+
+  /// No description provided for @browserEmptyPage.
+  ///
+  /// In zh, this message translates to:
+  /// **'这个网页没有可读的正文'**
+  String get browserEmptyPage;
+
+  /// No description provided for @browserExtractFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'页面已变化或无法读取，请重试'**
+  String get browserExtractFailed;
+
+  /// No description provided for @browserPreviewStale.
+  ///
+  /// In zh, this message translates to:
+  /// **'页面已经变了，重新提取'**
+  String get browserPreviewStale;
+
+  /// No description provided for @browserTruncated.
+  ///
+  /// In zh, this message translates to:
+  /// **'内容较长，只取了前一部分'**
+  String get browserTruncated;
+
+  /// No description provided for @browserCharCount.
+  ///
+  /// In zh, this message translates to:
+  /// **'{count} 字'**
+  String browserCharCount(int count);
+
+  /// No description provided for @browserAddToDraft.
+  ///
+  /// In zh, this message translates to:
+  /// **'加入草稿'**
+  String get browserAddToDraft;
+
+  /// No description provided for @browserAddedToDraft.
+  ///
+  /// In zh, this message translates to:
+  /// **'已加入草稿'**
+  String get browserAddedToDraft;
+
+  /// No description provided for @browserGoToChat.
+  ///
+  /// In zh, this message translates to:
+  /// **'去对话'**
+  String get browserGoToChat;
+
+  /// No description provided for @browserNotSent.
+  ///
+  /// In zh, this message translates to:
+  /// **'只放进输入框，不会自动发送'**
+  String get browserNotSent;
+
+  /// No description provided for @browserReferenceLimit.
+  ///
+  /// In zh, this message translates to:
+  /// **'待加入的引用太多，先回对话看看'**
+  String get browserReferenceLimit;
+
+  /// No description provided for @browserBlocked.
+  ///
+  /// In zh, this message translates to:
+  /// **'这个链接不能在这里打开'**
+  String get browserBlocked;
+
+  /// No description provided for @browserLoadFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'检查网络后再试'**
+  String get browserLoadFailed;
+
+  /// No description provided for @browserSearchWith.
+  ///
+  /// In zh, this message translates to:
+  /// **'用 {engine} 搜索'**
+  String browserSearchWith(String engine);
+
+  /// No description provided for @browserHome.
+  ///
+  /// In zh, this message translates to:
+  /// **'首页'**
+  String get browserHome;
+
+  /// No description provided for @browserShortcuts.
+  ///
+  /// In zh, this message translates to:
+  /// **'书签'**
+  String get browserShortcuts;
+
+  /// No description provided for @browserRecent.
+  ///
+  /// In zh, this message translates to:
+  /// **'最近浏览'**
+  String get browserRecent;
+
+  /// No description provided for @browserOpenPages.
+  ///
+  /// In zh, this message translates to:
+  /// **'打开的网页'**
+  String get browserOpenPages;
+
+  /// No description provided for @browserAllHistory.
+  ///
+  /// In zh, this message translates to:
+  /// **'全部历史'**
+  String get browserAllHistory;
+
+  /// No description provided for @browserLibrary.
+  ///
+  /// In zh, this message translates to:
+  /// **'书签与历史'**
+  String get browserLibrary;
+
+  /// No description provided for @browserBookmarks.
+  ///
+  /// In zh, this message translates to:
+  /// **'书签'**
+  String get browserBookmarks;
+
+  /// No description provided for @browserHistory.
+  ///
+  /// In zh, this message translates to:
+  /// **'历史'**
+  String get browserHistory;
+
+  /// No description provided for @browserBookmarkAdd.
+  ///
+  /// In zh, this message translates to:
+  /// **'加入书签'**
+  String get browserBookmarkAdd;
+
+  /// No description provided for @browserBookmarkEdit.
+  ///
+  /// In zh, this message translates to:
+  /// **'编辑书签'**
+  String get browserBookmarkEdit;
+
+  /// No description provided for @browserBookmarkSaved.
+  ///
+  /// In zh, this message translates to:
+  /// **'已加入书签'**
+  String get browserBookmarkSaved;
+
+  /// No description provided for @browserBookmarkRemoved.
+  ///
+  /// In zh, this message translates to:
+  /// **'已删除书签'**
+  String get browserBookmarkRemoved;
+
+  /// No description provided for @browserBookmarkTitle.
+  ///
+  /// In zh, this message translates to:
+  /// **'名称'**
+  String get browserBookmarkTitle;
+
+  /// No description provided for @browserBookmarkUrl.
+  ///
+  /// In zh, this message translates to:
+  /// **'网址'**
+  String get browserBookmarkUrl;
+
+  /// No description provided for @browserBookmarkLimit.
+  ///
+  /// In zh, this message translates to:
+  /// **'书签已满，先删掉几个'**
+  String get browserBookmarkLimit;
+
+  /// No description provided for @browserBookmarkMissing.
+  ///
+  /// In zh, this message translates to:
+  /// **'这个书签已经删除'**
+  String get browserBookmarkMissing;
+
+  /// No description provided for @browserNoBookmarks.
+  ///
+  /// In zh, this message translates to:
+  /// **'还没有书签'**
+  String get browserNoBookmarks;
+
+  /// No description provided for @browserNoBookmarksHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'在网页的菜单里选「加入书签」'**
+  String get browserNoBookmarksHint;
+
+  /// No description provided for @browserNoHistory.
+  ///
+  /// In zh, this message translates to:
+  /// **'还没有浏览记录'**
+  String get browserNoHistory;
+
+  /// No description provided for @browserHistoryRemove.
+  ///
+  /// In zh, this message translates to:
+  /// **'删除记录'**
+  String get browserHistoryRemove;
+
+  /// No description provided for @browserHistoryClear.
+  ///
+  /// In zh, this message translates to:
+  /// **'清空历史'**
+  String get browserHistoryClear;
+
+  /// No description provided for @browserHistoryClearConfirm.
+  ///
+  /// In zh, this message translates to:
+  /// **'清空全部浏览历史？'**
+  String get browserHistoryClearConfirm;
+
+  /// No description provided for @browserHistoryClearNote.
+  ///
+  /// In zh, this message translates to:
+  /// **'书签和打开的标签页不受影响'**
+  String get browserHistoryClearNote;
+
+  /// No description provided for @browserLibraryUnsaved.
+  ///
+  /// In zh, this message translates to:
+  /// **'书签和历史暂时没能保存'**
+  String get browserLibraryUnsaved;
+
+  /// No description provided for @browserTabClosed.
+  ///
+  /// In zh, this message translates to:
+  /// **'已关闭标签页'**
+  String get browserTabClosed;
+
+  /// No description provided for @browserUndo.
+  ///
+  /// In zh, this message translates to:
+  /// **'撤销'**
+  String get browserUndo;
+
+  /// No description provided for @browserCloseAll.
+  ///
+  /// In zh, this message translates to:
+  /// **'关闭全部标签页'**
+  String get browserCloseAll;
+
+  /// No description provided for @browserCloseAllConfirm.
+  ///
+  /// In zh, this message translates to:
+  /// **'关闭这个对话的 {count} 个标签页？'**
+  String browserCloseAllConfirm(int count);
+
+  /// No description provided for @browserCloseAllNote.
+  ///
+  /// In zh, this message translates to:
+  /// **'书签和历史会保留'**
+  String get browserCloseAllNote;
+
+  /// No description provided for @browserShare.
+  ///
+  /// In zh, this message translates to:
+  /// **'分享'**
+  String get browserShare;
+
+  /// No description provided for @browserTextSize.
+  ///
+  /// In zh, this message translates to:
+  /// **'网页文字大小'**
+  String get browserTextSize;
+
+  /// No description provided for @browserTextSizeReset.
+  ///
+  /// In zh, this message translates to:
+  /// **'恢复默认'**
+  String get browserTextSizeReset;
+
+  /// No description provided for @browserEngine.
+  ///
+  /// In zh, this message translates to:
+  /// **'搜索引擎'**
+  String get browserEngine;
+
+  /// No description provided for @browserEngineBing.
+  ///
+  /// In zh, this message translates to:
+  /// **'必应'**
+  String get browserEngineBing;
+
+  /// No description provided for @browserSiteGithub.
+  ///
+  /// In zh, this message translates to:
+  /// **'DSH Go'**
+  String get browserSiteGithub;
+
+  /// No description provided for @browserSiteWikipedia.
+  ///
+  /// In zh, this message translates to:
+  /// **'维基百科'**
+  String get browserSiteWikipedia;
+
+  /// No description provided for @browserTabsDone.
+  ///
+  /// In zh, this message translates to:
+  /// **'返回网页'**
+  String get browserTabsDone;
+
+  /// No description provided for @browserAuthSecure.
+  ///
+  /// In zh, this message translates to:
+  /// **'安全连接'**
+  String get browserAuthSecure;
+
+  /// No description provided for @browserAuthLoading.
+  ///
+  /// In zh, this message translates to:
+  /// **'正在加载登录页'**
+  String get browserAuthLoading;
+
+  /// No description provided for @browserAuthFinishing.
+  ///
+  /// In zh, this message translates to:
+  /// **'正在完成登录…'**
+  String get browserAuthFinishing;
+
+  /// No description provided for @browserAuthFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'登录没有完成，关闭后再试一次'**
+  String get browserAuthFailed;
+
+  /// No description provided for @browserAuthCallbackFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'登录结果没有送达，重试一次'**
+  String get browserAuthCallbackFailed;
+
+  /// No description provided for @browserAuthExternalFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'没能打开系统浏览器'**
+  String get browserAuthExternalFailed;
+
+  /// No description provided for @browserAuthBlocked.
+  ///
+  /// In zh, this message translates to:
+  /// **'这个地址不能在这里打开，可以换系统浏览器'**
+  String get browserAuthBlocked;
+
+  /// No description provided for @browserAuthOpenSystem.
+  ///
+  /// In zh, this message translates to:
+  /// **'在系统浏览器中打开'**
+  String get browserAuthOpenSystem;
+
+  /// No description provided for @browserSearch.
+  ///
+  /// In zh, this message translates to:
+  /// **'搜索'**
+  String get browserSearch;
+
+  /// No description provided for @browserClearHistory.
+  ///
+  /// In zh, this message translates to:
+  /// **'清除历史'**
+  String get browserClearHistory;
+
+  /// No description provided for @browserReturnToChat.
+  ///
+  /// In zh, this message translates to:
+  /// **'返回会话'**
+  String get browserReturnToChat;
+
+  /// No description provided for @browserReturnToChatRunning.
+  ///
+  /// In zh, this message translates to:
+  /// **'返回会话，任务进行中'**
+  String get browserReturnToChatRunning;
+
+  /// No description provided for @browserReturnToChatCompleted.
+  ///
+  /// In zh, this message translates to:
+  /// **'返回会话，任务已完成'**
+  String get browserReturnToChatCompleted;
+
+  /// No description provided for @browserRemoveReturn.
+  ///
+  /// In zh, this message translates to:
+  /// **'移除标签'**
+  String get browserRemoveReturn;
+
+  /// No description provided for @browserReopenBrowser.
+  ///
+  /// In zh, this message translates to:
+  /// **'回到浏览器'**
+  String get browserReopenBrowser;
+
+  /// No description provided for @browserDownloads.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载管理'**
+  String get browserDownloads;
+
+  /// No description provided for @browserDownload.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载'**
+  String get browserDownload;
+
+  /// No description provided for @browserDownloadFile.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载文件'**
+  String get browserDownloadFile;
+
+  /// No description provided for @browserDownloadConfirm.
+  ///
+  /// In zh, this message translates to:
+  /// **'确认下载'**
+  String get browserDownloadConfirm;
+
+  /// No description provided for @browserDownloadStart.
+  ///
+  /// In zh, this message translates to:
+  /// **'开始下载'**
+  String get browserDownloadStart;
+
+  /// No description provided for @browserDownloadCancel.
+  ///
+  /// In zh, this message translates to:
+  /// **'取消下载'**
+  String get browserDownloadCancel;
+
+  /// No description provided for @browserDownloadCancelled.
+  ///
+  /// In zh, this message translates to:
+  /// **'已取消下载'**
+  String get browserDownloadCancelled;
+
+  /// No description provided for @browserDownloadCompleted.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载完成'**
+  String get browserDownloadCompleted;
+
+  /// No description provided for @browserDownloadFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载失败'**
+  String get browserDownloadFailed;
+
+  /// No description provided for @browserDownloadInProgress.
+  ///
+  /// In zh, this message translates to:
+  /// **'正在下载'**
+  String get browserDownloadInProgress;
+
+  /// No description provided for @browserDownloadPaused.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载已暂停'**
+  String get browserDownloadPaused;
+
+  /// No description provided for @browserDownloadFileName.
+  ///
+  /// In zh, this message translates to:
+  /// **'文件名'**
+  String get browserDownloadFileName;
+
+  /// No description provided for @browserDownloadFileSize.
+  ///
+  /// In zh, this message translates to:
+  /// **'文件大小'**
+  String get browserDownloadFileSize;
+
+  /// No description provided for @browserDownloadSizeUnknown.
+  ///
+  /// In zh, this message translates to:
+  /// **'大小未知'**
+  String get browserDownloadSizeUnknown;
+
+  /// No description provided for @browserDownloadSource.
+  ///
+  /// In zh, this message translates to:
+  /// **'来源'**
+  String get browserDownloadSource;
+
+  /// No description provided for @browserDownloadLocation.
+  ///
+  /// In zh, this message translates to:
+  /// **'保存位置'**
+  String get browserDownloadLocation;
+
+  /// No description provided for @browserDownloadFolder.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载文件夹'**
+  String get browserDownloadFolder;
+
+  /// No description provided for @browserDownloadFolderChoose.
+  ///
+  /// In zh, this message translates to:
+  /// **'选择文件夹'**
+  String get browserDownloadFolderChoose;
+
+  /// No description provided for @browserDownloadFolderReset.
+  ///
+  /// In zh, this message translates to:
+  /// **'恢复默认'**
+  String get browserDownloadFolderReset;
+
+  /// No description provided for @browserDownloadFolderDefault.
+  ///
+  /// In zh, this message translates to:
+  /// **'默认下载文件夹'**
+  String get browserDownloadFolderDefault;
+
+  /// No description provided for @browserDownloadFirstTimeNote.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载会保存在下面的文件夹，可随时修改'**
+  String get browserDownloadFirstTimeNote;
+
+  /// No description provided for @browserDownloadUnsupported.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载链接或方式暂不支持'**
+  String get browserDownloadUnsupported;
+
+  /// No description provided for @browserDownloadExpired.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载链接已失效'**
+  String get browserDownloadExpired;
+
+  /// No description provided for @browserDownloadFolderChanged.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载文件夹已被其他页面修改，请重新确认'**
+  String get browserDownloadFolderChanged;
+
+  /// No description provided for @browserDownloadDirectoryError.
+  ///
+  /// In zh, this message translates to:
+  /// **'无法访问下载文件夹'**
+  String get browserDownloadDirectoryError;
+
+  /// No description provided for @browserDownloadPermissionError.
+  ///
+  /// In zh, this message translates to:
+  /// **'没有写入权限'**
+  String get browserDownloadPermissionError;
+
+  /// No description provided for @browserDownloadNetworkError.
+  ///
+  /// In zh, this message translates to:
+  /// **'网络连接失败'**
+  String get browserDownloadNetworkError;
+
+  /// No description provided for @browserDownloadHttpError.
+  ///
+  /// In zh, this message translates to:
+  /// **'服务器返回错误'**
+  String get browserDownloadHttpError;
+
+  /// No description provided for @browserDownloadIncomplete.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载未完成'**
+  String get browserDownloadIncomplete;
+
+  /// No description provided for @browserDownloadStorageError.
+  ///
+  /// In zh, this message translates to:
+  /// **'写入失败或存储空间不足'**
+  String get browserDownloadStorageError;
+
+  /// No description provided for @browserDownloadInterrupted.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载被中断'**
+  String get browserDownloadInterrupted;
+
+  /// No description provided for @browserDownloadNoApp.
+  ///
+  /// In zh, this message translates to:
+  /// **'没有应用可以打开此文件'**
+  String get browserDownloadNoApp;
+
+  /// No description provided for @browserDownloadMissing.
+  ///
+  /// In zh, this message translates to:
+  /// **'文件已被移动或删除'**
+  String get browserDownloadMissing;
+
+  /// No description provided for @browserDownloadTooLarge.
+  ///
+  /// In zh, this message translates to:
+  /// **'文件超过可加入会话的大小限制'**
+  String get browserDownloadTooLarge;
+
+  /// No description provided for @browserDownloadBusy.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载任务或记录已达上限'**
+  String get browserDownloadBusy;
+
+  /// No description provided for @browserDownloadError.
+  ///
+  /// In zh, this message translates to:
+  /// **'下载失败'**
+  String get browserDownloadError;
+
+  /// No description provided for @browserDownloadOpenFile.
+  ///
+  /// In zh, this message translates to:
+  /// **'打开文件'**
+  String get browserDownloadOpenFile;
+
+  /// No description provided for @browserDownloadAddToChat.
+  ///
+  /// In zh, this message translates to:
+  /// **'加入当前会话'**
+  String get browserDownloadAddToChat;
+
+  /// No description provided for @browserDownloadAddedToChat.
+  ///
+  /// In zh, this message translates to:
+  /// **'已加入草稿'**
+  String get browserDownloadAddedToChat;
+
+  /// No description provided for @browserDownloadNoDownloads.
+  ///
+  /// In zh, this message translates to:
+  /// **'还没有下载记录'**
+  String get browserDownloadNoDownloads;
+
+  /// No description provided for @browserDownloadRetry.
+  ///
+  /// In zh, this message translates to:
+  /// **'重试'**
+  String get browserDownloadRetry;
+
+  /// No description provided for @browserReturnShowAll.
+  ///
+  /// In zh, this message translates to:
+  /// **'查看全部'**
+  String get browserReturnShowAll;
+
+  /// No description provided for @browserReturnMultiple.
+  ///
+  /// In zh, this message translates to:
+  /// **'{count} 个标签'**
+  String browserReturnMultiple(int count);
+
+  /// No description provided for @browserDownloadChatChanged.
+  ///
+  /// In zh, this message translates to:
+  /// **'目标会话已更改'**
+  String get browserDownloadChatChanged;
+
+  /// No description provided for @browserDownloadTryFromPage.
+  ///
+  /// In zh, this message translates to:
+  /// **'请回到原网页重新发起下载'**
+  String get browserDownloadTryFromPage;
+
   /// No description provided for @catalogCurrentChat.
   ///
   /// In zh, this message translates to:
@@ -7741,6 +8539,84 @@ abstract class L10n {
   /// In zh, this message translates to:
   /// **'{name}，{description}'**
   String chatArtifactSemantics(String name, String description);
+
+  /// No description provided for @chatLegacyDrafts.
+  ///
+  /// In zh, this message translates to:
+  /// **'恢复旧草稿'**
+  String get chatLegacyDrafts;
+
+  /// No description provided for @chatLegacyDraftsHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'旧版保存的草稿，不属于任何主机'**
+  String get chatLegacyDraftsHint;
+
+  /// No description provided for @chatLegacyDraftNew.
+  ///
+  /// In zh, this message translates to:
+  /// **'旧版的新对话'**
+  String get chatLegacyDraftNew;
+
+  /// No description provided for @chatLegacyDraftChat.
+  ///
+  /// In zh, this message translates to:
+  /// **'旧版对话的草稿'**
+  String get chatLegacyDraftChat;
+
+  /// No description provided for @chatLegacyDraftTarget.
+  ///
+  /// In zh, this message translates to:
+  /// **'放在这个对话已有内容的后面，不会发送'**
+  String get chatLegacyDraftTarget;
+
+  /// No description provided for @chatLegacyDraftAppend.
+  ///
+  /// In zh, this message translates to:
+  /// **'加入当前草稿'**
+  String get chatLegacyDraftAppend;
+
+  /// No description provided for @chatLegacyDraftRestored.
+  ///
+  /// In zh, this message translates to:
+  /// **'已加入草稿'**
+  String get chatLegacyDraftRestored;
+
+  /// No description provided for @chatLegacyDraftStale.
+  ///
+  /// In zh, this message translates to:
+  /// **'对话已经切换，没有恢复'**
+  String get chatLegacyDraftStale;
+
+  /// No description provided for @chatWebQuote.
+  ///
+  /// In zh, this message translates to:
+  /// **'网页引用'**
+  String get chatWebQuote;
+
+  /// No description provided for @chatWebQuoteSelection.
+  ///
+  /// In zh, this message translates to:
+  /// **'选中内容'**
+  String get chatWebQuoteSelection;
+
+  /// No description provided for @chatWebQuotePage.
+  ///
+  /// In zh, this message translates to:
+  /// **'页面内容'**
+  String get chatWebQuotePage;
+
+  /// No description provided for @chatWebQuotePreview.
+  ///
+  /// In zh, this message translates to:
+  /// **'网页引用预览'**
+  String get chatWebQuotePreview;
+
+  /// No description provided for @chatRemoveWebQuote.
+  ///
+  /// In zh, this message translates to:
+  /// **'移除网页引用「{title}」'**
+  String chatRemoveWebQuote(String title);
 
   /// No description provided for @commonCancel.
   ///

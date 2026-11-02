@@ -64,7 +64,7 @@ void main() {
         expect(controllers['S']!.withdrawn, ['queued-local']);
         if (scenario == 'existing origin' || scenario == 'visible edited origin') {
           await tester.enterText(find.byType(TextField), 'new origin draft');
-          container.read(composerQuoteProvider.notifier).set('S', 'new origin quote');
+          container.read(composerQuoteProvider.notifier).set(localDraft('S'), 'new origin quote');
         }
         if (scenario != 'visible edited origin') {
           container.read(currentSessionProvider.notifier).select('T');
@@ -80,22 +80,22 @@ void main() {
         final shown = tester.widget<TextField>(find.byType(TextField)).controller!.text;
         if (scenario == 'visible edited origin') {
           expect(shown, 'new origin draft');
-          expect(quotes['S'], 'new origin quote');
+          expect(quotes[localDraft('S')], 'new origin quote');
           // Existing behavior may return attachments independently of text.
           expect(find.text('queued-file.txt'), findsWidgets);
         } else {
           expect(shown, scenario == 'typed target' ? 'target draft' : isEmpty);
-          expect(drafts['T']?.attachments ?? const [], isEmpty);
-          expect(quotes['T'], isNull);
+          expect(drafts[localDraft('T')]?.attachments ?? const [], isEmpty);
+          expect(quotes[localDraft('T')], isNull);
           expect(find.text('已撤回，可修改后再发'), findsNothing);
           if (scenario == 'existing origin') {
-            expect(drafts['S']!.text, 'new origin draft');
-            expect(drafts['S']!.attachments, isEmpty);
-            expect(quotes['S'], 'new origin quote');
+            expect(drafts[localDraft('S')]!.text, 'new origin draft');
+            expect(drafts[localDraft('S')]!.attachments, isEmpty);
+            expect(quotes[localDraft('S')], 'new origin quote');
           } else {
-            expect(drafts['S']!.text, 'withdrawn body');
-            expect(drafts['S']!.attachments.single, same(oldFile));
-            expect(quotes['S'], 'old quote');
+            expect(drafts[localDraft('S')]!.text, 'withdrawn body');
+            expect(drafts[localDraft('S')]!.attachments.single, same(oldFile));
+            expect(quotes[localDraft('S')], 'old quote');
           }
         }
         expect(tester.takeException(), isNull);

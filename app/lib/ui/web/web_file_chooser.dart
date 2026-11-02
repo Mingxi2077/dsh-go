@@ -52,6 +52,7 @@ class WebFileChooser {
         'acceptTypes': params.acceptTypes,
         'multiple': params.mode == FileSelectorMode.openMultiple,
       });
+      if (_disposed || generation != _generation) return const [];
       final after = await currentUrl();
       if (_disposed || generation != _generation || after != url) return const [];
       if (files == null || files.isEmpty) return const [];

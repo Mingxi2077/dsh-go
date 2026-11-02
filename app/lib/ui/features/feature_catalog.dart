@@ -16,6 +16,7 @@ import '../../plugins/seams/seams.dart';
 import '../../state/plugins_state.dart';
 import '../common/feature_tile.dart';
 import '../agents/team_page.dart';
+import '../browser/browser_entry.dart' show openBrowser;
 import '../bots/bots_page.dart';
 import '../community/community_page.dart';
 import '../cordis/cordis_page.dart';
@@ -371,6 +372,15 @@ final featureSections = <FeatureSection>[
       icon: AppIcons.workspace,
       tile: FeatureKind.workspace,
       native: (_) => const WorkspacesPage(),
+    ),
+    // 网页: external sites for the open conversation (or the host's 新对话);
+    // 网页版 below stays DSH's own interface.
+    FeatureItem.localized(
+      id: 'browser',
+      title: (l10n) => l10n.browserTitle,
+      summary: (l10n) => l10n.browserSummary,
+      icon: AppIcons.browser,
+      action: (context, ref, id) => openBrowser(context, sessionId: id),
     ),
     FeatureItem.localized(
       id: 'web',

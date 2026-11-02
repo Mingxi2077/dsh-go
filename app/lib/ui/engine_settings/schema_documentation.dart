@@ -5,8 +5,8 @@ import 'dart:async';
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter/material.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../theme/app_icons.dart';
 import '../theme/theme.dart';
@@ -161,7 +161,7 @@ Uri? schemaDocumentationUri(String value) {
 }
 
 typedef SchemaDocumentationLauncher = Future<bool> Function(Uri uri);
-Future<bool> _launch(Uri uri) => launchUrl(uri, mode: LaunchMode.externalApplication);
+Future<bool> _launch(Uri uri) => BrowserLinks.open(uri);
 
 class SchemaDocumentationButton extends StatelessWidget {
   const SchemaDocumentationButton({super.key, required this.schema, required this.title});

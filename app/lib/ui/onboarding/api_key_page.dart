@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../../state/app_info.dart';
 import '../../state/onboarding_state.dart';
@@ -84,7 +84,7 @@ class _ApiKeyPageState extends ConsumerState<ApiKeyPage> {
   }
 
   Future<void> _openPlatform() async {
-    if (await launchUrl(Uri.parse(AppInfo.deepseekPlatform), mode: LaunchMode.externalApplication)) return;
+    if (await BrowserLinks.open(Uri.parse(AppInfo.deepseekPlatform))) return;
     await Clipboard.setData(const ClipboardData(text: AppInfo.deepseekPlatform));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(context.l10n.shellBrowserUrlCopied)));

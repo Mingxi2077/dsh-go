@@ -14,12 +14,13 @@ import 'dart:convert';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../browser/browser_links.dart';
 import '../phone/phone_channel.dart' show PhoneTaskStatus;
 import '../pets/pet_signals.dart' show petFocusProvider, petPendingProvider;
 import '../update/update_config.dart' show updateRepo;
 import 'draft_store.dart';
+import 'hosts_state.dart' show activeHostProvider;
 import 'notify_state.dart' show appForegroundProvider, chatOnScreenProvider;
 import 'phone_state.dart' show phoneChannelProvider;
 import 'sessions_state.dart' show currentSessionProvider;
@@ -376,8 +377,10 @@ final phoneTaskSeenProvider = NotifierProvider<PhoneTaskSeenController, ({bool a
 /// host holds it while the switch is on.
 final starPromptSceneProvider = Provider<StarPromptScene>((ref) {
   final phone = ref.watch(phoneTaskSeenProvider);
+  final host = ref.watch(activeHostProvider);
   final session = ref.watch(currentSessionProvider);
-  final draft = ref.watch(draftStoreProvider.select((s) => s.drafts[session ?? 'new']));
+  final key = draftStorageKey(hostKey: '${host.kind.name}:${host.id}', sessionId: session);
+  final draft = ref.watch(draftStoreProvider.select((s) => s.drafts[key]));
   return StarPromptScene(
     onScreen: ref.watch(appForegroundProvider) && ref.watch(chatOnScreenProvider),
     running: ref.watch(petFocusProvider)?.running ?? false,
@@ -394,5 +397,5 @@ final starPromptSceneProvider = Provider<StarPromptScene>((ref) {
 /// Opens a page in the browser; false when none would (tests record it).
 final starLinkOpenerProvider = Provider<Future<bool> Function(Uri)>(
   (ref) =>
-      (uri) => launchUrl(uri, mode: LaunchMode.externalApplication).catchError((_) => false),
+      (uri) => BrowserLinks.open(uri).catchError((_) => false),
 );

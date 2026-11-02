@@ -115,6 +115,25 @@ void main() {
     });
   }
 
+  test('disposed chooser never queries the destroyed WebView after picker returns', () async {
+    final selected = Completer<List<String>>();
+    var reads = 0;
+    messenger.setMockMethodCallHandler(_channel, (call) async => call.method == 'pick' ? selected.future : null);
+    final pending = chooser.choose(
+      _params(),
+      webViewId: 7,
+      currentUrl: () async {
+        reads++;
+        return _url;
+      },
+    );
+    await pumpEventQueue();
+    chooser.dispose();
+    selected.complete([_file]);
+    expect(await pending, isEmpty);
+    expect(reads, 1);
+  });
+
   test('URL changed while selecting does not receive the selected file', () async {
     messenger.setMockMethodCallHandler(_channel, (_) async {
       url = 'https://other.example/';

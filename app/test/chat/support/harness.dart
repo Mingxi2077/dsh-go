@@ -1,3 +1,5 @@
+import 'package:dsh_app/state/web_quote.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -9,6 +11,7 @@ import 'package:dsh_app/state/balance_state.dart';
 import 'package:dsh_app/state/chat_state.dart';
 import 'package:dsh_app/state/commands_state.dart';
 import 'package:dsh_app/state/connection_state.dart';
+import 'package:dsh_app/state/draft_store.dart' show draftStorageKey;
 import 'package:dsh_app/state/models_state.dart';
 import 'package:dsh_app/state/sessions_state.dart';
 import 'package:dsh_app/state/settings_state.dart';
@@ -113,6 +116,7 @@ class FakeChatController extends ChatController {
   final sent = <String>[];
   final sentAttachments = <List<DraftAttachment>>[];
   final sentModes = <SendMode>[];
+  final sentWebCompositions = <WebQuoteComposition?>[];
   final steered = <String>[];
   final withdrawn = <String>[];
   final sentNow = <String>[];
@@ -134,10 +138,16 @@ class FakeChatController extends ChatController {
   void emit(ChatState next) => state = next;
 
   @override
-  Future<bool> send(String text, {List<DraftAttachment> attachments = const [], SendMode mode = SendMode.now}) async {
+  Future<bool> send(
+    String text, {
+    List<DraftAttachment> attachments = const [],
+    SendMode mode = SendMode.now,
+    WebQuoteComposition? webComposition,
+  }) async {
     sent.add(text);
     sentAttachments.add(attachments);
     sentModes.add(mode);
+    sentWebCompositions.add(webComposition);
     return await (sendResult ?? Future.value(true));
   }
 
@@ -417,6 +427,11 @@ class ChatHarness {
     ...extra,
   ];
 }
+
+/// The draft/quote storage key of [session] on 本机 (`new`: its new chat),
+/// as the chat screen stores them ([draftStorageKey]).
+String localDraft(String session, {String hostKey = 'local:local'}) =>
+    draftStorageKey(hostKey: hostKey, sessionId: session == 'new' ? null : session);
 
 /// Pumps a few frames without waiting for repeating animations to settle.
 Future<void> pumpFrames(WidgetTester tester, [int frames = 6]) async {

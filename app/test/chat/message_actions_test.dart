@@ -266,7 +266,6 @@ void main() {
       expect(await chat().forkBeforePrompt(prompt(8)), isNull);
       expect(state().error, '分叉失败：这里不能分叉');
     });
-
   });
 
   group('reply actions', () {
@@ -331,7 +330,10 @@ void main() {
       await tester.tap(find.widgetWithText(SettingsTile, '分享'));
       await pumpFrames(tester);
       expect(find.byType(SharePanel), findsOneWidget);
-      expect(tester.widget<SegmentedPill<ShareScope>>(find.byType(SegmentedPill<ShareScope>)).selected, ShareScope.reply);
+      expect(
+        tester.widget<SegmentedPill<ShareScope>>(find.byType(SegmentedPill<ShareScope>)).selected,
+        ShareScope.reply,
+      );
       expect(platform.shared, isEmpty);
       Navigator.of(tester.element(find.byType(SharePanel))).pop();
       await pumpFrames(tester);
@@ -342,7 +344,6 @@ void main() {
       expect(find.text('全部复制'), findsOneWidget);
       expect(find.byType(SelectionArea), findsOneWidget);
     });
-
   });
 
   group('prompt actions', () {
@@ -363,7 +364,7 @@ void main() {
       expect(harness.controllers['s1']!.edited, [1]);
       final container = ProviderScope.containerOf(tester.element(find.byType(ChatScreen)));
       expect(container.read(currentSessionProvider), 'fork-session');
-      expect(container.read(draftStoreProvider).drafts['s1']!.text, '原对话草稿');
+      expect(container.read(draftStoreProvider).drafts[localDraft('s1')]!.text, '原对话草稿');
       expect(_composerTexts(tester), contains('帮我看看测试为什么失败'));
       expect(find.text('已在新对话中打开'), findsOneWidget);
     });

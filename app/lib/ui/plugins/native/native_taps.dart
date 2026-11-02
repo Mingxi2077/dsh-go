@@ -16,8 +16,8 @@ import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 
+import '../../../browser/browser_links.dart';
 import '../../../l10n/l10n.dart';
 import '../../../plugins/native/native_capabilities.dart';
 import '../../../plugins/native/native_effects.dart';
@@ -783,8 +783,14 @@ Future<void> openNativePage(BuildContext context, WidgetRef ref, String page, {S
 }
 
 /// An https page in the browser, after a confirmation that names its host.
-Future<void> openConfirmedLink(BuildContext context, Uri url, {bool Function()? stillCurrent}) async {
-  if (url.scheme != 'https') return;
+/// [opener] can retain the caller's scope; it runs only after confirmation while current.
+Future<void> openConfirmedLink(
+  BuildContext context,
+  Uri url, {
+  bool Function()? stillCurrent,
+  Future<void> Function(Uri)? opener,
+}) async {
+  if (url.scheme != 'https' || !context.mounted || stillCurrent?.call() == false) return;
   final l10n = context.l10n;
   final ok = await showDialog<bool>(
     context: context,
@@ -796,8 +802,10 @@ Future<void> openConfirmedLink(BuildContext context, Uri url, {bool Function()? 
       ],
     ),
   );
-  if (ok == true && stillCurrent?.call() != false) {
-    await launchUrl(url, mode: LaunchMode.externalApplication).catchError((_) => false);
+  if (ok == true && context.mounted && stillCurrent?.call() != false) {
+    try {
+      await (opener ?? BrowserLinks.open)(url);
+    } catch (_) {}
   }
 }
 

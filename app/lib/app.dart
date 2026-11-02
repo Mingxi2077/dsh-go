@@ -10,9 +10,12 @@ import 'performance/refresh_rate.dart';
 import 'state/app_info.dart';
 import 'state/appearance_state.dart';
 import 'state/locale_state.dart';
+import 'state/hosts_state.dart' show activeHostProvider;
 import 'state/star_prompt.dart' show starPromptGateProvider, starPromptProvider;
 import 'state/tile_style_state.dart';
 import 'ui/chat/dsh_ui/dsh_ui_model.dart' show DshUiAppAccent;
+import 'ui/browser/browser_router.dart';
+import 'ui/browser/browser_auth_page.dart';
 import 'ui/common/side_insets.dart';
 import 'ui/launch/launch_overlay.dart';
 import 'ui/shell/root_gate.dart';
@@ -31,6 +34,9 @@ class DshApp extends ConsumerStatefulWidget {
 }
 
 class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
+  final _navigatorKey = GlobalKey<NavigatorState>();
+  late final AppBrowserRouter _browserRouter;
+
   /// Themes of the palette last built: rebuilt only when the palette or the
   /// language changes.
   AppAccent? _accent;
@@ -50,6 +56,12 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    _browserRouter = AppBrowserRouter(
+      navigatorKey: _navigatorKey,
+      host: () => ref.read(activeHostProvider),
+      authorizationBuilder: (request, onSystemBrowserOpened) =>
+          BrowserAuthPage(request: request, onSystemBrowserOpened: onSystemBrowserOpened),
+    )..attach();
     // Start loading the stored tile style now, so 全部功能 opens in it rather
     // than flashing the default first.
     ref.read(tileStyleProvider);
@@ -67,6 +79,7 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _browserRouter.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -116,9 +129,7 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     // 刷新率设置改动时告诉原生;setMode 对同一个值不做任何事。
-    unawaited(
-      RefreshRateService.instance.setMode(ref.watch(performancePrefsProvider.select((p) => p.refreshRate))),
-    );
+    unawaited(RefreshRateService.instance.setMode(ref.watch(performancePrefsProvider.select((p) => p.refreshRate))));
     final themeMode = ref.watch(uiThemeModeProvider.select((s) => s.value));
     final appearance = ref.watch(appearanceProvider);
     final waiting =
@@ -133,6 +144,7 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     final reduced =
         performance.reduceMotion || WidgetsBinding.instance.platformDispatcher.accessibilityFeatures.disableAnimations;
     return MaterialApp(
+      navigatorKey: _navigatorKey,
       title: AppInfo.name,
       debugShowCheckedModeBanner: false,
       theme: _light,

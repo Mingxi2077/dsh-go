@@ -17,6 +17,7 @@ import '../../runtime/runtime_bridge.dart' show RuntimePhase;
 import '../../runtime/runtime_state.dart' show localRuntimeProvider;
 import '../../state/agents_state.dart' show subagentParentProvider;
 import '../../state/attachments.dart';
+import '../../browser/browser_download_attachment.dart';
 import '../../state/balance_state.dart';
 import '../../state/chat_error_text.dart';
 import '../../state/chat_state.dart';
@@ -26,10 +27,11 @@ import '../../state/composer_insert.dart';
 import '../../state/composer_quote.dart';
 import '../../state/connection_state.dart';
 import '../../state/draft_store.dart';
+import '../../state/web_quote.dart';
 import '../../state/drawer_view_state.dart';
 import '../../state/engine_control.dart';
 import '../../state/engine_settings_state.dart' show engineSettingsProvider;
-import '../../state/hosts_state.dart' show HostKind, activeHostProvider;
+import '../../state/hosts_state.dart' show HostKind, activeHostProvider, hostLabel;
 import '../../state/media_generation.dart';
 import '../../state/mention_state.dart';
 import '../../state/models_state.dart';
@@ -42,6 +44,11 @@ import '../../state/voice_state.dart';
 import '../../state/voice_model_state.dart';
 import '../../state/voice_settings.dart';
 import '../../state/workspaces_state.dart' show selectedWorkspaceProvider, workspaceTitle;
+import '../../browser/browser_workspace.dart' show browserReferenceInboxProvider;
+import '../browser/browser_draft.dart';
+import '../browser/browser_entry.dart' show browserHostKey;
+import '../browser/browser_return_dock.dart';
+import 'legacy_drafts_sheet.dart';
 import '../../usage/usage_stats.dart';
 import '../common/app_sheet.dart';
 import '../common/brief_notice.dart';
@@ -189,6 +196,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
 
   /// Picked in the ＋ menu, not sent yet.
   List<DraftAttachment> _drafts = const [];
+  List<DraftWebQuote> _webQuotes = const [];
 
   /// Only this creation may own the composer's busy state.
   Object? _creating;
@@ -205,14 +213,32 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
   /// 每个对话一份草稿:换对话时输入条换成那个对话的字和附件。
   late final DraftStore _draftStore;
 
-  /// The open conversation's id, or `new`.
+  /// The open conversation's id, or `new`: what RPC, session creation and
+  /// generation mode go by.
   late String _draftKey;
 
-  void _saveDraft() => _draftStore.save(_draftKey, _input.text, _drafts);
+  /// Whose composer this is: the host and conversation captured with
+  /// [_draftKey]. Text, attachments and the quote are stored under
+  /// [_draftStorageKey], so a same-named conversation (or 新对话) on another
+  /// host never shares them.
+  late String _draftHostKey;
+  String? _draftSessionId;
+
+  String get _draftStorageKey => draftStorageKey(hostKey: _draftHostKey, sessionId: _draftSessionId);
+
+  /// The storage key of [sessionId] on [hostKey] (default: this composer's host).
+  String _storageKey(String? sessionId, [String? hostKey]) =>
+      draftStorageKey(hostKey: hostKey ?? _draftHostKey, sessionId: sessionId);
+
+  /// The composer on screen is [sessionId]'s on [hostKey].
+  bool _showing(String? sessionId, String hostKey) => _draftSessionId == sessionId && _draftHostKey == hostKey;
+
+  void _saveDraft() => _draftStore.save(_draftStorageKey, _input.text, _drafts, webQuotes: _webQuotes);
 
   /// Attachments first: setting the text saves both.
   void _showDraft(ChatDraft? draft) {
     _drafts = draft?.attachments ?? const [];
+    _webQuotes = draft?.webQuotes ?? const [];
     final text = draft?.text ?? '';
     _input.value = TextEditingValue(
       text: text,
@@ -222,9 +248,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
 
   void _reportVoice() => _voiceFlag.set(_voice.active);
 
-  void _switchDraft(String? sessionId) {
+  /// Shows [sessionId]'s composer on [hostKey] (default: this host), saving
+  /// the one on screen under its own key first.
+  void _switchDraft(String? sessionId, {String? hostKey}) {
+    final host = hostKey ?? _draftHostKey;
     final key = sessionId ?? 'new';
-    if (key == _draftKey) return;
+    if (key == _draftKey && _showing(sessionId, host)) return;
     _draftScope = Object();
     _creating = null;
     _syncWait = null;
@@ -232,9 +261,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     _mentions.dismiss();
     _saveDraft();
     _draftKey = key;
+    _draftSessionId = sessionId;
+    _draftHostKey = host;
     _spoken = null;
     _editing = false;
-    setState(() => _showDraft(ref.read(draftStoreProvider).drafts[key]));
+    setState(() => _showDraft(ref.read(draftStoreProvider).drafts[_draftStorageKey]));
+    // Quotes from 网页 already waiting for this composer: the ready flag may
+    // have stayed true across the switch, so nothing else would announce them.
+    scheduleMicrotask(_takeBrowserReferences);
   }
 
   /// 没有会话时的错误(建会话失败),会话内的错误走 ChatState.error。
@@ -269,11 +303,34 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     });
     _voiceFlag = ref.read(voiceInputActiveProvider.notifier);
     _voice.addListener(_reportVoice);
-    _draftKey = ref.read(currentSessionProvider) ?? 'new';
+    _draftSessionId = ref.read(currentSessionProvider);
+    _draftKey = _draftSessionId ?? 'new';
+    _draftHostKey = browserHostKey(ref.read(activeHostProvider));
     _draftStore = ref.read(draftStoreProvider.notifier);
-    _showDraft(ref.read(draftStoreProvider).drafts[_draftKey]);
+    _showDraft(ref.read(draftStoreProvider).drafts[_draftStorageKey]);
     _input.addListener(_saveDraft);
     ref.listenManual(currentSessionProvider, (_, next) => _switchDraft(next));
+    // Another host: the old composer is saved under its own host, and the
+    // new host's 新对话 shows (never the new host with the old session).
+    // A restored host may bring its conversation along: follow it after.
+    ref.listenManual(activeHostProvider, (_, next) {
+      final host = browserHostKey(next);
+      if (host == _draftHostKey) return;
+      _switchDraft(null, hostKey: host);
+      scheduleMicrotask(() {
+        if (mounted && _draftHostKey == host) _switchDraft(ref.read(currentSessionProvider));
+      });
+    });
+    // A quote from 网页, once this composer is its conversation's and the
+    // saved drafts are in. Taken after the notification that announced it.
+    ref.listenManual(browserReferenceReadyProvider, (_, ready) {
+      if (ready) scheduleMicrotask(_takeBrowserReferences);
+    });
+    ref.listenManual(browserDownloadDraftUpdatesProvider, (_, updates) {
+      if (!mounted || !updates.containsKey(_draftStorageKey)) return;
+      final saved = ref.read(draftStoreProvider).drafts[_draftStorageKey];
+      if (saved != null) setState(() => _drafts = saved.attachments);
+    });
     ref.listenManual(activeConnectionProvider.select((c) => c.value?.client), (_, _) {
       _draftScope = Object();
       if (_creating != null || _syncWait != null) {
@@ -285,8 +342,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     });
     // Saved drafts arrive a moment after launch.
     ref.listenManual(draftStoreProvider.select((s) => s.loaded), (_, loaded) {
-      if (loaded && _input.text.isEmpty) {
-        setState(() => _showDraft(ref.read(draftStoreProvider).drafts[_draftKey]));
+      if (loaded && _input.text.isEmpty && _drafts.isEmpty && _webQuotes.isEmpty) {
+        setState(() => _showDraft(ref.read(draftStoreProvider).drafts[_draftStorageKey]));
       }
     });
     // Opening the chat counts as "open" for the balance (throttled to 1/min).
@@ -298,7 +355,41 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
         _takeComposerInsert();
       }
       if (mounted && ref.read(readyComposeProvider) != null) _takeCompose();
+      if (mounted && ref.read(browserReferenceReadyProvider)) _takeBrowserReferences();
     });
+  }
+
+  /// Capture references as attachments without touching the prompt or caret.
+  void _takeBrowserReferences() {
+    if (!mounted || !ref.read(draftStoreProvider).loaded) return;
+    final scope = ref.read(activeBrowserScopeProvider);
+    if (!_showing(scope.sessionId, scope.hostKey) || _draftKey != (scope.sessionId ?? 'new')) return;
+    final owner = _composerOwner();
+    final inbox = ref.read(browserReferenceInboxProvider.notifier);
+    final base = _input.text;
+    final attachments = _drafts;
+    final previous = _webQuotes;
+    final added = <DraftWebQuote>[];
+    while (previous.length + added.length < DraftWebQuote.limit) {
+      // take() notifies synchronously: a listener may change host/session.
+      final reference = inbox.take(scope);
+      if (reference == null) break;
+      added.add(DraftWebQuote.fromContent(reference.content));
+      if (!_stillOwns(owner)) break;
+    }
+    if (added.isEmpty) return;
+    if (_stillOwns(owner)) {
+      setState(() => _webQuotes = List.unmodifiable([...previous, ...added]));
+      _saveDraft();
+    } else {
+      final saved = ref.read(draftStoreProvider).drafts[owner.key];
+      _draftStore.save(
+        owner.key,
+        saved?.text ?? base,
+        saved?.attachments ?? attachments,
+        webQuotes: [...saved?.webQuotes ?? previous, ...added],
+      );
+    }
   }
 
   void _takeRepairDraft() {
@@ -379,6 +470,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     if (current != null) return current;
     if (_creating != null) return null;
     final pendingFolder = ref.read(pendingSessionFolderProvider);
+    // The new chat's composer belongs to this host; its draft moves with it.
+    final hostKey = _draftHostKey;
     final attempt = Object();
     bool ownsCreation() => identical(_creating, attempt) && isCurrent();
     setState(() {
@@ -397,7 +490,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
       }
       // A completed create may outlive its page, client or new-chat draft.
       // Check before any selection, migration, deletion or model side effect.
-      if (!ownsCreation() || _draftKey != 'new' || ref.read(currentSessionProvider) != null) return null;
+      if (!ownsCreation() ||
+          !_showing(null, hostKey) ||
+          _draftKey != 'new' ||
+          ref.read(currentSessionProvider) != null) {
+        return null;
+      }
       if (ref.read(pendingSessionFolderProvider) != pendingFolder) return null;
       if (pendingFolder != null) {
         await ref
@@ -411,21 +509,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
       }
       final pendingModel = ref.read(pendingModelProvider);
       _draftKey = sessionId;
+      _draftSessionId = sessionId;
       _saveDraft();
-      if (!ownsCreation() || _draftKey != sessionId) return null;
+      bool owns() => ownsCreation() && _draftKey == sessionId && _showing(sessionId, hostKey);
+      if (!owns()) return null;
       ref.read(currentSessionProvider.notifier).select(sessionId);
-      if (!ownsCreation() || _draftKey != sessionId || ref.read(currentSessionProvider) != sessionId) return null;
-      ref.read(composerQuoteProvider.notifier).move('new', sessionId);
+      if (!owns() || ref.read(currentSessionProvider) != sessionId) return null;
+      ref.read(composerQuoteProvider.notifier).move(_storageKey(null, hostKey), _storageKey(sessionId, hostKey));
+      // Generation mode keeps its session/new keys.
       ref.read(generateModeProvider.notifier).move('new', sessionId);
-      if (!ownsCreation() || _draftKey != sessionId) return null;
-      _draftStore.clear('new');
+      if (!owns()) return null;
+      _draftStore.clear(_storageKey(null, hostKey));
       if (pendingModel != null) {
         if (!ownsCreation()) return null;
         ref.read(pendingModelProvider.notifier).select(null);
         if (!ownsCreation()) return null;
         if (!await ref.read(chatProvider(sessionId).notifier).setModel(pendingModel)) return null;
       }
-      if (!ownsCreation() || _draftKey != sessionId || ref.read(currentSessionProvider) != sessionId) return null;
+      if (!owns() || ref.read(currentSessionProvider) != sessionId) return null;
       return sessionId;
     } finally {
       if (mounted && identical(_creating, attempt)) setState(() => _creating = null);
@@ -437,7 +538,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     if (_mentions.pickHighlighted()) return;
     final typed = _input.text.trim();
     final drafts = _drafts;
-    if ((typed.isEmpty && drafts.isEmpty) || _creating != null || _syncWait != null) return;
+    final webQuotes = _webQuotes;
+    if ((typed.isEmpty && drafts.isEmpty && webQuotes.isEmpty) || _creating != null || _syncWait != null) return;
     // Generation mode: an ordinary message whose first line is the
     // parameter header (media-generation §8, revision of 2026-10-28).
     final generate = ref.read(generateModeProvider).byKey[_draftKey];
@@ -446,10 +548,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     if (client == null) return;
     final generation = client.mux.generation;
     final scope = _draftScope;
+    final hostKey = _draftHostKey;
     bool ownsDraft() => identical(_draftScope, scope) && _sameConnection(client, generation);
     // 引用追问: the passage above the composer goes in front, as a quote.
-    final quote = ref.read(composerQuoteProvider)[_draftKey];
-    final asked = quote == null ? typed : withQuote(quote, typed);
+    final quote = ref.read(composerQuoteProvider)[_draftStorageKey];
+    final asked = withWebQuotes(
+      quote == null ? typed : withQuote(quote, typed),
+      webQuotes,
+      english: AppLocale.isEnglish,
+    );
     // The header grammar refuses what it can't carry (§4.6.4): nothing goes.
     final written = generate?.tryMessage(asked);
     if (written != null && written.text == null) {
@@ -464,7 +571,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
 
     // With attachments or a quote the line is a message, even if it starts
     // with "/".
-    if (drafts.isEmpty && quote == null && generate == null) {
+    if (drafts.isEmpty && webQuotes.isEmpty && quote == null && generate == null) {
       final input = parseSlashInput(text);
       // A bare "/": the palette is open, the person picks a row.
       if (input != null && !input.hasArgs && input.token.isEmpty) return;
@@ -481,14 +588,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     }
 
     final sessionId = await _ensureSession(isCurrent: ownsDraft);
-    if (sessionId == null || !ownsDraft() || _draftKey != sessionId) return;
+    if (sessionId == null || !ownsDraft() || _draftKey != sessionId || !_showing(sessionId, hostKey)) return;
+    final quoteKey = _storageKey(sessionId, hostKey);
     final chat = ref.read(chatProvider(sessionId).notifier);
     if (!ref.read(chatProvider(sessionId)).controlReady) {
       if (mode == SendMode.interrupt) return;
       // session/create can finish before its first follow snapshot. Keep
       // the draft visible while waiting; a timeout must not eat the message.
       final wait = Object();
-      bool current() => identical(_syncWait, wait) && _draftKey == sessionId && ownsDraft();
+      bool current() =>
+          identical(_syncWait, wait) && _draftKey == sessionId && _showing(sessionId, hostKey) && ownsDraft();
       setState(() => _syncWait = wait);
       try {
         final ready = await chat.waitForSync(isCurrent: current);
@@ -496,7 +605,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
             !current() ||
             _input.text.trim() != typed ||
             !identical(_drafts, drafts) ||
-            ref.read(composerQuoteProvider)[sessionId] != quote) {
+            !identical(_webQuotes, webQuotes) ||
+            ref.read(composerQuoteProvider)[quoteKey] != quote) {
           return;
         }
       } finally {
@@ -507,14 +617,20 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     // even when the session's baseline is already available on return.
     if (!ownsDraft() ||
         _draftKey != sessionId ||
+        !_showing(sessionId, hostKey) ||
         _input.text.trim() != typed ||
         !identical(_drafts, drafts) ||
-        ref.read(composerQuoteProvider)[sessionId] != quote) {
+        !identical(_webQuotes, webQuotes) ||
+        ref.read(composerQuoteProvider)[quoteKey] != quote) {
       return;
     }
-    setState(() => _drafts = const []);
+    setState(() {
+      _drafts = const [];
+      _webQuotes = const [];
+    });
     _input.clear();
-    ref.read(composerQuoteProvider.notifier).clear(sessionId);
+    _saveDraft();
+    ref.read(composerQuoteProvider.notifier).clear(quoteKey);
 
     // One open question and nothing else waiting: the text is its answer
     // (a steer would wait behind the question).
@@ -522,17 +638,27 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     final bool ok;
     if (current.singleQuestion case final request?
         when drafts.isEmpty &&
+            webQuotes.isEmpty &&
             quote == null &&
             generate == null &&
             mode == SendMode.now &&
             current.openApproval == null) {
       ok = await chat.answer(request, [QuestionAnswer(request.questions.single.id, custom: text)]);
     } else {
-      ok = await chat.send(text, attachments: drafts, mode: mode);
+      ok = await chat.send(
+        text,
+        attachments: drafts,
+        mode: mode,
+        webComposition: webQuotes.isEmpty
+            ? null
+            : WebQuoteComposition(text: typed, quotes: webQuotes, replyQuote: quote),
+      );
       // A generation request, counted on top of its turn.
       if (ok && generate != null && mounted) ref.read(usageStatsProvider.notifier).count(UsageCount.gen);
     }
-    if (!ok && _sameConnection(client, generation)) _giveBack(sessionId, typed, drafts, quote: quote);
+    if (!ok && _sameConnection(client, generation)) {
+      _giveBack(sessionId, hostKey, typed, drafts, quote: quote, webQuotes: webQuotes);
+    }
   }
 
   // A failed send belongs to the Host that accepted it. The controller may
@@ -544,17 +670,40 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
       identical(client.mux.generation, generation);
 
   /// 没发出去:把字、附件和引用还给那个对话(用户还没开始打新的才还)。
-  void _giveBack(String sessionId, String text, List<DraftAttachment> attachments, {String? quote}) {
-    final quotes = ref.read(composerQuoteProvider.notifier);
-    if (quote != null && ref.read(composerQuoteProvider)[sessionId] == null) {
-      quotes.set(sessionId, quote);
+  /// [hostKey] is the host the message went to, captured when it was sent.
+  void _giveBack(
+    String sessionId,
+    String hostKey,
+    String text,
+    List<DraftAttachment> attachments, {
+    String? quote,
+    List<DraftWebQuote> webQuotes = const [],
+  }) {
+    final key = _storageKey(sessionId, hostKey);
+    if (_draftStore.isForgotten(key)) return;
+    final showing = _draftKey == sessionId && _showing(sessionId, hostKey);
+    final currentQuote = ref.read(composerQuoteProvider)[key];
+    if (!showing) {
+      // Recover the original draft as a whole, never attach its old reply
+      // quote to a newer saved draft in a conversation that is now hidden.
+      if (ref.read(draftStoreProvider).drafts[key] != null || currentQuote != null) return;
+    } else if (webQuotes.isNotEmpty || _webQuotes.isNotEmpty) {
+      // A structured composition is atomic, including its reply quote.
+      if (_input.text.isNotEmpty || _drafts.isNotEmpty || _webQuotes.isNotEmpty || currentQuote != null) return;
     }
-    if (_draftKey != sessionId) {
-      // Moved on to another conversation: back into its own draft.
-      if (ref.read(draftStoreProvider).drafts[sessionId] == null) {
-        _draftStore.save(sessionId, text, attachments);
+    final quotes = ref.read(composerQuoteProvider.notifier);
+    if (quote != null && currentQuote == null) {
+      quotes.set(key, quote);
+    }
+    if (!showing) {
+      // Moved on to another conversation or host: back into its own draft.
+      if (ref.read(draftStoreProvider).drafts[key] == null) {
+        _draftStore.save(key, text, attachments, webQuotes: webQuotes);
       }
       return;
+    }
+    if (webQuotes.isNotEmpty) {
+      setState(() => _webQuotes = webQuotes);
     }
     if (_drafts.isEmpty) setState(() => _drafts = attachments);
     if (_input.text.isEmpty) {
@@ -572,16 +721,87 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     final client = ref.read(activeConnectionProvider).value?.client;
     if (client == null) return;
     final generation = client.mux.generation;
+    final hostKey = _draftHostKey;
     final ok = await ref.read(chatProvider(sessionId).notifier).send(text, attachments: images);
     if (ok || !_sameConnection(client, generation)) return;
     final (:quote, :body) = splitQuote(text);
-    _giveBack(sessionId, quote == null ? text : body, images, quote: quote);
+    _giveBack(sessionId, hostKey, quote == null ? text : body, images, quote: quote);
   }
 
-  /// 「引用」 on a reply of [sessionId]: the passage above its composer.
-  void _quote(String sessionId, String passage) {
-    ref.read(composerQuoteProvider.notifier).set(sessionId, passage);
-    _focus.requestFocus();
+  /// What a composer action made now belongs to: this draft generation, its
+  /// host, conversation and storage key. A sheet may call back later; the
+  /// owner says whether that call still lands in the same composer (an
+  /// A → B → A switch is a new generation, so it does not).
+  ({Object scope, String host, String? session, String key}) _composerOwner() =>
+      (scope: _draftScope, host: _draftHostKey, session: _draftSessionId, key: _draftStorageKey);
+
+  bool _stillOwns(({Object scope, String host, String? session, String key}) owner) =>
+      mounted &&
+      identical(_draftScope, owner.scope) &&
+      _showing(owner.session, owner.host) &&
+      _draftStorageKey == owner.key;
+
+  /// 「引用」 on a reply, the callback made for the composer on screen when
+  /// the list was built: a selection sheet opened before a switch quotes
+  /// nothing.
+  ValueChanged<String> _quoteFor() {
+    final owner = _composerOwner();
+    return (passage) {
+      if (!_stillOwns(owner)) return;
+      ref.read(composerQuoteProvider.notifier).set(owner.key, passage);
+      _focus.requestFocus();
+    };
+  }
+
+  bool _restoringLegacy = false;
+
+  /// 恢复旧草稿: an old draft (no host) read in full and confirmed, added
+  /// after this composer's draft. The edit on screen is saved first and the
+  /// result shown after; attachments stay, nothing is sent, the old draft is
+  /// kept. A switch while the sheet is open (A → B → A too) restores nothing.
+  Future<void> _restoreLegacyDraft() async {
+    if (_restoringLegacy) return;
+    final owner = _composerOwner();
+    final l10n = context.l10n;
+    final chat = owner.session == null
+        ? l10n.commonNewChat
+        : (ref.read(sessionsProvider).value?.where((s) => s.sessionId == owner.session).firstOrNull?.title?.trim() ??
+              l10n.commonUntitledChat);
+    // The host this composer is on, named as the header names it.
+    final host = ref.read(activeHostProvider);
+    final hostName = hostLabel(host.kind, host.isLocal ? null : ref.read(hostNameProvider(host)));
+    _restoringLegacy = true;
+    try {
+      final pick = await showLegacyDraftsSheet(
+        context,
+        chat: chat.isEmpty ? l10n.commonUntitledChat : chat,
+        host: hostName,
+      );
+      if (pick == null || !mounted) return;
+      if (!_stillOwns(owner)) {
+        _toast(l10n.chatLegacyDraftStale);
+        return;
+      }
+      _saveDraft();
+      final store = ref.read(draftStoreProvider.notifier);
+      if (!store.importLegacy(legacyKey: pick.key, expectedText: pick.text, targetKey: owner.key)) {
+        _toast(l10n.commonFailedTryAgain);
+        return;
+      }
+      final draft = ref.read(draftStoreProvider).drafts[owner.key];
+      if (draft == null) return;
+      setState(() {
+        _drafts = draft.attachments;
+        _webQuotes = draft.webQuotes;
+      });
+      _input.value = TextEditingValue(
+        text: draft.text,
+        selection: TextSelection.collapsed(offset: draft.text.length),
+      );
+      _toast(l10n.chatLegacyDraftRestored);
+    } finally {
+      _restoringLegacy = false;
+    }
   }
 
   /// [message] into the composer, its leading quote back above it as the
@@ -603,7 +823,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     }
     final (:quote, :body) = quoteChip ? splitQuote(text) : (quote: null, body: text);
     if (quote != null) {
-      ref.read(composerQuoteProvider.notifier).set(_draftKey, quote);
+      ref.read(composerQuoteProvider.notifier).set(_draftStorageKey, quote);
     }
     final shown = quote == null ? text : body;
     _input.value = TextEditingValue(
@@ -667,7 +887,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     final readyNumber = client?.mux.lastReadyGenerationNumber;
     final text = _input.text;
     final drafts = _drafts;
-    final quote = ref.read(composerQuoteProvider)[sessionId];
+    final webQuotes = _webQuotes;
+    final hostKey = _draftHostKey;
+    final quoteKey = _storageKey(sessionId, hostKey);
+    final quote = ref.read(composerQuoteProvider)[quoteKey];
     final mode = await showAppSheet<SendMode>(
       context,
       builder: (sheet) => SafeArea(
@@ -704,13 +927,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
         !mounted ||
         !identical(_draftScope, scope) ||
         _draftKey != sessionId ||
+        !_showing(sessionId, hostKey) ||
         ref.read(currentSessionProvider) != sessionId ||
         client == null ||
         !_sameConnection(client, generation) ||
         client.mux.lastReadyGenerationNumber != readyNumber ||
         _input.text != text ||
         !identical(_drafts, drafts) ||
-        ref.read(composerQuoteProvider)[sessionId] != quote) {
+        !identical(_webQuotes, webQuotes) ||
+        ref.read(composerQuoteProvider)[quoteKey] != quote) {
       return;
     }
     await _send(mode: mode);
@@ -723,17 +948,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     final client = ref.read(activeConnectionProvider).value?.client;
     if (client == null) return;
     final generation = client.mux.generation;
+    final hostKey = _draftHostKey;
     final lost = await ref.read(chatProvider(sessionId).notifier).sendNow(prompt);
-    if (_sameConnection(client, generation)) _giveBackLost(sessionId, lost);
+    if (_sameConnection(client, generation)) _giveBackLost(sessionId, hostKey, lost);
   }
 
   /// A waiting message taken out to go again did not make it back: into the
   /// composer, like any send that failed.
-  void _giveBackLost(String sessionId, List<PendingPrompt> lost) {
+  void _giveBackLost(String sessionId, String hostKey, List<PendingPrompt> lost) {
     final prompt = lost.firstOrNull;
     if (prompt == null) return;
+    if (prompt.webComposition case final composition?) {
+      _giveBack(
+        sessionId,
+        hostKey,
+        composition.text,
+        prompt.attachments,
+        quote: composition.replyQuote,
+        webQuotes: composition.quotes,
+      );
+      return;
+    }
     final (:quote, :body) = splitQuote(prompt.text);
-    _giveBack(sessionId, quote == null ? prompt.text : body, prompt.attachments, quote: quote);
+    _giveBack(sessionId, hostKey, quote == null ? prompt.text : body, prompt.attachments, quote: quote);
   }
 
   /// "撤回" on a queued message: out of the inbox and back into the composer
@@ -745,6 +982,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     if (client == null) return;
     final generation = client.mux.generation;
     final readyNumber = client.mux.lastReadyGenerationNumber;
+    final hostKey = _draftHostKey;
+    final key = _storageKey(sessionId, hostKey);
     final ok = await ref.read(chatProvider(sessionId).notifier).withdrawQueued(prompt);
     if (!ok ||
         !mounted ||
@@ -752,19 +991,32 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
         client.mux.lastReadyGenerationNumber != readyNumber) {
       return;
     }
-    if (_draftKey != sessionId) {
+    if (_draftKey != sessionId || !_showing(sessionId, hostKey)) {
       // The queue removal succeeded, but its text still belongs to that chat.
       // Preserve an existing draft as a whole, including its quote.
-      if (ref.read(draftStoreProvider).drafts[sessionId] == null) {
-        _giveBackLost(sessionId, [prompt]);
+      if (ref.read(draftStoreProvider).drafts[key] == null) {
+        _giveBackLost(sessionId, hostKey, [prompt]);
       }
+      return;
+    }
+    if (prompt.webComposition != null || _webQuotes.isNotEmpty) {
+      final empty =
+          _input.text.trim().isEmpty &&
+          _drafts.isEmpty &&
+          _webQuotes.isEmpty &&
+          ref.read(composerQuoteProvider)[key] == null;
+      if (empty) {
+        _giveBackLost(sessionId, hostKey, [prompt]);
+        _focus.requestFocus();
+      }
+      showBriefNotice(context, empty ? appL10n.chatWithdrawnEditable : appL10n.chatWithdrawn);
       return;
     }
     var restored = false;
     if (_input.text.trim().isEmpty && prompt.text.isNotEmpty) {
       final (:quote, :body) = splitQuote(prompt.text);
-      if (quote != null && ref.read(composerQuoteProvider)[sessionId] == null) {
-        ref.read(composerQuoteProvider.notifier).set(sessionId, quote);
+      if (quote != null && ref.read(composerQuoteProvider)[key] == null) {
+        ref.read(composerQuoteProvider.notifier).set(key, quote);
       }
       _input.text = quote == null ? prompt.text : body;
       restored = true;
@@ -810,6 +1062,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
       );
       if (choice is GenerateChoice) {
         if (ownsDraft()) _enterGenerate();
+        return;
+      }
+      if (choice is LegacyDraftsChoice) {
+        if (ownsDraft()) unawaited(_restoreLegacyDraft());
         return;
       }
       if (choice is! AttachChoice || !ownsDraft()) return;
@@ -890,6 +1146,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
       ],
     );
     _saveDraft();
+  }
+
+  void _removeWebQuote(DraftWebQuote quote) {
+    setState(() => _webQuotes = List.unmodifiable(_webQuotes.where((q) => q.id != quote.id)));
+    _saveDraft();
+    scheduleMicrotask(_takeBrowserReferences);
   }
 
   void _toast(String message) {
@@ -1189,15 +1451,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
         final scope = _draftScope;
         final text = _input.text;
         final drafts = _drafts;
-        final quote = ref.read(composerQuoteProvider)[_draftKey];
+        final webQuotes = _webQuotes;
+        final hostKey = _draftHostKey;
+        final quote = ref.read(composerQuoteProvider)[_draftStorageKey];
         bool ownsDraft() => identical(_draftScope, scope) && _sameConnection(client, generation);
         final sessionId = await _ensureSession(isCurrent: ownsDraft);
         if (sessionId == null ||
             !ownsDraft() ||
             _draftKey != sessionId ||
+            !_showing(sessionId, hostKey) ||
             _input.text != text ||
             !identical(_drafts, drafts) ||
-            ref.read(composerQuoteProvider)[sessionId] != quote) {
+            !identical(_webQuotes, webQuotes) ||
+            ref.read(composerQuoteProvider)[_storageKey(sessionId, hostKey)] != quote) {
           return;
         }
         _input.clear();
@@ -1218,8 +1484,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     final client = ref.read(activeConnectionProvider).value?.client;
     if (client == null) return;
     final generation = client.mux.generation;
+    final hostKey = _draftHostKey;
     final lost = await ref.read(chatProvider(sessionId).notifier).cancel();
-    if (_sameConnection(client, generation)) _giveBackLost(sessionId, lost);
+    if (_sameConnection(client, generation)) _giveBackLost(sessionId, hostKey, lost);
   }
 
   /// The engine could not be reached: try again.
@@ -1447,7 +1714,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
         ? null
         : ref.watch(mediaCatalogProvider.select((c) => c.resolve(generate.model, generate.kind)?.model));
     // 引用追问: the passage waiting above this conversation's composer.
-    final quote = ref.watch(composerQuoteProvider.select((quotes) => quotes[_draftKey]));
+    final quoteKey = _draftStorageKey;
+    final quote = ref.watch(composerQuoteProvider.select((quotes) => quotes[quoteKey]));
+    final legacyDrafts = ref.watch(draftStoreProvider.select((s) => s.loaded && hasLegacyDrafts(s)));
     final error = sessionId == null ? _localError : chat?.error;
     // An error wins the slot; a notice shows when there is none.
     final notice = error == null && sessionId != null ? chat?.notice : null;
@@ -1557,7 +1826,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
                                 onSendNow: _sendNow,
                                 onEditPrompt: _compose,
                                 onResend: _resend,
-                                onQuote: readOnly ? null : (passage) => _quote(sessionId, passage),
+                                onQuote: readOnly ? null : _quoteFor(),
                                 onToast: _composerToast,
                                 onSwitchModel: readOnly ? null : _switchModel,
                               ),
@@ -1831,20 +2100,32 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
                                     onKeyEvent: _mentions.handleKey,
                                     onContentInserted: connected ? _pasteContent : null,
                                     onStop: _stop,
-                                    hasAttachments: _drafts.isNotEmpty,
-                                    leading: AttachButton(onPressed: connected ? _attach : null),
+                                    hasAttachments: _drafts.isNotEmpty || _webQuotes.isNotEmpty,
+                                    // Offline, ＋ (attachments need the host) gives way to
+                                    // 恢复旧草稿 while old drafts are there: they are local.
+                                    leading: connected || !legacyDrafts
+                                        ? AttachButton(onPressed: connected ? _attach : null)
+                                        : AttachButton(
+                                            key: const ValueKey('composer-legacy-drafts'),
+                                            icon: AppIcons.history,
+                                            label: l10n.chatLegacyDrafts,
+                                            onPressed: () => unawaited(_restoreLegacyDraft()),
+                                          ),
                                     tray: ComposerTrayStack.maybe(
                                       quote: switch (quote) {
                                         final quote? => QuoteChip(
                                           quote: quote,
-                                          onRemove: () => ref.read(composerQuoteProvider.notifier).clear(_draftKey),
+                                          onRemove: () =>
+                                              ref.read(composerQuoteProvider.notifier).clear(_draftStorageKey),
                                         ),
                                         null => null,
                                       },
-                                      attachments: _drafts.isEmpty
+                                      attachments: _drafts.isEmpty && _webQuotes.isEmpty
                                           ? null
                                           : ComposerTray(
                                               items: _drafts,
+                                              webQuotes: _webQuotes,
+                                              onRemoveWebQuote: _removeWebQuote,
                                               onRemove: _removeDraft,
                                               labels: frameLabels(generate, generateModel, _drafts.length),
                                             ),
@@ -1870,7 +2151,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
         ),
       ),
     );
-    return UiTrace(scope: 'chat', child: screen);
+    return UiTrace(
+      scope: 'chat',
+      child: BrowserReturnDock(child: screen),
+    );
   }
 
   /// What sits on the composer's top-left edge: 「自动允许中 ×」 while this

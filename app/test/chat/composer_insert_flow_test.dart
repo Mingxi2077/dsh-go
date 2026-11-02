@@ -82,7 +82,7 @@ void main() {
     expect(find.byType(ChatEmptyState), findsOneWidget);
     expect(_field(tester).text, '/pdf ');
     expect(_focused(tester), isTrue);
-    expect(container.read(draftStoreProvider).drafts['s1']?.text, '还没发的话');
+    expect(container.read(draftStoreProvider).drafts[localDraft('s1')]?.text, '还没发的话');
   });
 
   testWidgets('asked before the chat was built', (tester) async {

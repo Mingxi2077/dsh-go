@@ -305,5 +305,25 @@
   "chatGoalStateSemantics": "Goal, {objective}, {state}",
   "chatTodoItemSemantics": "{content}, {state}",
   "chatMentionSemantics": "{kind}: {label}",
-  "chatArtifactSemantics": "{name}, {description}"
+  "chatArtifactSemantics": "{name}, {description}",
+  "chatLegacyDrafts": "Restore old drafts",
+  "chatLegacyDraftsHint": "Saved by an older version, not tied to a host",
+  "chatLegacyDraftNew": "Old new chat",
+  "chatLegacyDraftChat": "Old chat draft",
+  "chatLegacyDraftTarget": "Goes after the text already there. Nothing is sent",
+  "chatLegacyDraftAppend": "Add to draft",
+  "chatLegacyDraftRestored": "Added to draft",
+  "chatLegacyDraftStale": "The chat changed. Nothing was restored",
+  "chatWebQuote": "Web reference",
+  "chatWebQuoteSelection": "Selection",
+  "chatWebQuotePage": "Page",
+  "chatWebQuotePreview": "Web reference preview",
+  "chatRemoveWebQuote": "Remove web reference \"{title}\"",
+  "@chatRemoveWebQuote": {
+    "placeholders": {
+      "title": {
+        "type": "String"
+      }
+    }
+  }
 }

@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../browser/browser_links.dart';
+import '../../browser/browser_policy.dart';
 import '../../l10n/l10n.dart';
 import '../../state/account_state.dart';
 import '../../state/settings_state.dart';
@@ -28,14 +30,18 @@ class AccountPage extends ConsumerStatefulWidget {
 
 class _AccountPageState extends ConsumerState<AccountPage> {
   late final AppLifecycleListener _lifecycle;
+  late final StreamSubscription<Uri> _pageReturns;
 
   /// A Platform page (top-up, usage) was opened: re-read wallets on return.
-  bool _awaitingReturn = false;
+  Uri? _awaitingReturn;
 
   @override
   void initState() {
     super.initState();
     _lifecycle = AppLifecycleListener(onResume: _onResume);
+    _pageReturns = BrowserLinks.pageReturns.listen((url) {
+      if (mounted && url == _awaitingReturn) _onResume();
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final account = ref.read(accountProvider);
@@ -48,13 +54,14 @@ class _AccountPageState extends ConsumerState<AccountPage> {
   @override
   void dispose() {
     _lifecycle.dispose();
+    unawaited(_pageReturns.cancel());
     super.dispose();
   }
 
   void _onResume() {
     ref.read(accountProvider.notifier).noteAppResumed();
-    if (_awaitingReturn) {
-      _awaitingReturn = false;
+    if (_awaitingReturn != null) {
+      _awaitingReturn = null;
       _refresh();
     }
   }
@@ -66,7 +73,8 @@ class _AccountPageState extends ConsumerState<AccountPage> {
 
   Future<void> _openPlatform(String? url) async {
     if (url == null) return;
-    _awaitingReturn = true;
+    final uri = Uri.tryParse(url);
+    _awaitingReturn = uri == null ? null : BrowserPolicy.savedUrl(uri);
     await openAccountLink(context, ref, url);
   }
 

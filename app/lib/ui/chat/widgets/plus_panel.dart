@@ -24,6 +24,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../l10n/l10n.dart';
 import '../../../state/chat_state.dart';
 import '../../../state/connection_state.dart';
+import '../../../state/draft_store.dart' show draftStoreProvider;
+import '../legacy_drafts_sheet.dart' show hasLegacyDrafts;
 import '../../../state/features_state.dart';
 import '../../../state/phone_state.dart';
 import '../../../state/session_modes.dart';
@@ -55,6 +57,11 @@ final class AttachChoice extends PlusChoice {
 /// 「生成」: into generation mode.
 final class GenerateChoice extends PlusChoice {
   const GenerateChoice();
+}
+
+/// 「恢复旧草稿」: drafts an older version saved without a host.
+final class LegacyDraftsChoice extends PlusChoice {
+  const LegacyDraftsChoice();
 }
 
 /// The panel's measured geometry; `test/chat/plus_panel_test.dart` checks it.
@@ -113,6 +120,7 @@ class _PlusRoot extends ConsumerWidget {
     final l10n = context.l10n;
     final sessionId = this.sessionId;
     final phoneOn = ref.watch(phoneProvider.select((s) => s.status.enabled));
+    final legacy = ref.watch(draftStoreProvider.select((s) => s.loaded && hasLegacyDrafts(s)));
     final tiles = [
       (AttachChoice(AttachSource.gallery), AppIcons.gallery, l10n.chatGallery, 0),
       (AttachChoice(AttachSource.camera), AppIcons.camera, l10n.chatTakePhoto, 2),
@@ -137,6 +145,22 @@ class _PlusRoot extends ConsumerWidget {
         ),
         if (sessionId != null) ...[const SizedBox(height: 16), _ThisChatCard(sessionId: sessionId)],
         if (phoneOn) ...[const SizedBox(height: 24), const _PhoneCard()],
+        // Only while an older version's drafts are there to restore.
+        if (legacy) ...[
+          const SizedBox(height: 16),
+          SheetGroup(
+            margin: const EdgeInsets.symmetric(horizontal: PlusPanelMetrics.side),
+            children: [
+              ListPageRow(
+                key: const ValueKey('plus-legacy-drafts'),
+                icon: AppIcons.history,
+                title: l10n.chatLegacyDrafts,
+                subtitle: l10n.chatLegacyDraftsHint,
+                onTap: () => Navigator.pop(context, const LegacyDraftsChoice()),
+              ),
+            ],
+          ),
+        ],
         const SizedBox(height: 20),
       ],
     );

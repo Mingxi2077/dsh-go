@@ -14,6 +14,7 @@ runtime/.build-*.log
 app/build/
 # Gradle writes reports (problems-report.html) here even though Flutter moves the build dir
 app/android/build/
+app/android/.kotlin/
 # build outputs never belong in git
 *.apk
 *.aab

@@ -205,16 +205,16 @@ void main() {
       c.trace(tester, 'late-create-after-T');
       expect(c.selected, 'T');
       expect(c.input(tester), 'T B');
-      expect(c.drafts['new']!.text, 'new A');
-      expect(c.drafts['T']!.text, 'T B');
-      expect(c.drafts['S'], isNull);
+      expect(c.drafts[localDraft('new')]!.text, 'new A');
+      expect(c.drafts[localDraft('T')]!.text, 'T B');
+      expect(c.drafts[localDraft('S')], isNull);
       expect(c.h.container.read(pendingModelProvider), _model);
       expect(c.h.methods.where((m) => m == 'session/selectModel'), isEmpty);
       expect(fixture.writes(c.h), isEmpty);
       await c.typeAndSend(tester, 'T B');
       await fixture.settleIo(tester, () => fixture.writes(c.h).isNotEmpty);
       _expectPrompt(c, 'T', 'T B');
-      expect(c.drafts['new']!.text, 'new A');
+      expect(c.drafts[localDraft('new')]!.text, 'new A');
       expect(tester.takeException(), isNull);
     } finally {
       await c.close(tester);
@@ -234,8 +234,8 @@ void main() {
       c.trace(tester, 'new-T-new-ABA');
       expect(c.selected, isNull);
       expect(c.input(tester), 'new A');
-      expect(c.drafts['new']!.text, 'new A');
-      expect(c.drafts['S'], isNull);
+      expect(c.drafts[localDraft('new')]!.text, 'new A');
+      expect(c.drafts[localDraft('S')], isNull);
       expect(fixture.writes(c.h), isEmpty);
       expect(tester.takeException(), isNull);
     } finally {
@@ -267,8 +267,8 @@ void main() {
           expect(c.selected, next == 'create' ? isNull : 'T');
           expect(c.busy(tester), isTrue);
           expect(c.input(tester), 'new B');
-          expect(c.drafts[next == 'create' ? 'new' : 'T']!.text, 'new B');
-          expect(c.drafts['S'], isNull);
+          expect(c.drafts[localDraft(next == 'create' ? 'new' : 'T')]!.text, 'new B');
+          expect(c.drafts[localDraft('S')], isNull);
           expect(fixture.writes(c.h), isEmpty);
           if (next == 'sync') {
             // The existing informational synchronizing banner is legitimate.
@@ -311,21 +311,21 @@ void main() {
       expect(c.selected, isNull);
       expect(c.busy(tester), isFalse);
       expect(c.input(tester), 'retry A');
-      expect(c.drafts['new']!.text, 'retry A');
+      expect(c.drafts[localDraft('new')]!.text, 'retry A');
       expect(find.byType(ErrorBanner), findsOneWidget);
       await c.typeAndSend(tester, 'retry A');
       expect(c.sessions.pending, hasLength(2));
       c.sessions.finish(1);
       await tester.pump();
       expect(c.selected, 'S');
-      expect(c.drafts['new'], isNull);
-      expect(c.drafts['S']!.text, 'retry A');
+      expect(c.drafts[localDraft('new')], isNull);
+      expect(c.drafts[localDraft('S')]!.text, 'retry A');
       expect(c.busy(tester), isTrue);
       expect(fixture.writes(c.h), isEmpty);
       await c.baseline(tester, 'S');
       await fixture.settleIo(tester, () => fixture.writes(c.h).isNotEmpty);
       _expectPrompt(c, 'S', 'retry A');
-      expect(c.drafts['S'], isNull);
+      expect(c.drafts[localDraft('S')], isNull);
       expect(tester.takeException(), isNull);
     } finally {
       await c.close(tester);
@@ -349,8 +349,8 @@ void main() {
       expect(c.selected, isNull);
       expect(c.busy(tester), isTrue);
       expect(c.input(tester), 'after remount');
-      expect(c.drafts['new']!.text, 'after remount');
-      expect(c.drafts['S'], isNull);
+      expect(c.drafts[localDraft('new')]!.text, 'after remount');
+      expect(c.drafts[localDraft('S')], isNull);
       expect(fixture.writes(c.h), isEmpty);
       expect(tester.takeException(), isNull);
     } finally {
@@ -387,8 +387,8 @@ void main() {
         c.trace(tester, 'client-${replace ? 'replacement' : 'ABA'}');
         expect(c.selected, isNull);
         expect(c.input(tester), 'client A');
-        expect(c.drafts['new']!.text, 'client A');
-        expect(c.drafts['S'], isNull);
+        expect(c.drafts[localDraft('new')]!.text, 'client A');
+        expect(c.drafts[localDraft('S')], isNull);
         expect(fixture.writes(c.h), isEmpty);
         if (replacement != null) expect(fixture.writes(replacement!), isEmpty);
         expect(tester.takeException(), isNull);
@@ -414,8 +414,8 @@ void main() {
       c.trace(tester, 'mux-retirement');
       expect(c.selected, isNull);
       expect(c.busy(tester), isFalse);
-      expect(c.drafts['new']!.text, 'generation A');
-      expect(c.drafts['S'], isNull);
+      expect(c.drafts[localDraft('new')]!.text, 'generation A');
+      expect(c.drafts[localDraft('S')], isNull);
       expect(fixture.writes(c.h), isEmpty);
       expect(tester.takeException(), isNull);
     } finally {
@@ -446,8 +446,8 @@ void main() {
         expect(c.selected, 'S');
         expect(c.busy(tester), isFalse);
         expect(c.input(tester), edit == 'text' ? 'edited B' : 'original A');
-        expect(c.drafts['S']!.text, edit == 'text' ? 'edited B' : 'original A');
-        expect(c.drafts['S']!.attachments, hasLength(edit == 'attachment' ? 1 : 0));
+        expect(c.drafts[localDraft('S')]!.text, edit == 'text' ? 'edited B' : 'original A');
+        expect(c.drafts[localDraft('S')]!.attachments, hasLength(edit == 'attachment' ? 1 : 0));
         expect(fixture.writes(c.h), isEmpty);
         expect(tester.takeException(), isNull);
       } finally {
@@ -466,7 +466,7 @@ void main() {
       await fixture.settleIo(tester, () => hold.received!.isCompleted);
       expect(c.selected, 'S');
       expect(c.busy(tester), isTrue);
-      expect(c.drafts['S']!.text, 'S A');
+      expect(c.drafts[localDraft('S')]!.text, 'S A');
       c.select(null);
       await tester.pump();
       c.h.container.read(pendingModelProvider.notifier).select(_nextModel);
@@ -478,8 +478,8 @@ void main() {
       expect(c.selected, isNull);
       expect(c.busy(tester), isTrue);
       expect(c.input(tester), 'U B');
-      expect(c.drafts['S']!.text, 'S A');
-      expect(c.drafts['new']!.text, 'U B');
+      expect(c.drafts[localDraft('S')]!.text, 'S A');
+      expect(c.drafts[localDraft('new')]!.text, 'U B');
       expect(c.h.container.read(pendingModelProvider), _nextModel);
       expect(fixture.writes(c.h), isEmpty);
       c.sessions.finish(1, id: 'U');
@@ -489,7 +489,7 @@ void main() {
       _expectPrompt(c, 'U', 'U B');
       expect(c.h.container.read(pendingModelProvider), isNull);
       expect(c.h.container.read(chatProvider('U')).model!.toJson(), _nextModel.toJson());
-      expect(c.drafts['S']!.text, 'S A');
+      expect(c.drafts[localDraft('S')]!.text, 'S A');
       expect(tester.takeException(), isNull);
     } finally {
       hold.finish();
@@ -515,9 +515,9 @@ void main() {
         if (retire) {
           expect(c.selected, 'T');
           expect(c.input(tester), 'T B');
-          expect(c.drafts['new']!.text, '/compact');
-          expect(c.drafts['T']!.text, 'T B');
-          expect(c.drafts['S'], isNull);
+          expect(c.drafts[localDraft('new')]!.text, '/compact');
+          expect(c.drafts[localDraft('T')]!.text, 'T B');
+          expect(c.drafts[localDraft('S')], isNull);
           expect(c.h.methods.where((m) => m == 'commands/execute'), isEmpty);
         } else {
           await fixture.settleIo(tester, () => c.h.methods.contains('commands/execute'));
@@ -550,7 +550,7 @@ void main() {
       c.trace(tester, 'ready-S-T-S-ABA');
       expect(c.selected, 'S');
       expect(c.input(tester), 'S A');
-      expect(c.drafts['S']!.text, 'S A');
+      expect(c.drafts[localDraft('S')]!.text, 'S A');
       expect(c.sessions.pending, isEmpty);
       expect(fixture.writes(c.h), isEmpty);
       expect(c.busy(tester), isFalse);

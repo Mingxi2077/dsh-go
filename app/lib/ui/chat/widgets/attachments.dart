@@ -6,12 +6,14 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../l10n/l10n.dart';
 import '../../../media/gallery.dart' show imageProviderBytes;
 import '../../../state/attachments.dart';
+import '../../../state/web_quote.dart';
 import '../../shell/page_frame.dart';
 import '../../theme/app_icons.dart';
 import '../../theme/theme.dart';
 import 'image_actions.dart';
 import 'plus_panel.dart';
 import 'stream_motion.dart';
+import 'web_quote_card.dart';
 
 export 'plus_panel.dart' show AttachSource;
 
@@ -24,21 +26,28 @@ Future<AttachSource?> showAttachMenu(BuildContext context, {bool files = true}) 
 
 /// 40dp round ＋ at the composer's leading edge.
 class AttachButton extends StatelessWidget {
-  const AttachButton({super.key, required this.onPressed});
+  const AttachButton({super.key, required this.onPressed, this.icon, this.label});
 
   final VoidCallback? onPressed;
+
+  /// Another action in the same seat (恢复旧草稿 while offline); default ＋.
+  final IconData? icon;
+
+  /// Its name, read out and shown as the tooltip; default 添加附件.
+  final String? label;
 
   @override
   Widget build(BuildContext context) {
     final l10n = context.l10n;
     final scheme = Theme.of(context).colorScheme;
     final enabled = onPressed != null;
+    final name = label ?? l10n.chatAddAttachment;
     return Semantics(
       button: true,
       enabled: enabled,
-      label: l10n.chatAddAttachment,
+      label: name,
       child: Tooltip(
-        message: l10n.chatAddAttachment,
+        message: name,
         child: InkResponse(
           onTap: onPressed == null
               ? null
@@ -52,7 +61,7 @@ class AttachButton extends StatelessWidget {
             height: 40,
             decoration: BoxDecoration(color: scheme.onSurface.withValues(alpha: 0.06), shape: BoxShape.circle),
             child: Icon(
-              AppIcons.add,
+              icon ?? AppIcons.add,
               size: 24,
               color: enabled ? scheme.onSurface : scheme.onSurface.withValues(alpha: 0.38),
             ),
@@ -65,7 +74,14 @@ class AttachButton extends StatelessWidget {
 
 /// Picked-but-unsent attachments, in a strip above the composer's text.
 class ComposerTray extends StatelessWidget {
-  const ComposerTray({super.key, required this.items, required this.onRemove, this.labels = const []});
+  const ComposerTray({
+    super.key,
+    required this.items,
+    required this.onRemove,
+    this.labels = const [],
+    this.webQuotes = const [],
+    this.onRemoveWebQuote,
+  });
 
   final List<DraftAttachment> items;
   final ValueChanged<DraftAttachment> onRemove;
@@ -74,41 +90,57 @@ class ComposerTray extends StatelessWidget {
   /// 首帧 / 尾帧), 6 in from its bottom-left corner.
   final List<Widget?> labels;
 
+  /// Web quotes to show after file/image attachments.
+  final List<DraftWebQuote> webQuotes;
+  final ValueChanged<DraftWebQuote>? onRemoveWebQuote;
+
   static const height = 56 + _overhang;
 
   @override
   Widget build(BuildContext context) {
     final l10n = context.l10n;
+    final totalCount = items.length + webQuotes.length;
     return SizedBox(
       height: height,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
         padding: EdgeInsets.zero,
-        itemCount: items.length,
+        itemCount: totalCount,
         separatorBuilder: (_, _) => const SizedBox(width: 8),
         itemBuilder: (context, i) {
-          final a = items[i];
-          final tile = a.isImage
-              ? _Thumb(
-                  size: const Size.square(56),
-                  heroTag: 'draft-${a.id}',
-                  image: MemoryImage(a.bytes),
-                  onTap: () => openImageViewer(context, MemoryImage(a.bytes), heroTag: 'draft-${a.id}', name: a.name),
-                )
-              : FileCard(name: a.name, bytes: a.size, height: 56, tinted: true);
-          final label = i < labels.length ? labels[i] : null;
-          return _Removable(
-            onRemove: () => onRemove(a),
-            label: l10n.chatRemoveAttachment(a.name),
-            child: label == null
-                ? tile
-                : Stack(
-                    children: [
-                      tile,
-                      Positioned(left: 6, bottom: 6, child: label),
-                    ],
-                  ),
-          );
+          if (i < items.length) {
+            final a = items[i];
+            final tile = a.isImage
+                ? _Thumb(
+                    size: const Size.square(56),
+                    heroTag: 'draft-${a.id}',
+                    image: MemoryImage(a.bytes),
+                    onTap: () => openImageViewer(context, MemoryImage(a.bytes), heroTag: 'draft-${a.id}', name: a.name),
+                  )
+                : FileCard(name: a.name, bytes: a.size, height: 56, tinted: true);
+            final label = i < labels.length ? labels[i] : null;
+            return _Removable(
+              onRemove: () => onRemove(a),
+              label: l10n.chatRemoveAttachment(a.name),
+              child: label == null
+                  ? tile
+                  : Stack(
+                      children: [
+                        tile,
+                        Positioned(left: 6, bottom: 6, child: label),
+                      ],
+                    ),
+            );
+          } else {
+            final quoteIndex = i - items.length;
+            final quote = webQuotes[quoteIndex];
+            final title = quote.title.trim().isEmpty ? quote.url.host : quote.title.trim();
+            return _Removable(
+              onRemove: () => onRemoveWebQuote?.call(quote),
+              label: l10n.chatRemoveWebQuote(title),
+              child: WebQuoteCard(quote: quote),
+            );
+          }
         },
       ),
     );

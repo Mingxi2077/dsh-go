@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../browser/browser_workspace.dart';
 import 'composer_quote.dart';
 import 'connection_state.dart';
 import 'draft_store.dart';
@@ -161,13 +162,26 @@ class SessionDeletionController extends Notifier<bool> {
         try {
           if (!owned()) break;
           await backend.delete(client, id);
-          // A late response belongs to its old Host, never to a new screen.
-          if (!owned()) break;
           deleted.add(id);
+          // Success still clears its captured Host's global scope after a
+          // departure. Only the current UI and further requests need ownership.
+          if (!ref.mounted) break;
           ref.read(readListCacheProvider).invalidateKind(ReadListKind.sessions, identity);
-          ref.read(draftStoreProvider.notifier).forget(id);
-          if (!owned()) break;
-          ref.read(composerQuoteProvider.notifier).clear(id);
+          final hostKey = '${owner.host.kind.name}:${owner.host.id}';
+          final draftKey = draftStorageKey(hostKey: hostKey, sessionId: id);
+          ref.read(draftStoreProvider.notifier).forget(draftKey);
+          if (!ref.mounted) break;
+          ref.read(composerQuoteProvider.notifier).clear(draftKey);
+          if (!ref.mounted) break;
+          final browserScope = BrowserScope(hostKey: hostKey, sessionId: id);
+          ref.read(browserReferenceInboxProvider.notifier).discard(browserScope);
+          if (!ref.mounted) break;
+          try {
+            await ref.read(browserWorkspaceProvider.notifier).clear(browserScope);
+          } on Object {
+            // The Host already confirmed deletion. Browser cleanup must not
+            // undo that result or prevent the remaining local cleanup.
+          }
           if (!owned()) break;
           sessions.confirmDeleted(id);
           if (!owned()) break;

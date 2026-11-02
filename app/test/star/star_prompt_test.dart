@@ -595,11 +595,15 @@ void main() {
       await blocked(
         tester,
         (b) async {
-          b.container.read(draftStoreProvider.notifier).save('new', '帮我看看', const []);
+          b.container
+              .read(draftStoreProvider.notifier)
+              .save(draftStorageKey(hostKey: 'local:local', sessionId: null), '帮我看看', const []);
           await tester.pump(const Duration(milliseconds: 500));
         },
         lift: (b) async {
-          b.container.read(draftStoreProvider.notifier).save('new', '', const []);
+          b.container
+              .read(draftStoreProvider.notifier)
+              .save(draftStorageKey(hostKey: 'local:local', sessionId: null), '', const []);
           await tester.pump(const Duration(milliseconds: 500));
         },
       );

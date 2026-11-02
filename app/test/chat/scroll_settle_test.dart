@@ -156,9 +156,9 @@ void main() {
       }
     }
 
-    await change(() => quotes.set('s1', '超时重试多发了一次请求'));
+    await change(() => quotes.set(localDraft('s1'), '超时重试多发了一次请求'));
     expect(find.text('超时重试多发了一次请求'), findsOneWidget);
-    await change(() => quotes.clear('s1'));
+    await change(() => quotes.clear(localDraft('s1')));
     expect(find.text('超时重试多发了一次请求'), findsNothing);
   });
 }

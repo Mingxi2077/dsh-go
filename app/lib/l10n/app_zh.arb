@@ -1898,6 +1898,174 @@
   "brandOppoOs": "OPPO / 一加 / realme（ColorOS）",
   "brandSamsungOs": "三星（One UI）",
   "brandZhihu": "知乎",
+  "browserTitle": "网页",
+  "browserSummary": "浏览网页,引用到对话",
+  "browserAddressHint": "搜索或输入网址",
+  "browserAddressHintPlaceholders": "探索未至之境……\n开始深度求索——\n记得给dsh-go点star喵~~\n今天想搜点什么呢？\n搜索或输入网址",
+  "browserAddressInvalid": "这个地址不能在这里打开",
+  "browserTabs": "标签页",
+  "browserTabCount": "{count} 个标签页",
+  "@browserTabCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "browserNoTabs": "还没有标签页",
+  "browserNewTab": "新标签页",
+  "browserCloseTab": "关闭标签页",
+  "browserTabLimit": "标签页已满，先关掉几个",
+  "browserTabsUnsaved": "标签页暂时没能保存",
+  "browserClose": "关闭网页",
+  "browserBack": "后退",
+  "browserForward": "前进",
+  "browserReload": "重新加载",
+  "browserOpenExternal": "在系统浏览器打开",
+  "browserQuote": "引用到对话",
+  "browserQuoteSelection": "选中的文字",
+  "browserQuoteSelectionHint": "先在网页里长按选中",
+  "browserQuotePage": "网页正文",
+  "browserQuotePageHint": "不含表单、脚本和隐藏内容",
+  "browserNoSelection": "没有选中文字，先在网页里长按选中",
+  "browserEmptyPage": "这个网页没有可读的正文",
+  "browserExtractFailed": "页面已变化或无法读取，请重试",
+  "browserPreviewStale": "页面已经变了，重新提取",
+  "browserTruncated": "内容较长，只取了前一部分",
+  "browserCharCount": "{count} 字",
+  "@browserCharCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "browserAddToDraft": "加入草稿",
+  "browserAddedToDraft": "已加入草稿",
+  "browserGoToChat": "去对话",
+  "browserNotSent": "只放进输入框，不会自动发送",
+  "browserReferenceLimit": "待加入的引用太多，先回对话看看",
+  "browserBlocked": "这个链接不能在这里打开",
+  "browserLoadFailed": "检查网络后再试",
+  "browserSearchWith": "用 {engine} 搜索",
+  "@browserSearchWith": {
+    "placeholders": {
+      "engine": {
+        "type": "String"
+      }
+    }
+  },
+  "browserHome": "首页",
+  "browserShortcuts": "书签",
+  "browserRecent": "最近浏览",
+  "browserOpenPages": "打开的网页",
+  "browserAllHistory": "全部历史",
+  "browserLibrary": "书签与历史",
+  "browserBookmarks": "书签",
+  "browserHistory": "历史",
+  "browserBookmarkAdd": "加入书签",
+  "browserBookmarkEdit": "编辑书签",
+  "browserBookmarkSaved": "已加入书签",
+  "browserBookmarkRemoved": "已删除书签",
+  "browserBookmarkTitle": "名称",
+  "browserBookmarkUrl": "网址",
+  "browserBookmarkLimit": "书签已满，先删掉几个",
+  "browserBookmarkMissing": "这个书签已经删除",
+  "browserNoBookmarks": "还没有书签",
+  "browserNoBookmarksHint": "在网页的菜单里选「加入书签」",
+  "browserNoHistory": "还没有浏览记录",
+  "browserHistoryRemove": "删除记录",
+  "browserHistoryClear": "清空历史",
+  "browserHistoryClearConfirm": "清空全部浏览历史？",
+  "browserHistoryClearNote": "书签和打开的标签页不受影响",
+  "browserLibraryUnsaved": "书签和历史暂时没能保存",
+  "browserTabClosed": "已关闭标签页",
+  "browserUndo": "撤销",
+  "browserCloseAll": "关闭全部标签页",
+  "browserCloseAllConfirm": "关闭这个对话的 {count} 个标签页？",
+  "@browserCloseAllConfirm": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "browserCloseAllNote": "书签和历史会保留",
+  "browserShare": "分享",
+  "browserTextSize": "网页文字大小",
+  "browserTextSizeReset": "恢复默认",
+  "browserEngine": "搜索引擎",
+  "browserEngineBing": "必应",
+  "browserSiteGithub": "DSH Go",
+  "browserSiteWikipedia": "维基百科",
+  "browserTabsDone": "返回网页",
+  "browserAuthSecure": "安全连接",
+  "browserAuthLoading": "正在加载登录页",
+  "browserAuthFinishing": "正在完成登录…",
+  "browserAuthFailed": "登录没有完成，关闭后再试一次",
+  "browserAuthCallbackFailed": "登录结果没有送达，重试一次",
+  "browserAuthExternalFailed": "没能打开系统浏览器",
+  "browserAuthBlocked": "这个地址不能在这里打开，可以换系统浏览器",
+  "browserAuthOpenSystem": "在系统浏览器中打开",
+  "browserSearch": "搜索",
+  "browserClearHistory": "清除历史",
+  "browserReturnToChat": "返回会话",
+  "browserReturnToChatRunning": "返回会话，任务进行中",
+  "browserReturnToChatCompleted": "返回会话，任务已完成",
+  "browserRemoveReturn": "移除标签",
+  "browserReopenBrowser": "回到浏览器",
+  "browserDownloads": "下载管理",
+  "browserDownload": "下载",
+  "browserDownloadFile": "下载文件",
+  "browserDownloadConfirm": "确认下载",
+  "browserDownloadStart": "开始下载",
+  "browserDownloadCancel": "取消下载",
+  "browserDownloadCancelled": "已取消下载",
+  "browserDownloadCompleted": "下载完成",
+  "browserDownloadFailed": "下载失败",
+  "browserDownloadInProgress": "正在下载",
+  "browserDownloadPaused": "下载已暂停",
+  "browserDownloadFileName": "文件名",
+  "browserDownloadFileSize": "文件大小",
+  "browserDownloadSizeUnknown": "大小未知",
+  "browserDownloadSource": "来源",
+  "browserDownloadLocation": "保存位置",
+  "browserDownloadFolder": "下载文件夹",
+  "browserDownloadFolderChoose": "选择文件夹",
+  "browserDownloadFolderReset": "恢复默认",
+  "browserDownloadFolderDefault": "默认下载文件夹",
+  "browserDownloadFirstTimeNote": "下载会保存在下面的文件夹，可随时修改",
+  "browserDownloadUnsupported": "下载链接或方式暂不支持",
+  "browserDownloadExpired": "下载链接已失效",
+  "browserDownloadFolderChanged": "下载文件夹已被其他页面修改，请重新确认",
+  "browserDownloadDirectoryError": "无法访问下载文件夹",
+  "browserDownloadPermissionError": "没有写入权限",
+  "browserDownloadNetworkError": "网络连接失败",
+  "browserDownloadHttpError": "服务器返回错误",
+  "browserDownloadIncomplete": "下载未完成",
+  "browserDownloadStorageError": "写入失败或存储空间不足",
+  "browserDownloadInterrupted": "下载被中断",
+  "browserDownloadNoApp": "没有应用可以打开此文件",
+  "browserDownloadMissing": "文件已被移动或删除",
+  "browserDownloadTooLarge": "文件超过可加入会话的大小限制",
+  "browserDownloadBusy": "下载任务或记录已达上限",
+  "browserDownloadError": "下载失败",
+  "browserDownloadOpenFile": "打开文件",
+  "browserDownloadAddToChat": "加入当前会话",
+  "browserDownloadAddedToChat": "已加入草稿",
+  "browserDownloadNoDownloads": "还没有下载记录",
+  "browserDownloadRetry": "重试",
+  "browserReturnShowAll": "查看全部",
+  "browserReturnMultiple": "{count} 个标签",
+  "@browserReturnMultiple": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "browserDownloadChatChanged": "目标会话已更改",
+  "browserDownloadTryFromPage": "请回到原网页重新发起下载",
   "catalogCurrentChat": "当前对话",
   "catalogChatDetails": "对话详情",
   "catalogChatDetailsSummary": "轨迹、改动与进度",
@@ -2751,6 +2919,26 @@
         "type": "String"
       },
       "description": {
+        "type": "String"
+      }
+    }
+  },
+  "chatLegacyDrafts": "恢复旧草稿",
+  "chatLegacyDraftsHint": "旧版保存的草稿，不属于任何主机",
+  "chatLegacyDraftNew": "旧版的新对话",
+  "chatLegacyDraftChat": "旧版对话的草稿",
+  "chatLegacyDraftTarget": "放在这个对话已有内容的后面，不会发送",
+  "chatLegacyDraftAppend": "加入当前草稿",
+  "chatLegacyDraftRestored": "已加入草稿",
+  "chatLegacyDraftStale": "对话已经切换，没有恢复",
+  "chatWebQuote": "网页引用",
+  "chatWebQuoteSelection": "选中内容",
+  "chatWebQuotePage": "页面内容",
+  "chatWebQuotePreview": "网页引用预览",
+  "chatRemoveWebQuote": "移除网页引用「{title}」",
+  "@chatRemoveWebQuote": {
+    "placeholders": {
+      "title": {
         "type": "String"
       }
     }

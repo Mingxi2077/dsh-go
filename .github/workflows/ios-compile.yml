@@ -25,6 +25,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  device-engine:
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      DSH_IOS_ENGINE_WORK: ${{ github.workspace }}/../engine-work
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check native addon paths
+        run: |
+          python3 -B tooling/ios/test_native_loader.py
+          python3 -B runtime/tests/ohos/host-core.py --out "$RUNNER_TEMP/host-core-hap"
+          python3 -B runtime/tests/ohos/host-core.py --ios-frameworks --out "$RUNNER_TEMP/host-core-ios"
+
+      - name: Build the device engine
+        run: |
+          bash tooling/ios/prepare-engine.sh
+          bash tooling/ios/build-engine-native.sh iphoneos "$RUNNER_TEMP/device"
+          tar -czf "$RUNNER_TEMP/ios-device-engine.tar.gz" \
+            -C "$RUNNER_TEMP/device" DshNodeHost.framework DshFlock.framework DshRequireBuiltin.framework \
+            -C "$GITHUB_WORKSPACE/app/ios/Engine" runtime.zip
+
+      - name: Upload the device engine
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-device-engine
+          path: ${{ runner.temp }}/ios-device-engine.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
   compile:
     runs-on: macos-26
     timeout-minutes: 60
@@ -84,12 +120,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check the iOS native addon loader
-        run: |
-          python3 -B tooling/ios/test_native_loader.py
-          python3 -B runtime/tests/ohos/host-core.py --out "$RUNNER_TEMP/host-core-hap"
-          python3 -B runtime/tests/ohos/host-core.py --ios-frameworks --out "$RUNNER_TEMP/host-core-ios"
-
       - name: Prepare the engine
         id: prepare
         run: |
@@ -118,20 +148,6 @@ jobs:
             grep -E 'error:|Undefined|ld:' "$log" | awk '!seen[$0]++' | head -10 | cut -c1-600               | sed -e 's/%/%25/g' -e 's/^/::error title=native-device::/'
             exit 1
           fi
-
-      - name: Keep the device engine for local signing tests
-        run: |
-          tar -czf "$RUNNER_TEMP/ios-device-engine.tar.gz" \
-            -C "$RUNNER_TEMP/device" DshNodeHost.framework DshFlock.framework DshRequireBuiltin.framework \
-            -C "$GITHUB_WORKSPACE/app/ios/Engine" runtime.zip
-
-      - name: Upload the device engine
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ios-device-engine
-          path: ${{ runner.temp }}/ios-device-engine.tar.gz
-          if-no-files-found: error
-          retention-days: 7
 
       - name: Run a round on the simulator
         run: |

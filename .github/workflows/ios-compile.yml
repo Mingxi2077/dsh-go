@@ -230,8 +230,27 @@ jobs:
           if-no-files-found: ignore
 
       - name: Archive as for TestFlight, and look inside
+        id: archive
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: bash tooling/ios/check-archive.sh
+
+      - name: Package the unsigned device app for local signing
+        id: unsigned_ipa
+        if: ${{ !cancelled() && steps.archive.outcome == 'success' }}
+        run: |
+          payload="$RUNNER_TEMP/unsigned-ipa/Payload"
+          mkdir -p "$payload"
+          ditto "$RUNNER_TEMP/Runner.xcarchive/Products/Applications/Runner.app" "$payload/Runner.app"
+          ditto -c -k --keepParent "$payload" "$RUNNER_TEMP/DSH-Go-ios-unsigned.ipa"
+
+      - name: Keep the unsigned device IPA
+        if: ${{ !cancelled() && steps.unsigned_ipa.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-device-unsigned
+          path: ${{ runner.temp }}/DSH-Go-ios-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Keep the launch screenshot
         if: always()

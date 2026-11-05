@@ -25,6 +25,24 @@ PRELOAD = 'runtime/ohos/preload.mjs'
 RELOCATION_FILES = ('runtime/ios/storage/relocate.mjs', 'runtime/ios/storage/preload.mjs')
 PRELOAD_BEFORE = "await import('./publication/preload.mjs');\n"
 PRELOAD_AFTER = PRELOAD_BEFORE + "await import('../ios/storage/preload.mjs');\n"
+NATIVE_LOADER = 'node_modules/@dsh-go/ohos-native/index.cjs'
+NATIVE_LIBRARIES = {
+    'libdsh_flock.so': 'DshFlock.framework/DshFlock',
+    'libdsh_require_builtin.so': 'DshRequireBuiltin.framework/DshRequireBuiltin',
+}
+
+
+def native_loader_for_ios(original):
+    # Loose .so files are skipped by IPA re-signers; load the framework executables.
+    data = original
+    for before, after in NATIVE_LIBRARIES.items():
+        before, after = ("'" + before + "'").encode(), ("'" + after + "'").encode()
+        if data.count(before) != 1:
+            raise ValueError('iOS native loader differs from shared input')
+        data = data.replace(before, after)
+    return data
+
+
 # Keep platform diagnostics local to the iOS output; each exact edit must match once.
 DIAGNOSTIC_EDITS = {
     'runtime/ohos/process/rg.mjs': (
@@ -218,6 +236,8 @@ def specialize(expanded, out, composer):
     diagnostics = {}
     for name, edits in DIAGNOSTIC_EDITS.items():
         data = attachments if name == ATTACHMENTS else (expanded / 'files' / name).read_bytes()
+        if name == NATIVE_LOADER:
+            data = native_loader_for_ios(data)
         for before, after in edits:
             before, after = before.encode(), after.encode()
             if data.count(before) != 1:

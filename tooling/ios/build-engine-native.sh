@@ -3,9 +3,9 @@
 #
 #   tooling/ios/build-engine-native.sh iphoneos|iphonesimulator OUTPUT_DIR [extra compiler flags]
 #
-# Writes DshNodeHost.framework, libdsh_flock.so and libdsh_require_builtin.so to
-# OUTPUT_DIR, unsigned. Node resolves the addons by these fixed names
-# (runtime/ohos/native/hap-loader), which is why they keep the .so suffix.
+# Writes DshNodeHost.framework, DshFlock.framework and DshRequireBuiltin.framework
+# to OUTPUT_DIR, unsigned. iOS specializes the shared loader to these bundle paths
+# so archive export and IPA signing tools recognize every native executable.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -38,7 +38,7 @@ FRAMEWORK="$OUT/DshNodeHost.framework"
 rm -rf "$FRAMEWORK"
 mkdir -p "$FRAMEWORK"
 cp "$ROOT/runtime/ios/host/worker-preload.cjs" "$FRAMEWORK/worker-preload.cjs"
-"$CLANGXX" "${COMMON[@]}" -std=c++20 -stdlib=libc++ -fexceptions -frtti -DNAPI_VERSION=8 \
+"$CLANGXX" "${COMMON[@]}" -std=c++20 -stdlib=libc++ -fexceptions -frtti -DNAPI_VERSION=8 -DDSH_IOS_HOST \
   "-I$ENGINE/include" "-I$HOST_CORE" "-I$HOST_RUNTIME" "$@" \
   "$ROOT/runtime/ios/host/node_runner.cc" "$ROOT/runtime/ios/host/ios_host.cc" \
   "$ROOT/runtime/ios/host/phone_binding.cc" "$ROOT/runtime/ios/host/image_binding.cc" \
@@ -60,8 +60,27 @@ cat >"$FRAMEWORK/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 
+addon_framework() {
+  local name="$1" identifier="$2"
+  mkdir -p "$OUT/$name.framework"
+  cat >"$OUT/$name.framework/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>$name</string>
+  <key>CFBundleIdentifier</key><string>io.github.ccch1mneyyy.dshgo.$identifier</string>
+  <key>CFBundleName</key><string>$name</string>
+  <key>CFBundlePackageType</key><string>FMWK</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>MinimumOSVersion</key><string>$MIN_IOS</string>
+</dict></plist>
+PLIST
+}
+
+addon_framework DshFlock flock
 "$CLANG" "${COMMON[@]}" -std=c11 -DNAPI_VERSION=8 "$ENGINE/addons/flock/flock.c" \
-  "${LINK[@]}" -install_name @rpath/libdsh_flock.so -o "$OUT/libdsh_flock.so"
+  "${LINK[@]}" -install_name @rpath/DshFlock.framework/DshFlock -o "$OUT/DshFlock.framework/DshFlock"
 
 # The same units and defines as upstream's binding.gyp for its napi backend
 # (runtime/ohos/native/loader/build-loader.py), against the same pinned commit.
@@ -74,7 +93,9 @@ target = json.load(open(sys.argv[1]))["targets"][0]
 for name in target["sources"] + target["conditions"][0][2]["sources"]:
     print(name)
 ' "$LOADER/binding.gyp")
+addon_framework DshRequireBuiltin requirebuiltin
 "$CLANGXX" "${COMMON[@]}" -std=c++17 -stdlib=libc++ -fno-exceptions -pthread \
   -DNAPI_VERSION=9 -DNARB_BACKEND=1 -DNARB_PRODUCT=1 -DNODE_ADDON_API_DISABLE_CPP_EXCEPTIONS \
   -DNODE_GYP_MODULE_NAME=require_builtin "-I$ENGINE/addons/node-addon-api" \
-  "${SOURCES[@]}" "${LINK[@]}" -install_name @rpath/libdsh_require_builtin.so -o "$OUT/libdsh_require_builtin.so"
+  "${SOURCES[@]}" "${LINK[@]}" -install_name @rpath/DshRequireBuiltin.framework/DshRequireBuiltin \
+  -o "$OUT/DshRequireBuiltin.framework/DshRequireBuiltin"

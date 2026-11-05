@@ -33,12 +33,16 @@ std::string Directory(const std::string& path, const char* code = "ERR_OHOS_HOST
 
 std::string NativeDirectory(const std::string& path) {
   const auto root = Directory(path, "ERR_OHOS_NATIVE_LIBRARY_PATH");
+#if defined(DSH_IOS_HOST)
+  for (const char* name : {"DshFlock.framework/DshFlock", "DshRequireBuiltin.framework/DshRequireBuiltin"}) {
+#else
   for (const char* name : {"libdsh_flock.so", "libdsh_require_builtin.so"}) {
+#endif
     const auto expected = root + "/" + name;
     std::error_code error;
     const auto real = std::filesystem::canonical(expected, error);
     Require(!error && real == expected && std::filesystem::is_regular_file(real, error),
-            "ERR_OHOS_NATIVE_LIBRARY_PATH", "Required HAP native libraries must be regular files in the trusted directory");
+            "ERR_OHOS_NATIVE_LIBRARY_PATH", "Required native libraries must be regular files in the trusted directory");
   }
   return root;
 }

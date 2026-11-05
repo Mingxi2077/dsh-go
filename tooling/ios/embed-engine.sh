@@ -31,12 +31,15 @@ fi
 FRAMEWORKS="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"
 RESOURCES="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
 mkdir -p "$FRAMEWORKS" "$RESOURCES/dsh-runtime"
-rm -rf "$FRAMEWORKS/NodeMobile.framework" "$FRAMEWORKS/DshNodeHost.framework"
+rm -rf "$FRAMEWORKS/NodeMobile.framework" "$FRAMEWORKS/DshNodeHost.framework" \
+  "$FRAMEWORKS/DshFlock.framework" "$FRAMEWORKS/DshRequireBuiltin.framework"
+# Remove the old layout when rebuilding an existing app directory.
+rm -f "$FRAMEWORKS/libdsh_flock.so" "$FRAMEWORKS/libdsh_require_builtin.so"
 cp -R "$ENGINE/NodeMobile.xcframework/$SLICE/NodeMobile.framework" "$FRAMEWORKS/"
 rm -rf "$FRAMEWORKS/NodeMobile.framework/Headers" "$FRAMEWORKS/NodeMobile.framework/Modules" \
   "$FRAMEWORKS/NodeMobile.framework/_CodeSignature"
 cp -R "$BUILT/DshNodeHost.framework" "$FRAMEWORKS/"
-cp "$BUILT/libdsh_flock.so" "$BUILT/libdsh_require_builtin.so" "$FRAMEWORKS/"
+cp -R "$BUILT/DshFlock.framework" "$BUILT/DshRequireBuiltin.framework" "$FRAMEWORKS/"
 cp "$ENGINE/runtime.zip" "$RESOURCES/dsh-runtime/runtime.zip"
 # The phone tools' backend is iOS's own, so it isn't in the archive runtime/ohos composes.
 mkdir -p "$RESOURCES/dsh-runtime/phone"
@@ -59,7 +62,7 @@ fi
 if [ "${CODE_SIGNING_ALLOWED:-YES}" = "NO" ] || [ -z "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]; then
   exit 0
 fi
-for item in NodeMobile.framework DshNodeHost.framework libdsh_flock.so libdsh_require_builtin.so; do
+for item in NodeMobile.framework DshNodeHost.framework DshFlock.framework DshRequireBuiltin.framework; do
   /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" ${OTHER_CODE_SIGN_FLAGS:-} \
     --preserve-metadata=identifier,entitlements "$FRAMEWORKS/$item"
 done

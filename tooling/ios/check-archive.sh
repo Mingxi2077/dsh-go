@@ -31,6 +31,9 @@ fi
 app="$archive/Products/Applications/Runner.app"
 [ -d "$app" ] || { fail "no Runner.app in the archive"; exit 1; }
 frameworks="$app/Frameworks"
+for name in DshFlock DshRequireBuiltin; do
+  [ -f "$frameworks/$name.framework/$name" ] || fail "native addon $name.framework/$name is missing"
+done
 note 'archive frameworks' "$(ls "$frameworks" | tr '\n' ' ')"
 note 'archive size' "$(du -sh "$app" | cut -f1), top level: $(ls "$app" | grep -vE '\.(png|car|nib|storyboardc|lproj)$' | head -30 | tr '\n' ' ')"
 
@@ -72,9 +75,9 @@ for binary in "$app/Runner" "$frameworks"/*.framework/*; do
 done | sort -u >"$log"
 if [ -s "$log" ]; then fail "missing at launch: $(cat "$log")"; else note 'archive links' 'everything linked is in the app'; fi
 
-# Files the App Store refuses, loose outside a framework.
-loose="$(find "$app" \( -name '*.dylib' -o -name '*.so' -o -name '*.node' \) -not -path '*/Frameworks/*.framework/*' | sed "s|$app/||" | head -10 | tr '\n' ' ')"
-[ -n "$loose" ] && note 'archive loose binaries' "$loose"
+# Native addon filenames that IPA re-signers do not recognize as frameworks.
+loose="$(find "$app" \( -name '*.so' -o -name '*.node' \) -not -path '*/Frameworks/*.framework/*' | sed "s|$app/||" | head -10 | tr '\n' ' ')"
+[ -n "$loose" ] && fail "native binaries outside frameworks can be missed by IPA signing: $loose"
 
 note 'archive' "$( [ "$failed" -eq 0 ] && echo 'looks whole' || echo 'see the errors')"
 exit "$failed"

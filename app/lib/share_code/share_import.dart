@@ -3,6 +3,8 @@
 // restore point, plugins, settings, skills, AGENTS.md.
 
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:dsh_client/dsh_client.dart';
 
@@ -40,7 +42,7 @@ enum IntegrityStatus { verified, unverifiable, mismatch }
 
 /// The engine an import goes to.
 class ImportTarget {
-  const ImportTarget(this.connection, {required this.isActive, this.safeMode = false});
+  const ImportTarget(this.connection, {required this.isActive, this.safeMode = false, this.installRefused = false});
 
   final HostConnection connection;
 
@@ -50,10 +52,13 @@ class ImportTarget {
   /// The on-device engine runs its repair profile: no installs.
   final bool safeMode;
 
+  /// The engine takes no market installs (HarmonyOS's own).
+  final bool installRefused;
+
   bool get isLocal => connection.isLocal;
   String get label => connection.label;
   DshClient get client => connection.client;
-  bool get canInstall => !safeMode && client.canInstallPlugins;
+  bool get canInstall => !safeMode && !installRefused && client.canInstallPlugins;
 }
 
 /// One row of the diff.
@@ -453,7 +458,25 @@ Future<ImportPlan> planImport(SharePayload payload, ImportTarget target, {requir
         );
         continue;
       }
-      final current = files.readSkill(skill.name);
+      Map<String, String>? current;
+      try {
+        final bytes = files.readSkillForImport(skill.name);
+        current = bytes?.map((path, value) => MapEntry(path, utf8.decode(value)));
+      } on Object catch (error) {
+        if (error is! FileSystemException && error is! FormatException) rethrow;
+        changes.add(
+          ImportChange(
+            id: id,
+            section: ImportSection.skills,
+            title: skill.name,
+            kind: ChangeKind.unavailable,
+            blocked: appL10n.pluginsFileWriteFailed,
+            defaultOn: false,
+            skill: skill,
+          ),
+        );
+        continue;
+      }
       if (current != null && _sameFiles(current, skill.files)) continue;
       changes.add(
         ImportChange(
@@ -505,8 +528,11 @@ Future<ImportPlan> planImport(SharePayload payload, ImportTarget target, {requir
 bool _sameFiles(Map<String, String> a, Map<String, String> b) =>
     a.length == b.length && a.entries.every((e) => b[e.key]?.trim() == e.value.trim());
 
-String _cantInstall(ImportTarget target) =>
-    target.safeMode ? appL10n.pluginsSafeModeInstallBlocked : appL10n.pluginsHostInstallBlocked;
+String _cantInstall(ImportTarget target) => target.safeMode
+    ? appL10n.pluginsSafeModeInstallBlocked
+    : target.installRefused
+    ? appL10n.marketInstallRefused
+    : appL10n.pluginsHostInstallBlocked;
 
 // ── Applying ─────────────────────────────────────────────────────────────────
 
@@ -723,8 +749,7 @@ Future<ImportResult> applyImport(
     try {
       final point = RestorePoint(files);
       if (step.section == ImportSection.skills) {
-        await point.backupSkill(backup, step.skill!.name);
-        await files.writeSkill(step.skill!);
+        point.replaceSkill(backup, step.skill!);
       } else {
         await point.backupAgentsMd(backup);
         await files.writeImportedAgentsMd(step.text!);

@@ -58,6 +58,8 @@ class VoicePlugin :
     private var recorder: WavRecorder? = null
     private var recognizerMic = 0
     private var recorderMic = 0
+    private var releasingRecorders = 0
+    private val afterRecorderRelease = ArrayList<() -> Unit>()
     private var generation = 0L
     private var pendingPermission: MethodChannel.Result? = null
 
@@ -68,6 +70,7 @@ class VoicePlugin :
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        StreamingPcm.disable()
         methods.setMethodCallHandler(null)
         events.setStreamHandler(null)
         releaseAll()
@@ -112,10 +115,25 @@ class VoicePlugin :
             "openSettings" -> result.success(openSettings())
             "startRecognizer" -> startRecognizer(call.argument<String>("language"), call.argument<Number>("sessionId")?.toLong() ?: 0, result)
             "startRecorder" -> startRecorder(call.argument<Int>("maxSeconds") ?: 60, call.argument<Number>("sessionId")?.toLong() ?: 0, result)
+            "streamingPcm" -> {
+                val source = call.argument<String>("source")
+                val id = call.argument<Number>("pcmSession")?.toLong() ?: 0
+                if (source == null) StreamingPcm.disable(id)
+                else if (source == "call" || source == "dictation") {
+                    StreamingPcm.enable(source, id) { tap, bytes, valid -> main.post {
+                        if (StreamingPcm.current(tap) && valid()) sink?.success(mapOf(
+                            "type" to "pcm", "bytes" to bytes, "rate" to 16000,
+                            "source" to tap.source, "pcmSession" to tap.id,
+                        ))
+                    } }
+                } else return result.error("pcm-source", "invalid PCM source", null)
+                result.success(null)
+            }
             "stop" -> stop(result)
             "cancel" -> {
                 releaseAll()
-                result.success(null)
+                if (releasingRecorders == 0) result.success(null)
+                else afterRecorderRelease += { result.success(null) }
             }
             else -> result.notImplemented()
         }
@@ -229,16 +247,17 @@ class VoicePlugin :
         override fun onError(error: Int) {
             if (!current()) return
             VoiceDiagnostics.failure(appContext, environment, error, "listen")
-            emit(sessionId, mapOf("type" to "error", "code" to error))
             releaseRecognizer()
+            emit(sessionId, mapOf("type" to "error", "code" to error))
             emit(sessionId, mapOf("type" to "end"))
         }
 
         override fun onResults(results: Bundle?) {
             if (!current()) return
-            if (firstText(results).isNotEmpty()) VoiceDiagnostics.success(appContext, environment)
-            emit(sessionId, mapOf("type" to "final", "text" to firstText(results)))
+            val text = firstText(results)
+            if (text.isNotEmpty()) VoiceDiagnostics.success(appContext, environment)
             releaseRecognizer()
+            emit(sessionId, mapOf("type" to "final", "text" to text))
             emit(sessionId, mapOf("type" to "end"))
         }
 
@@ -276,20 +295,25 @@ class VoicePlugin :
         lateinit var r: WavRecorder
         r = WavRecorder(
             maxSeconds = maxSeconds.coerceIn(1, 600),
+            isCurrentCapture = { generation == ownGeneration && recorder === r },
             onLevel = { level -> main.post {
                 if (generation == ownGeneration && recorder === r) emit(sessionId, mapOf("type" to "level", "value" to level))
             } },
             onLimit = { main.post {
                 if (generation == ownGeneration && recorder === r) emit(sessionId, mapOf("type" to "limit"))
             } },
+            onError = { main.post {
+                if (generation == ownGeneration && recorder === r) {
+                    VoiceDiagnostics.failure(appContext, environment, 100, "record")
+                    releaseAll()
+                    emit(sessionId, mapOf("type" to "error", "code" to 100))
+                }
+            } },
         )
         val mic = MicArbiter.beginDictation()
         val started = runCatching { r.start() }
         if (started.getOrDefault(false) != true) {
-            Thread {
-                runCatching { r.discard() }
-                main.post { MicArbiter.endDictation(mic) }
-            }.start()
+            releaseRecorder(mic, r::discard) {}
             VoiceDiagnostics.failure(appContext, environment, 100, "record", started.exceptionOrNull())
             return result.error("audio", "the microphone could not be opened", mapOf("code" to 100))
         }
@@ -316,15 +340,11 @@ class VoicePlugin :
         val mic = recorderMic
         val environment = VoiceDiagnostics.environment(appContext)
         // Joining the capture thread and building the WAV can take a moment.
-        Thread {
-            val recorded = runCatching { r.finish() }
+        releaseRecorder(mic, r::finish) { recorded ->
             if (recorded.isFailure) VoiceDiagnostics.failure(appContext, environment, 100, "record", recorded.exceptionOrNull())
-            main.post {
-                MicArbiter.endDictation(mic)
-                if (recorded.isFailure) result.error("audio", "could not finish recording", mapOf("code" to 100))
-                else result.success(recorded.getOrNull())
-            }
-        }.start()
+            if (recorded.isFailure) result.error("audio", "could not finish recording", mapOf("code" to 100))
+            else result.success(recorded.getOrNull())
+        }
     }
 
     private fun releaseAll() {
@@ -332,12 +352,25 @@ class VoicePlugin :
         releaseRecognizer()
         recorder?.let { r ->
             recorder = null
-            val mic = recorderMic
-            Thread {
-                runCatching { r.discard() }
-                main.post { MicArbiter.endDictation(mic) }
-            }.start()
+            releaseRecorder(recorderMic, r::discard) {}
         }
+    }
+
+    private fun <T> releaseRecorder(mic: Int, work: () -> T, finished: (Result<T>) -> Unit) {
+        releasingRecorders++
+        Thread {
+            val outcome = runCatching(work)
+            main.post {
+                MicArbiter.endDictation(mic)
+                releasingRecorders--
+                finished(outcome)
+                if (releasingRecorders == 0) {
+                    val callbacks = afterRecorderRelease.toList()
+                    afterRecorderRelease.clear()
+                    callbacks.forEach { it() }
+                }
+            }
+        }.start()
     }
 
     // EventChannel
@@ -347,6 +380,7 @@ class VoicePlugin :
     }
 
     override fun onCancel(arguments: Any?) {
+        StreamingPcm.disable()
         sink = null
     }
 

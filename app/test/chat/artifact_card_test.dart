@@ -7,9 +7,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dsh_app/state/android_features.dart';
 import 'package:dsh_app/state/artifact_files.dart';
 import 'package:dsh_app/state/artifacts.dart';
 import 'package:dsh_app/state/connection_state.dart';
+import 'package:dsh_app/ui/chat/artifact_preview.dart' show runArtifactAction;
+import 'package:dsh_app/ui/chat/media/media_card.dart' show saveMediaItems;
 import 'package:dsh_app/ui/chat/widgets/artifact_card.dart';
 import 'package:dsh_app/ui/share/share_card.dart';
 import 'package:dsh_app/ui/share/share_content.dart';
@@ -32,6 +35,12 @@ class _Android {
   final shares = <MethodCall>[];
   Object? openError;
 
+  /// What 'saveToDownloads' answers, when not Android's own: HarmonyOS's URI.
+  String? savedAt;
+  Object? saveError;
+  Future<void>? saveGate;
+  Uint8List? pagePng;
+
   void install(WidgetTester tester) {
     final messenger = tester.binding.defaultBinaryMessenger;
     messenger.setMockMethodCallHandler(_files, (call) async {
@@ -45,7 +54,9 @@ class _Android {
           if (openError case final error?) throw error;
           return null;
         case 'saveToDownloads':
-          return 'Download/DSH-Go/${args['name']}';
+          await saveGate;
+          if (saveError case final error?) throw error;
+          return savedAt ?? 'Download/DSH-Go/${args['name']}';
         case 'listOutputs':
           return const <Object?>[];
         case 'pdfInfo':
@@ -54,7 +65,7 @@ class _Android {
             {'width': 595, 'height': 842},
           ];
         case 'pdfPage':
-          return Uint8List(0);
+          return pagePng ?? Uint8List(0);
       }
       return null;
     });
@@ -84,7 +95,7 @@ const _zip = Artifact(path: '/root/workspace/素材.zip', origin: ArtifactOrigin
 
 const _docx = Artifact(path: '/home/me/out/纪要.docx', origin: ArtifactOrigin.linked, turn: 1);
 
-Widget _card(List<Artifact> files, {HostConnection? connection}) => testApp(
+Widget _card(List<Artifact> files, {HostConnection? connection, String? os}) => testApp(
   Scaffold(
     body: Padding(
       padding: const EdgeInsets.all(16),
@@ -94,7 +105,10 @@ Widget _card(List<Artifact> files, {HostConnection? connection}) => testApp(
       ),
     ),
   ),
-  overrides: [activeConnectionProvider.overrideWithValue(AsyncData<HostConnection?>(connection ?? fakeConnection))],
+  overrides: [
+    if (os != null) operatingSystemProvider.overrideWithValue(os),
+    activeConnectionProvider.overrideWithValue(AsyncData<HostConnection?>(connection ?? fakeConnection)),
+  ],
 );
 
 Future<void> _menuAction(WidgetTester tester, String label, {int row = 0}) async {
@@ -217,6 +231,226 @@ void main() {
     expect(find.text('已复制路径'), findsOneWidget);
   });
 
+  group('save', () {
+    const picked = 'file://docs/storage/Users/currentUser/Download/report.pdf';
+    final cancelled = PlatformException(code: 'cancelled', message: '保存已取消。');
+    const inDownloads = Artifact(path: '/sdcard/Download/x.pdf', origin: ArtifactOrigin.linked, turn: 1);
+    const video = MediaItem(path: '/root/workspace/clip.mp4', mime: 'video/mp4');
+
+    Future<void> openMenu(WidgetTester tester) async {
+      await tester.tap(find.byTooltip('更多操作').first);
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('Android: the menu names 下载 and the note says where', (tester) async {
+      usePhoneView(tester);
+      _Android().install(tester);
+      await tester.pumpWidget(_card([_pdf]));
+      await tester.pumpAndSettle();
+      await openMenu(tester);
+      expect(find.text('下载/DSH-Go 文件夹'), findsOneWidget);
+      expect(find.text('保存到文件'), findsNothing);
+      await tester.tap(find.text('存到「下载」'));
+      await tester.pumpAndSettle();
+      expect(find.text('已存到 下载/DSH-Go/report.pdf'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('Android: while saving it still says 下载', (tester) async {
+      usePhoneView(tester);
+      final gate = Completer<void>();
+      _Android()
+        ..saveGate = gate.future
+        ..install(tester);
+      await tester.pumpWidget(_card([_pdf]));
+      await tester.pumpAndSettle();
+      await openMenu(tester);
+      await tester.tap(find.text('存到「下载」'));
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(find.text('正在存到「下载」…'), findsOneWidget);
+      gate.complete();
+      await tester.pump(const Duration(milliseconds: 500));
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('HarmonyOS: the menu asks where, then saving, then 已保存, never the URI', (tester) async {
+      usePhoneView(tester);
+      final gate = Completer<void>();
+      _Android()
+        ..savedAt = picked
+        ..saveGate = gate.future
+        ..install(tester);
+      await tester.pumpWidget(_card([_pdf], os: 'ohos'));
+      await tester.pumpAndSettle();
+      await openMenu(tester);
+      expect(find.text('选择保存位置'), findsOneWidget);
+      expect(find.text('存到「下载」'), findsNothing);
+      expect(find.text('下载/DSH-Go 文件夹'), findsNothing);
+      await tester.tap(find.text('保存到文件'));
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(find.text('正在保存…'), findsOneWidget);
+      expect(find.text('正在存到「下载」…'), findsNothing);
+      gate.complete();
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(find.text('已保存'), findsOneWidget);
+      expect(find.textContaining('file://'), findsNothing);
+      expect(find.textContaining('已存到'), findsNothing);
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('HarmonyOS: backing out of the window reads as neither saved nor failed', (tester) async {
+      usePhoneView(tester);
+      _Android()
+        ..saveError = cancelled
+        ..install(tester);
+      await tester.pumpWidget(_card([_pdf], os: 'ohos'));
+      await tester.pumpAndSettle();
+      await _menuAction(tester, '保存到文件');
+      expect(find.text('2026 Q3 销售汇总'), findsOneWidget);
+      expect(find.text('已保存'), findsNothing);
+      expect(find.text('没能完成，再试一次'), findsNothing);
+      expect(find.text('保存已取消。'), findsNothing);
+    });
+
+    testWidgets('HarmonyOS: a save that really failed still says so', (tester) async {
+      usePhoneView(tester);
+      _Android()
+        ..saveError = PlatformException(code: 'failed')
+        ..install(tester);
+      await tester.pumpWidget(_card([_pdf], os: 'ohos'));
+      await tester.pumpAndSettle();
+      await _menuAction(tester, '保存到文件');
+      expect(find.text('没能完成，再试一次'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('Android: a file already in 下载 says so and has nothing to save', (tester) async {
+      usePhoneView(tester);
+      _Android().install(tester);
+      await tester.pumpWidget(_card([inDownloads]));
+      await tester.pumpAndSettle();
+      await openMenu(tester);
+      expect(find.text('已在手机的「下载」里'), findsOneWidget);
+      expect(find.text('存到「下载」'), findsNothing);
+    });
+
+    testWidgets('HarmonyOS: no /sdcard, so a path that reads like it can still be saved', (tester) async {
+      usePhoneView(tester);
+      _Android().install(tester);
+      await tester.pumpWidget(_card([inDownloads], os: 'ohos'));
+      await tester.pumpAndSettle();
+      await openMenu(tester);
+      expect(find.text('已在手机的「下载」里'), findsNothing);
+      expect(find.text('保存到文件'), findsOneWidget);
+    });
+
+    Widget actions(void Function(BuildContext, WidgetRef) tap, {String? os}) => testApp(
+      Scaffold(
+        body: Consumer(
+          builder: (context, ref, _) => TextButton(onPressed: () => tap(context, ref), child: const Text('go')),
+        ),
+      ),
+      overrides: [
+        if (os != null) operatingSystemProvider.overrideWithValue(os),
+        activeConnectionProvider.overrideWithValue(AsyncData<HostConnection?>(fakeConnection)),
+      ],
+    );
+
+    Widget fileAction({String? os}) => actions(
+      (context, ref) => runArtifactAction(context, ref, sessionId: 's1', artifact: _pdf, action: ArtifactAction.save),
+      os: os,
+    );
+
+    testWidgets('file actions: Android names the place', (tester) async {
+      usePhoneView(tester);
+      _Android().install(tester);
+      await tester.pumpWidget(fileAction());
+      await tester.tap(find.text('go'));
+      await tester.pumpAndSettle();
+      expect(find.text('已存到 下载/DSH-Go/report.pdf'), findsOneWidget);
+    });
+
+    testWidgets('file actions: HarmonyOS says 已保存, and nothing when backed out of', (tester) async {
+      usePhoneView(tester);
+      final android = _Android()
+        ..savedAt = picked
+        ..install(tester);
+      await tester.pumpWidget(fileAction(os: 'ohos'));
+      await tester.tap(find.text('go'));
+      await tester.pumpAndSettle();
+      expect(find.text('已保存'), findsOneWidget);
+      expect(find.textContaining('file://'), findsNothing);
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+      expect(find.text('已保存'), findsNothing);
+
+      android.saveError = cancelled;
+      await tester.tap(find.text('go'));
+      await tester.pumpAndSettle();
+      expect(find.byType(SnackBar), findsNothing);
+      expect(find.text('已保存'), findsNothing);
+    });
+
+    Widget batch({String? os}) =>
+        actions((context, ref) => saveMediaItems(context, ref, 's1', const [video, video]), os: os);
+
+    testWidgets('a batch of videos: Android saves them to the gallery and counts files', (tester) async {
+      usePhoneView(tester);
+      final android = _Android()..install(tester);
+      final gallery = <MethodCall>[];
+      const media = MethodChannel('dsh/media');
+      final messenger = tester.binding.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(media, (call) async {
+        gallery.add(call);
+        return 'Movies/DSH Go/${(call.arguments as Map)['name']}';
+      });
+      addTearDown(() => messenger.setMockMethodCallHandler(media, null));
+      await tester.pumpWidget(batch());
+      await tester.tap(find.text('go'));
+      await tester.pumpAndSettle();
+      expect(gallery.map((c) => c.method), ['saveVideoFile', 'saveVideoFile']);
+      expect(android.calls.where((c) => c.method == 'saveToDownloads'), isEmpty);
+      expect(find.text('已保存 2 个文件到相册'), findsOneWidget);
+    });
+
+    testWidgets('a batch of videos: HarmonyOS saves them to the album too; backing out stops asking, without a failure', (
+      tester,
+    ) async {
+      usePhoneView(tester);
+      final android = _Android()..install(tester);
+      final gallery = <MethodCall>[];
+      var backOut = false;
+      const media = MethodChannel('dsh/media');
+      final messenger = tester.binding.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(media, (call) async {
+        gallery.add(call);
+        if (backOut) throw PlatformException(code: 'cancelled');
+        return 'file://media/Photo/1/VID_1/movie.mp4';
+      });
+      addTearDown(() => messenger.setMockMethodCallHandler(media, null));
+      await tester.pumpWidget(batch(os: 'ohos'));
+      await tester.tap(find.text('go'));
+      await tester.pumpAndSettle();
+      expect(gallery.map((c) => c.method), ['saveVideoFile', 'saveVideoFile']);
+      expect(android.calls.where((c) => c.method == 'saveToDownloads'), isEmpty);
+      expect(find.text('已保存 2 个文件到相册'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+
+      gallery.clear();
+      backOut = true;
+      await tester.tap(find.text('go'));
+      await tester.pumpAndSettle();
+      expect(gallery, hasLength(1));
+      expect(find.byType(SnackBar), findsNothing);
+      expect(find.textContaining('已保存'), findsNothing);
+    });
+  });
+
   testWidgets('tapping a file Android must open opens it; failures stay on the row', (tester) async {
     usePhoneView(tester);
     final android = _Android()
@@ -240,7 +474,9 @@ void main() {
 
   testWidgets('a PDF previews in the app, page by page', (tester) async {
     usePhoneView(tester);
-    final android = _Android()..install(tester);
+    final android = _Android()
+      ..pagePng = tinyPng
+      ..install(tester);
     await tester.pumpWidget(_card([_pdf]));
     await tester.pumpAndSettle();
     await tester.tap(find.text('report.pdf'));
@@ -256,12 +492,21 @@ void main() {
       [0, 1],
       reason: 'both pages are on screen',
     );
+    final pages = tester.widgetList<Image>(find.byType(Image)).map((w) => w.image).whereType<MemoryImage>().toSet();
+    expect(pages, hasLength(2));
+    final cache = PaintingBinding.instance.imageCache;
+    for (var i = 0; i < 40 && pages.any((image) => cache.statusForKey(image).pending); i++) {
+      await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    expect(pages.where((image) => cache.statusForKey(image).keepAlive), hasLength(2));
     await tester.drag(find.byType(ListView), const Offset(0, -1500));
     await tester.pumpAndSettle();
     expect(find.text('共 2 页'), findsOneWidget);
     await tester.tap(find.byTooltip('返回'));
     await tester.pumpAndSettle();
     expect(android.methods.last, 'pdfClose');
+    expect(pages.where((image) => cache.statusForKey(image).tracked), isEmpty);
   });
 
   testWidgets('an Office file previews as the Host\'s PDF; apps stay a tap away', (tester) async {
@@ -303,7 +548,7 @@ void main() {
     expect(carrier.calls, contains('officeToPdf/render'));
     expect(android.methods, contains('pdfInfo'));
     final info = android.last('pdfInfo');
-    expect(info['path'], endsWith('/纪要.docx.pdf'));
+    expect(info['path'], endsWith('/纪要.pdf'));
     expect(find.text('正在转换为 PDF 预览…'), findsNothing);
   });
 
@@ -409,7 +654,7 @@ void main() {
     test('Office files: the Host\'s PDF, converted once per version', () async {
       expect(files.canConvertOffice, isTrue);
       final pdf = await files.officePdf('s1', _docx);
-      expect(pdf.path, endsWith('/纪要.docx.pdf'));
+      expect(pdf.path, endsWith('/纪要.pdf'));
       expect(utf8.decode(pdf.readAsBytesSync()), '%PDF-1.7 v1');
       carrier.calls.clear();
       await files.officePdf('s1', _docx);

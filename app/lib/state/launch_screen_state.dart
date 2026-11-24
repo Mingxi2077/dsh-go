@@ -22,6 +22,8 @@ class CustomLaunchController extends AsyncNotifier<CustomLaunch?> {
     final (custom, problem) = await ref.read(launchImportProvider).pick(previous: previous);
     if (custom == null) return problem ?? LaunchImportProblem.unreadable;
     await _store(custom);
+    // Only now: until the new choice is saved, the old files are the one the next launch reads.
+    await LaunchImport.removeFiles(previous, except: custom);
     return null;
   }
 
@@ -42,6 +44,19 @@ class CustomLaunchController extends AsyncNotifier<CustomLaunch?> {
     final current = state.value;
     if (current == null || current.backdrop == backdrop) return;
     await _store(current.copyWith(backdrop: backdrop));
+  }
+
+  /// Where the screen sits in a [LaunchFit.fill] picture.
+  Future<void> frame({required double zoom, required double alignX, required double alignY}) async {
+    final current = state.value;
+    if (current == null) return;
+    await _store(
+      current.copyWith(
+        zoom: zoom.clamp(1.0, CustomLaunch.maxZoom),
+        alignX: alignX.clamp(-1.0, 1.0),
+        alignY: alignY.clamp(-1.0, 1.0),
+      ),
+    );
   }
 
   Future<void> _store(CustomLaunch custom) async {

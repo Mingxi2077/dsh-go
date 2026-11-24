@@ -137,12 +137,12 @@ void main() {
       final container = ProviderContainer();
       addTearDown(container.dispose);
       final quotes = container.read(composerQuoteProvider.notifier);
-      quotes.set('s1', '  第一段  ');
-      quotes.set('s2', '第二段');
-      quotes.set('s3', '   ');
-      expect(container.read(composerQuoteProvider), {'s1': '第一段', 's2': '第二段'});
-      quotes.clear('s1');
-      expect(container.read(composerQuoteProvider).keys, ['s2']);
+      quotes.set(localDraft('s1'), '  第一段  ');
+      quotes.set(localDraft('s2'), '第二段');
+      quotes.set(localDraft('s3'), '   ');
+      expect(container.read(composerQuoteProvider), {localDraft('s1'): '第一段', localDraft('s2'): '第二段'});
+      quotes.clear(localDraft('s1'));
+      expect(container.read(composerQuoteProvider).keys, [localDraft('s2')]);
     });
   });
 

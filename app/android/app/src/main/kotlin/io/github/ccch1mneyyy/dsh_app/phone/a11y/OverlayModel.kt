@@ -1,13 +1,18 @@
 package io.github.ccch1mneyyy.dsh_app.phone.a11y
 
+import io.github.ccch1mneyyy.dsh_app.pet.Dock
+import io.github.ccch1mneyyy.dsh_app.pet.EdgeSnap
+import io.github.ccch1mneyyy.dsh_app.pet.SafeArea
 import io.github.ccch1mneyyy.dsh_app.pet.Side
 import io.github.ccch1mneyyy.dsh_app.pet.WindowPos
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.roundToInt
 
 // The control's pure half (measured in OverlayModelTest): what the line says, the steps behind it,
-// the header's keys, the capsule's width, the ball's hold-to-stop and where the ball meets the
-// capsule. ControlOverlay, OverlayCapsule and OverlayBall draw what these decide.
+// the header's keys, the capsule's width, the ball's hold-to-stop, where the capsule rests and
+// where a drag leaves it, and where the ball meets the capsule and tucks away. ControlOverlay,
+// OverlayCapsule and OverlayBall draw what these decide.
 
 /**
  * A status line as the capsule shows it. The core says 「免确认 · DSH 正在操作 · 点「发送」」; the
@@ -62,8 +67,13 @@ internal class StatusLines(waivedFormat: String, actingFormat: String) {
 internal class StepHistory(private val capacity: Int = CAPACITY) {
     private val steps = ArrayDeque<String>()
 
+    /** Every action so far this task (not only the ones kept): the island's 「第 N 步」. */
+    var count = 0
+        private set
+
     fun add(line: StatusLine) {
         if (!line.acting || steps.lastOrNull() == line.text) return
+        count++
         steps.addLast(line.text)
         // One more than shown: the newest may be the line the header shows.
         while (steps.size > capacity + 1) steps.removeFirst()
@@ -76,15 +86,21 @@ internal class StepHistory(private val capacity: Int = CAPACITY) {
         return list.asReversed().take(limit.coerceAtLeast(0))
     }
 
-    fun clear() = steps.clear()
+    fun clear() {
+        steps.clear()
+        count = 0
+    }
 
     companion object {
-        const val CAPACITY = 3
+        const val CAPACITY = 5
     }
 }
 
-/** The header's keys, left to right: the same in the capsule and the card, so 停止 never moves. */
-internal enum class Slot { MARK, LINE, PAUSE, STOP }
+/**
+ * The header's keys, left to right: the same in the capsule and the card. 暂停 (held a second:
+ * 停止) and 回到 DSH Go at the right end.
+ */
+internal enum class Slot { MARK, LINE, PAUSE, BACK }
 
 /**
  * Sizes of the control, in dp. One radius for every form: the capsule's ends, the card's corners
@@ -122,11 +138,8 @@ internal object CapsuleMetrics {
     /** Gap to the screen sides, as the app's floating controls (page-design §7). */
     const val EDGE_DP = 12
 
-    /** Below the status bar. */
-    const val TOP_GAP_DP = 6
-
     fun slots(stopped: Boolean): List<Slot> =
-        if (stopped) listOf(Slot.MARK, Slot.LINE) else listOf(Slot.MARK, Slot.LINE, Slot.PAUSE, Slot.STOP)
+        if (stopped) listOf(Slot.MARK, Slot.LINE) else listOf(Slot.MARK, Slot.LINE, Slot.PAUSE, Slot.BACK)
 
     /** The capsule's content width in dp for a line [textDp] wide ([chevron]: the line can open the card). */
     fun contentDp(textDp: Float, lock: Boolean, stopped: Boolean, chevron: Boolean = !stopped): Float {
@@ -148,8 +161,12 @@ internal object CapsuleMetrics {
         return stepped.coerceIn((MIN_DP * density).roundToInt(), maxPx(screenW, density))
     }
 
-    /** How many past steps the card lists: one on a short screen (landscape), else three. */
-    fun steps(screenHeightDp: Float): Int = if (screenHeightDp < 560f) 1 else StepHistory.CAPACITY
+    /** How many past steps the card lists: one on a short screen (landscape), three on a small phone, else five. */
+    fun steps(screenHeightDp: Float): Int = when {
+        screenHeightDp < 560f -> 1
+        screenHeightDp < 720f -> 3
+        else -> StepHistory.CAPACITY
+    }
 }
 
 /**
@@ -292,6 +309,144 @@ internal class HoldToStop(val armMs: Long = ARM_MS, val fillMs: Long = FILL_MS) 
     }
 }
 
+/** Where the capsule rests across the screen; it grows from this side when its line gets longer. */
+internal enum class CapsuleAnchor { LEFT, CENTRE, RIGHT }
+
+/** Where the person left the capsule: across, and its centre's height as a share of the safe height. Kept across tasks. */
+internal data class CapsuleSpot(val anchor: CapsuleAnchor = CapsuleAnchor.CENTRE, val fraction: Float = CapsulePlacement.TOP)
+
+/**
+ * Where the capsule sits, in px. By default an island at the top, centred, just under the status
+ * bar ([TOP]); dragged, at the height it was let go and against the nearest of three anchors
+ * ([CapsuleAnchor], [EDGE_DP] from the side). Always [GAP_DP] clear of the bars and of whatever
+ * takes the bottom — the keyboard, the confirm card — by moving up over it.
+ *
+ * The card grows out of the capsule away from the nearer end of the screen, so the header (and its
+ * keys) stays where the capsule was: down from a capsule in the upper half ([opensDown]; its window
+ * hangs from the top, Gravity.TOP, and a taller window grows down), up from one lower down (its
+ * window hangs from the bottom, Gravity.BOTTOM, and grows up; the capsule moves down while the card
+ * is open if the card would not fit above it).
+ */
+internal object CapsulePlacement {
+    /** The default: the capsule's centre as high as it goes, [GAP_DP] under the status bar. */
+    const val TOP = 0f
+
+    /** The lower middle, in the thumb's reach. */
+    const val CENTRE = 0.72f
+    const val GAP_DP = 12
+    const val EDGE_DP = CapsuleMetrics.EDGE_DP
+
+    /** Let go this far past the screen's side (or thrown out past it), the capsule folds into the ball there. */
+    const val FOLD_OUT_DP = 32
+
+    /**
+     * The capsule's centre y on [area], at [fraction] of the safe height; [obstacleTop]: the top of a
+     * keyboard or confirm card, if one shows; [cardH]: the open card's height (header included),
+     * which must fit under the status bar above the header.
+     */
+    fun centreY(area: SafeArea, headerH: Int, gap: Int, obstacleTop: Int? = null, fraction: Float = CENTRE, cardH: Int = 0): Int {
+        val top = area.top
+        val bottom = area.screenH - area.bottom
+        var base = top + ((bottom - top) * fraction).roundToInt()
+        if (cardH > 0) base = maxOf(base, top + gap + cardH - headerH / 2)
+        val limit = minOf(bottom, obstacleTop ?: bottom) - gap - headerH / 2
+        val floor = top + gap + headerH / 2
+        return maxOf(floor, minOf(base, limit))
+    }
+
+    /** A dragged capsule's centre, kept [gap] clear of the bars. */
+    fun clampCentre(area: SafeArea, centreY: Int, headerH: Int, gap: Int): Int =
+        centreY.coerceIn(area.top + gap + headerH / 2, maxOf(area.top + gap + headerH / 2, area.screenH - area.bottom - gap - headerH / 2))
+
+    /** The share of the safe height a capsule let go at [centreY] keeps (what [centreY] takes back). */
+    fun fractionFor(area: SafeArea, centreY: Int, headerH: Int, gap: Int): Float {
+        val h = area.screenH - area.bottom - area.top
+        if (h <= 0) return TOP
+        return (clampCentre(area, centreY, headerH, gap) - area.top).toFloat() / h
+    }
+
+    /** A capsule centred at [centreY] is in the upper half of the safe height: its card opens downward. */
+    fun opensDown(area: SafeArea, centreY: Int): Boolean = centreY * 2 < area.top + (area.screenH - area.bottom)
+
+    /**
+     * The card's room, header included, below a capsule centred at [centreY] that opens downward:
+     * down to [gap] over the navigation bar, or over [obstacleTop] (the keyboard while 插话 is typed).
+     */
+    fun cardRoomBelow(area: SafeArea, centreY: Int, headerH: Int, gap: Int, obstacleTop: Int? = null): Int =
+        minOf(area.screenH - area.bottom, obstacleTop ?: Int.MAX_VALUE) - gap - (centreY - headerH / 2)
+
+    /**
+     * A downward card's capsule centre moved up so its [cardH] (header included) fits over
+     * [obstacleTop] (the keyboard while 插话 is typed), never above [gap] under the status bar.
+     */
+    fun liftForCard(area: SafeArea, centreY: Int, headerH: Int, gap: Int, obstacleTop: Int?, cardH: Int): Int {
+        if (obstacleTop == null || cardH <= 0) return centreY
+        val floor = area.top + gap + headerH / 2
+        return maxOf(floor, minOf(centreY, obstacleTop - gap - cardH + headerH / 2))
+    }
+
+    /** The window's Gravity.TOP offset for a capsule centred at [centreY], its root padding the surface by [padTop] above. */
+    fun windowTopY(centreY: Int, headerH: Int, padTop: Int) = centreY - headerH / 2 - padTop
+
+    /**
+     * The width the capsule and the card are sized for: the screen less a cutout or bar on either
+     * side. A left or right anchor starts inside that inset, so the widest card still ends on screen.
+     */
+    fun roomW(area: SafeArea): Int = area.screenW - area.left - area.right
+
+    /** The capsule's left on screen at [anchor], [capW] wide, [edge] from the side. Centred means on the whole screen. */
+    fun capsuleLeft(anchor: CapsuleAnchor, area: SafeArea, capW: Int, edge: Int): Int = when (anchor) {
+        CapsuleAnchor.LEFT -> area.left + edge
+        CapsuleAnchor.CENTRE -> (area.screenW - capW) / 2
+        CapsuleAnchor.RIGHT -> area.screenW - area.right - edge - capW
+    }
+
+    /** Where a steady capsule [capW] wide sits in a surface [extentW] wide: on its anchor's side, so it grows from there. */
+    fun leftIn(anchor: CapsuleAnchor, extentW: Int, capW: Int): Int = when (anchor) {
+        CapsuleAnchor.LEFT -> 0
+        CapsuleAnchor.CENTRE -> (extentW - capW) / 2
+        CapsuleAnchor.RIGHT -> extentW - capW
+    }
+
+    /** The window's x (Gravity.LEFT) that puts the steady capsule's left at [capLeft]; [leftInSurface] is [leftIn]. */
+    fun windowX(capLeft: Int, padX: Int, leftInSurface: Int) = capLeft - padX - leftInSurface
+
+    /** The anchor a capsule let go at [capLeft] settles on: thrown, the side it was thrown to; else the nearest. */
+    fun anchorFor(capLeft: Int, capW: Int, area: SafeArea, edge: Int, velocityX: Float): CapsuleAnchor {
+        if (abs(velocityX) >= EdgeSnap.FLING_PX_PER_S) return if (velocityX < 0) CapsuleAnchor.LEFT else CapsuleAnchor.RIGHT
+        return CapsuleAnchor.entries.minBy { abs(capsuleLeft(it, area, capW, edge) - capLeft) }
+    }
+
+    /**
+     * The side a capsule let go at [capLeft] folds into the ball on: past the screen's side by [out]
+     * px, or past it at all and thrown that way; null when it stays a capsule.
+     */
+    fun foldSide(capLeft: Int, capW: Int, screenW: Int, out: Int, velocityX: Float): Side? {
+        val pastLeft = -capLeft
+        val pastRight = capLeft + capW - screenW
+        return when {
+            pastLeft >= out || (pastLeft > 0 && velocityX <= -EdgeSnap.FLING_PX_PER_S) -> Side.LEFT
+            pastRight >= out || (pastRight > 0 && velocityX >= EdgeSnap.FLING_PX_PER_S) -> Side.RIGHT
+            else -> null
+        }
+    }
+
+    /**
+     * The card's room, header included, above a capsule centred at [centreY]: up to [gap] under
+     * the status bar. A short screen with the keyboard up has little; the card's body scrolls in it.
+     */
+    fun cardRoom(area: SafeArea, centreY: Int, headerH: Int, gap: Int): Int = centreY + headerH / 2 - (area.top + gap)
+
+    /** The body's height in a card at most [maxCard] tall, of which the header takes [headerPart]. */
+    fun bodyHeight(natural: Int, maxCard: Int, headerPart: Int): Int = minOf(natural, (maxCard - headerPart).coerceAtLeast(0))
+
+    /** The window's Gravity.BOTTOM offset for a capsule centred at [centreY], its root padding the surface by [padBottom] below. */
+    fun windowY(screenH: Int, centreY: Int, headerH: Int, padBottom: Int) = screenH - (centreY + headerH / 2) - padBottom
+
+    /** A Gravity.BOTTOM window's top on screen, from its offset [y] and its height. */
+    fun windowTop(screenH: Int, y: Int, windowH: Int) = screenH - y - windowH
+}
+
 /**
  * Where the ball's window goes, in px. The ball sits [edge] from the screen side like the app's
  * floating controls; folding starts on the capsule's end circle.
@@ -300,11 +455,41 @@ internal object BallGeometry {
     /** The window margin EdgeSnap keeps from the safe area so the ball itself is [edge] in. */
     fun margin(edge: Int, pad: Int) = edge - pad
 
-    /** The x of a window [windowW] wide centred on a [screenW] screen (Gravity.CENTER_HORIZONTAL). */
-    fun centredX(screenW: Int, windowW: Int) = (screenW - windowW) / 2
+    /** A ball on [side], level with a capsule centred at [centreY]: where one never moved rests (on the right), and where a capsule dragged off a side folds. */
+    fun dockLevel(area: SafeArea, size: Int, margin: Int, centreY: Int, side: Side = Side.RIGHT): Dock {
+        val lo = EdgeSnap.minY(area, margin)
+        val hi = EdgeSnap.maxY(area, size, margin)
+        val f = if (hi <= lo) 0f else ((centreY - size / 2 - lo).toFloat() / (hi - lo)).coerceIn(0f, 1f)
+        return Dock(side, f)
+    }
 
-    /** The left edge of the circle at the end on [side] of a rect [left]..[right] ([ball] across). */
-    fun circleLeft(left: Int, right: Int, ball: Int, side: Side) = if (side == Side.RIGHT) right - ball else left
+    /**
+     * An idle ball half out of sight: slid out on its [side] until its centre is on the safe area's
+     * edge, half of it showing. [pos] is its docked window ([pad] round a [ball] across).
+     */
+    fun tucked(pos: WindowPos, side: Side, area: SafeArea, pad: Int, ball: Int): WindowPos =
+        WindowPos(if (side == Side.LEFT) area.left - ball / 2 - pad else area.screenW - area.right - ball / 2 - pad, pos.y)
+
+    /** A resting ball window ([size] square) at [pos] lifted, if it would reach below [limit] (a confirm card's top), but not above [minY]. */
+    fun above(pos: WindowPos, size: Int, limit: Int?, minY: Int): WindowPos =
+        if (limit == null || pos.y + size <= limit) pos else WindowPos(pos.x, maxOf(minY, limit - size))
+
+    /** The left edge of the circle at the end on [side] of a rect [left]..[right] ([ball] across); null: in its middle. */
+    fun circleLeft(left: Int, right: Int, ball: Int, side: Side?) = when (side) {
+        Side.RIGHT -> right - ball
+        Side.LEFT -> left
+        null -> (left + right - ball) / 2
+    }
+
+    /** The ball's window ([size] square) at the top centre, its centre at [centreY]: under an island at the top. */
+    fun topCentre(area: SafeArea, size: Int, centreY: Int) = WindowPos((area.screenW - size) / 2, centreY - size / 2)
+
+    /**
+     * A ball let go with its centre at ([cx], [cy]) goes back to the top centre rather than a side:
+     * within the top band (two balls under the status bar) and the middle third across.
+     */
+    fun nearTopCentre(cx: Int, cy: Int, area: SafeArea, ball: Int): Boolean =
+        cy < area.top + 2 * ball && abs(cx - area.screenW / 2) < area.screenW / 6
 
     /**
      * The ball window over a circle at ([circleLeft], [circleTop]) in the surface of a capsule
@@ -313,4 +498,91 @@ internal object BallGeometry {
      */
     fun ballOver(windowX: Int, windowY: Int, padX: Int, padTop: Int, circleLeft: Int, circleTop: Int, pad: Int) =
         WindowPos(windowX + padX + circleLeft - pad, windowY + padTop + circleTop - pad)
+}
+
+/**
+ * The confirm and handoff cards' windows: nearly the display's width, capped so a sentence keeps a
+ * readable measure on a tablet. The width is measured from the window the manager laid out (see
+ * ControlOverlay.fitCardWidth), never from the context's configuration, which can still describe
+ * the previous rotation for a moment after a cold start.
+ */
+internal object CardMetrics {
+    /** Window cap of the confirm card and of the handoff card, in dp. */
+    const val CONFIRM_DP = 472
+    const val HANDOFF_DP = 492
+
+    /** The window width in px for a display [displayW] px wide ([density] as DisplayMetrics has it). */
+    fun windowWidthPx(displayW: Int, density: Float, capDp: Int): Int =
+        minOf(displayW - (CapsuleMetrics.EDGE_DP * density).roundToInt(), (capDp * density).roundToInt())
+}
+
+/** How long a task has run, as the island's second line shows it: 0:42, 12:05, 1:02:03. */
+internal object Elapsed {
+    fun format(ms: Long): String {
+        val total = (ms.coerceAtLeast(0) / 1000)
+        val h = total / 3600
+        val m = total / 60 % 60
+        val sec = total % 60
+        return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
+    }
+
+    /** The widest this can be for a while (the capsule's width is measured on it, not on every tick). */
+    const val WIDEST = "00:00"
+}
+
+/**
+ * The background-screen window (OverlayScreen): a small live view of the background screen in place
+ * of the capsule, against the left or right side of the screen at a height the person chooses,
+ * small or large. Sizes in dp.
+ */
+internal object ScreenWindow {
+    /** The view's width in its two sizes; its height follows the background screen's shape. */
+    const val SMALL_DP = 116
+    const val LARGE_DP = 176
+
+    /** Frame round the view, the footer's height and the surface's corner. */
+    const val FRAME_DP = 5
+    const val FOOTER_DP = 64
+    const val RADIUS_DP = 22
+    const val VIEW_RADIUS_DP = 17
+
+    /** Default height (the window's centre) as a share of the safe area: upper half, clear of a confirm card. */
+    const val CENTRE = 0.4f
+
+    /** Height ÷ width of a background screen whose shape isn't known yet (a 9 : 20 phone). */
+    const val DEFAULT_ASPECT = 20f / 9f
+
+    /** The view's height for [widthPx] at the frame's [aspect] (height ÷ width), within [maxPx]. */
+    fun viewHeight(widthPx: Int, aspect: Float, maxPx: Int): Int {
+        val a = if (aspect.isFinite() && aspect > 0.5f && aspect < 4f) aspect else DEFAULT_ASPECT
+        return (widthPx * a).roundToInt().coerceAtMost(maxPx).coerceAtLeast(widthPx / 2)
+    }
+
+    /** The window's left: against [side] of the safe area, [edge] px in. */
+    fun left(side: Side, area: SafeArea, windowW: Int, edge: Int): Int =
+        if (side == Side.LEFT) area.left + edge else area.screenW - area.right - edge - windowW
+
+    /** The window's top for a centre at [fraction] of the safe area, kept inside it [gap] px from each bar. */
+    fun top(fraction: Float, area: SafeArea, windowH: Int, gap: Int): Int {
+        val lo = area.top + gap
+        val hi = area.screenH - area.bottom - gap - windowH
+        val centre = area.top + (area.screenH - area.top - area.bottom) * fraction
+        return (centre - windowH / 2f).roundToInt().coerceIn(lo, maxOf(lo, hi))
+    }
+
+    /** The share of the safe area a window [windowH] tall at [top] has its centre at. */
+    fun fractionFor(top: Int, area: SafeArea, windowH: Int): Float {
+        val room = (area.screenH - area.top - area.bottom).coerceAtLeast(1)
+        return ((top + windowH / 2f - area.top) / room).coerceIn(0f, 1f)
+    }
+
+    /** The side a window dropped with its left at [left] goes to: the nearer one, or the way it was flung. */
+    fun sideFor(left: Int, windowW: Int, screenW: Int, velocityX: Float): Side = when {
+        velocityX > FLING -> Side.RIGHT
+        velocityX < -FLING -> Side.LEFT
+        left + windowW / 2 < screenW / 2 -> Side.LEFT
+        else -> Side.RIGHT
+    }
+
+    private const val FLING = 1200f
 }

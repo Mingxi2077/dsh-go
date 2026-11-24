@@ -1,4 +1,11 @@
 {
+  "browserPreview": "预览网页",
+  "browserPreviewSummary": "打开这台电脑上运行的本地网页",
+  "browserPreviewPort": "电脑上的端口",
+  "browserPreviewInvalidPort": "请输入 1 到 65535 之间的端口",
+  "browserPreviewPortUnreachable": "连不上电脑的 127.0.0.1:{port}。检查网页服务是否在运行。",
+  "@browserPreviewPortUnreachable": {"placeholders": {"port": {"type": "int"}}},
+  "browserPreviewFailed": "无法打开预览。",
   "browserTitle": "网页",
   "browserSummary": "浏览网页,引用到对话",
   "browserAddressHint": "搜索或输入网址",

@@ -162,7 +162,11 @@ class NativeFilesPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCall
                         if (si >= 0 && !cursor.isNull(si)) size = cursor.getLong(si).takeIf { it >= 0 }
                     }
                 }
-                val safeName = name.substringAfterLast('/').substringAfterLast('\\').filter { it >= ' ' && it != '\u007f' }.take(128).ifEmpty { "file" }
+                val cleaned = name.substringAfterLast('/').substringAfterLast('\\').filter { it >= ' ' && it != '\u007f' }
+                val cut = if (cleaned.length > 128 && cleaned[127].isHighSurrogate() && cleaned[128].isLowSurrogate()) 127 else 128
+                val safeName = cleaned.take(cut).takeIf { label ->
+                    label.any { !it.isWhitespace() && it !in '\u007f'..'\u009f' && it != '\uFEFF' }
+                } ?: "file"
                 val mime = context.contentResolver.getType(uri)?.takeIf {
                     it.matches(Regex("^[A-Za-z0-9][A-Za-z0-9!#\$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#\$&^_.+-]{0,63}$"))
                 } ?: "application/octet-stream"
@@ -195,7 +199,7 @@ class NativeFilesPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCall
             val count = input.read(buffer)
             check(count != 0) { "empty file chunk" }
             if (count < 0) { input.close(); entry.stream = null; entry.ended = true; null }
-            else { s.budget.accept(entry.handle, count); buffer.copyOf(count) }
+            else { s.budget.accept(entry.handle, count); if (count == buffer.size) buffer else buffer.copyOf(count) }
         }
     }
 

@@ -127,13 +127,12 @@ class _PhoneUnlockPageState extends ConsumerState<PhoneUnlockPage> {
     if (_busy != null) return;
     final l10n = context.l10n;
     if (on) {
-      if (ref.read(phoneProvider).status.task.active) {
+      if (ref.read(phoneProvider).status.anyTaskBusy) {
         showBriefNotice(context, l10n.phoneUnlockBusy);
         return;
       }
-      final done = await Navigator.of(context).push<bool>(
-        MaterialPageRoute(builder: (_) => PhoneUnlockConfirmPage(unlock: unlock)),
-      );
+      final done = await Navigator.of(context)
+          .push<bool>(MaterialPageRoute(builder: (_) => PhoneUnlockConfirmPage(unlock: unlock)));
       if (done == true && mounted) showBriefNotice(context, l10n.phoneUnlockOnNotice(unlock.label(l10n)));
       return;
     }
@@ -149,7 +148,7 @@ class _PhoneUnlockPageState extends ConsumerState<PhoneUnlockPage> {
     final l10n = context.l10n;
     final state = ref.watch(phoneProvider);
     final policies = state.policies;
-    final busyTask = state.status.task.active;
+    final busyTask = state.status.anyTaskBusy;
     return AppPage.list(
       title: l10n.phoneUnlockTitle,
       subtitle: Text(l10n.phoneUnlockSubtitle),
@@ -185,9 +184,8 @@ class _PhoneUnlockPageState extends ConsumerState<PhoneUnlockPage> {
                 icon: AppIcons.appRules,
                 title: l10n.phoneUnlockBanks,
                 subtitle: l10n.phoneUnlockBanksHint,
-                onTap: () => Navigator.of(
-                  context,
-                ).push(MaterialPageRoute<void>(builder: (_) => const PhoneAppRulesPage())),
+                onTap: () =>
+                    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const PhoneAppRulesPage())),
               ),
             ],
           ),
@@ -226,7 +224,7 @@ class _UnlockRow extends StatelessWidget {
                 dimension: 22,
                 child: CircularProgressIndicator(strokeWidth: 2, strokeCap: StrokeCap.round),
               )
-            : Switch(value: on, onChanged: change),
+            : Switch.adaptive(value: on, onChanged: change),
       ),
     );
   }
@@ -258,7 +256,7 @@ class _PhoneUnlockConfirmPageState extends ConsumerState<PhoneUnlockConfirmPage>
     }
     setState(() => _saving = false);
     final l10n = context.l10n;
-    final busy = ref.read(phoneProvider).status.task.active;
+    final busy = ref.read(phoneProvider).status.anyTaskBusy;
     showBriefNotice(context, busy ? l10n.phoneUnlockBusy : l10n.phoneConfirmSaveFailed);
   }
 
@@ -266,7 +264,7 @@ class _PhoneUnlockConfirmPageState extends ConsumerState<PhoneUnlockConfirmPage>
   Widget build(BuildContext context) {
     final l10n = context.l10n;
     final unlock = widget.unlock;
-    final busyTask = ref.watch(phoneProvider.select((s) => s.status.task.active));
+    final busyTask = ref.watch(phoneProvider.select((s) => s.status.anyTaskBusy));
     const gap = SizedBox(height: 24);
     final page = AppPage.list(
       title: unlock.confirmTitle(l10n),
@@ -312,9 +310,7 @@ class _PhoneUnlockConfirmPageState extends ConsumerState<PhoneUnlockConfirmPage>
                     busyTask ? l10n.phoneUnlockBusy : l10n.phoneUnlockHoldHint,
                     key: const ValueKey('unlock-hold-hint'),
                     textAlign: TextAlign.center,
-                    style: Theme.of(
-                      context,
-                    ).textTheme.bodySmall?.copyWith(color: DshColors.of(context).textTertiary),
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(color: DshColors.of(context).textTertiary),
                   ),
                 ),
               ],
@@ -360,7 +356,10 @@ class _Disclaimer extends StatelessWidget {
                     Expanded(
                       child: Semantics(
                         header: true,
-                        child: Text(context.l10n.phoneUnlockDisclaimerTitle, style: theme.textTheme.titleSmall?.copyWith(color: ink)),
+                        child: Text(
+                          context.l10n.phoneUnlockDisclaimerTitle,
+                          style: theme.textTheme.titleSmall?.copyWith(color: ink),
+                        ),
                       ),
                     ),
                   ],

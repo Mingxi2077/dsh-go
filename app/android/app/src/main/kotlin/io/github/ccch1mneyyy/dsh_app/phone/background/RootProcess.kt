@@ -1,5 +1,6 @@
 package io.github.ccch1mneyyy.dsh_app.phone.background
 
+import android.os.Bundle
 import java.io.Closeable
 import java.io.IOException
 import java.util.concurrent.Callable
@@ -14,6 +15,18 @@ internal class RootProcess private constructor(private val process: Process) : C
     private val closed = AtomicBoolean(false)
     private val io = Executors.newSingleThreadExecutor { task -> Thread(task, "dsh-root-pipe").apply { isDaemon = true } }
     private var synced = false
+    private val muxGuard = Any()
+    @Volatile private var mux: FramedMuxSession<Bundle>? = null
+
+    fun installMux(peer: String, retired: () -> Unit) = synchronized(muxGuard) {
+        check(!closed.get() && synced && mux == null)
+        FramedMuxSession(process.inputStream, process.outputStream,
+            { MuxProtocol.unwrap(Bundles.unmarshal(it), peer) },
+            { retired(); close() }, FramedMuxSession.REQUEST_DEADLINE_MS).also { mux = it; it.start() }
+    }
+
+    fun exchangeMux(request: Bundle, peer: String): Bundle =
+        checkNotNull(mux).exchange { id -> Bundles.marshal(MuxProtocol.request(request, peer, id)) }
 
     init {
         // su and the manager write here too (authorization prompts included): drain it so the
@@ -34,13 +47,6 @@ internal class RootProcess private constructor(private val process: Process) : C
         Frames.read(process.inputStream) ?: throw IOException("rootDisconnected")
     }
 
-    /** The fixed pm grant: stdout drained unread. */
-    fun exitCode(timeoutMs: Long): Int = bounded(timeoutMs) {
-        val buffer = ByteArray(4096)
-        while (process.inputStream.read(buffer) >= 0) { }
-        process.waitFor()
-    }
-
     // The deadline is the caller's: a pending authorization blocks the read until the person answers.
     private fun <T> bounded(timeoutMs: Long, action: () -> T): T {
         if (closed.get()) throw IOException("rootDisconnected")
@@ -57,7 +63,11 @@ internal class RootProcess private constructor(private val process: Process) : C
     }
 
     override fun close() {
-        if (!closed.compareAndSet(false, true)) return
+        val current = synchronized(muxGuard) {
+            if (!closed.compareAndSet(false, true)) return
+            mux
+        }
+        current?.close()
         io.shutdownNow()
         // Closing a pipe another thread reads can block, so not on the caller's thread. Our
         // server also exits on stdin EOF; killing su revokes nothing at the manager.

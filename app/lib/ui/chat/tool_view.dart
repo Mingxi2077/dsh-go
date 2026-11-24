@@ -35,8 +35,57 @@ MediaMeta? toolMedia(ToolChatItem item) {
 
 final _media = Expando<(MediaMeta?,)>('media');
 
-/// 这次调用带了一张画得出来的原生卡片(插件卡片,或生成的媒体卡)。
-bool hasToolCard(ToolChatItem item) => toolCardParse(item) is DshUiParsed || toolMedia(item) != null;
+typedef QuestionReply = ({String id, String question, String answer});
+
+final _questionReplies = Expando<List<QuestionReply>>('question replies');
+
+/// A durable receipt, only from a successful question tool's saved answer.
+/// Unknown/malformed results retain the ordinary raw tool detail.
+List<QuestionReply> toolQuestionReplies(ToolChatItem item) {
+  if (item.name != 'ask_user_question' || item.status != ToolStatus.succeeded) return const [];
+  return _questionReplies[item] ??= _parseQuestionReplies(item);
+}
+
+List<QuestionReply> _parseQuestionReplies(ToolChatItem item) {
+  final questions = ToolView._decode(item.arguments)?['questions'];
+  final answers = ToolView._decode(item.resultText)?['answers'];
+  if (questions is! List || answers is! List || answers.isEmpty) return const [];
+  final labels = <String, String>{};
+  for (final question in questions) {
+    if (question is! Map) return const [];
+    final id = question['id'];
+    final text = question['question'];
+    if (id is! String || id.isEmpty || text is! String || text.trim().isEmpty || labels.containsKey(id)) {
+      return const [];
+    }
+    final header = question['header'];
+    labels[id] = header is String && header.trim().isNotEmpty ? header : text;
+  }
+  final replies = <QuestionReply>[];
+  final seen = <String>{};
+  for (final answer in answers) {
+    if (answer is! Map) return const [];
+    final id = answer['id'];
+    final selected = answer['selected'];
+    final custom = answer['custom'];
+    if (id is! String ||
+        !labels.containsKey(id) ||
+        !seen.add(id) ||
+        selected is! List ||
+        selected.any((value) => value is! String || value.trim().isEmpty) ||
+        (custom != null && custom is! String)) {
+      return const [];
+    }
+    final text = [...selected.cast<String>(), if (custom is String && custom.trim().isNotEmpty) custom].join('\n');
+    if (text.isEmpty) return const [];
+    replies.add((id: id, question: labels[id]!, answer: text));
+  }
+  return List.unmodifiable(replies);
+}
+
+/// 这次调用带了一张画得出来的原生卡片(插件卡片、媒体卡或提问回执)。
+bool hasToolCard(ToolChatItem item) =>
+    toolCardParse(item) is DshUiParsed || toolMedia(item) != null || toolQuestionReplies(item).isNotEmpty;
 
 /// 带原生卡片的工具调用,卡片画在哪(`ToolCallRow.card`)。
 enum ToolCardPlacement {
@@ -60,7 +109,7 @@ const _sandboxUnavailableMarker = 'no sandbox backend is usable';
 /// 全部从 [ToolChatItem] 现算,但 diff(LCS)不便宜,所以惰性 + 由工具行的
 /// State 按输入身份复用([matches])。
 class ToolView {
-  ToolView._(this.item) : args = _decode(item.arguments);
+  ToolView._(this.item);
 
   factory ToolView.of(ToolChatItem item, [ToolView? previous]) =>
       previous != null && previous.matches(item) ? previous : ToolView._(item);
@@ -68,8 +117,9 @@ class ToolView {
   final ToolChatItem item;
   final _locale = AppLocale.current;
 
-  /// 解析后的参数;流式中(JSON 不完整)为 null。
-  final Map<String, Object?>? args;
+  /// 解析后的参数;流式中(JSON 不完整)为 null。用到才解析:活动条每次更新都为上一个工具
+  /// 建视图,只读 [command],不该每次把 write 的整份内容解析一遍。
+  late final Map<String, Object?>? args = _decode(item.arguments);
 
   String get name => item.name;
 
@@ -87,7 +137,9 @@ class ToolView {
       other.pendingApproval?.eventId == item.pendingApproval?.eventId;
 
   static Map<String, Object?>? _decode(String raw) {
-    if (raw.trim().isEmpty) return null;
+    // An object's JSON ends in `}`. Arguments still streaming mostly don't:
+    // skip the parse that would throw on every delta.
+    if (!raw.trimRight().endsWith('}')) return null;
     try {
       final value = jsonDecode(raw);
       return value is Map<String, Object?> ? value : null;
@@ -178,6 +230,8 @@ class ToolView {
 
   /// 生成的媒体,见 [toolMedia]。
   late final MediaMeta? media = toolMedia(item);
+
+  late final List<QuestionReply> questionReplies = toolQuestionReplies(item);
 
   /// 原生卡片的标题:折叠行的摘要用它(卡片画不了或没写标题时为 null)。
   String? get pluginTitle => switch (pluginView) {
@@ -277,6 +331,23 @@ class ToolView {
   /// 结果文本(原样,含 ANSI)。
   String get resultText => item.resultText;
 
+  /// What a phone tool on HarmonyOS's engine reported, in place of a bare success
+  /// or failure: opening a page isn't the job done, and an unknown isn't a
+  /// failure. Null for everything else (Android's phone tools answer in prose).
+  late final DshPhoneResult? phoneResult = _phoneResult();
+
+  DshPhoneResult? _phoneResult() {
+    if (!name.startsWith('mcp__phone__') || isActive) return null;
+    final text = item.resultText;
+    final start = text.indexOf('{');
+    if (start < 0) return null;
+    try {
+      return DshPhoneResult.fromJson(jsonDecode(text.substring(start)));
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// 失败原因(结果文本优先,其次 failure.reason)。
   String? get failureText {
     if (item.status != ToolStatus.failed) return null;
@@ -374,9 +445,11 @@ class ToolView {
   }
 
   /// read 的行号窗口:优先 meta,退回解析结果文本里的 `N: text` 行。
-  late final ({String code, int firstLine, String? language})? readWindow = _read();
+  late final ({String code, int firstLine, String? language})? readWindow = readFresh();
 
-  ({String code, int firstLine, String? language})? _read() {
+  /// 同 [readWindow],但每次现拼、不留在视图上:改动摘要只借用一次,
+  /// 别让全局缓存里的视图常驻整窗正文。
+  ({String code, int firstLine, String? language})? readFresh() {
     if (name != 'read' || item.status != ToolStatus.succeeded) return null;
     final meta = item.meta;
     final p = path;
@@ -416,8 +489,54 @@ class ToolView {
 
 /// 工作区内的路径去掉工作区前缀,其余原样。
 String displayPath(String path) {
-  const prefix = '$localWorkspaceDir/';
+  final prefix = '$localWorkspaceDir/';
   if (path.startsWith(prefix)) return path.substring(prefix.length);
   if (path == localWorkspaceDir) return '.';
   return path;
+}
+
+/// How a [DshPhoneResult] reads in the chat: a word for the row's end, a sentence
+/// for its details, and whether it deserves the row's failure red.
+extension PhoneResultText on DshPhoneResult {
+  bool get _unsupported => code == 'unsupported';
+
+  /// Unknown and unsupported aren't faults of the call, and a stop was asked for.
+  bool get isFault => switch (status) {
+    DshPhoneStatus.failed => !_unsupported,
+    DshPhoneStatus.timedOut => true,
+    _ => false,
+  };
+
+  String get word => switch (status) {
+    DshPhoneStatus.succeeded when evidence == DshPhoneEvidence.openedUi => appL10n.systemActionsOpenedUi,
+    DshPhoneStatus.succeeded when evidence == DshPhoneEvidence.userConfirmed => appL10n.phoneDecisionContinued,
+    DshPhoneStatus.succeeded when effect == DshPhoneEffect.reminderScheduled => appL10n.harmonyReminderSet,
+    DshPhoneStatus.succeeded => appL10n.phoneDecisionDone,
+    DshPhoneStatus.unknown => appL10n.systemActionsResultUnknown,
+    DshPhoneStatus.cancelled => appL10n.commonStopped,
+    DshPhoneStatus.timedOut => appL10n.phoneDecisionTimeout,
+    DshPhoneStatus.failed when _unsupported => appL10n.systemActionsNotSupported,
+    DshPhoneStatus.failed => appL10n.systemActionsNotRun,
+  };
+
+  String get sentence => switch (status) {
+    DshPhoneStatus.succeeded => switch (effect) {
+      DshPhoneEffect.openedUi => appL10n.systemActionsResultOpened,
+      DshPhoneEffect.notificationPublished => appL10n.systemActionsResultNotified,
+      DshPhoneEffect.clipboardWritten => appL10n.systemActionsResultClipboard,
+      DshPhoneEffect.reminderScheduled => appL10n.systemActionsResultReminder,
+      DshPhoneEffect.none => appL10n.systemActionsResultContinued,
+    },
+    DshPhoneStatus.unknown => appL10n.systemActionsResultUnknownDetail,
+    DshPhoneStatus.cancelled => appL10n.systemActionsResultStopped,
+    DshPhoneStatus.timedOut => appL10n.systemActionsResultTimeout,
+    DshPhoneStatus.failed => switch (code) {
+      'unsupported' => appL10n.systemActionsResultUnsupported,
+      'not_foreground' => appL10n.systemActionsResultOffScreen,
+      'native_unavailable' || 'owner_retired' || 'closed' => appL10n.systemActionsResultUnavailable,
+      'reminder_refused' when AppLocale.isEnglish => appL10n.harmonyReminderRefused,
+      // The native side's own reason says which part of it; it only has Chinese.
+      _ => AppLocale.isEnglish ? appL10n.systemActionsResultNotRun : message,
+    },
+  };
 }

@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:dsh_app/browser/browser_models.dart';
 import 'package:dsh_app/state/attachments.dart';
 import 'package:dsh_app/state/draft_store.dart';
+import 'package:dsh_app/state/web_quote.dart';
 import 'package:dsh_app/state/sessions_state.dart';
 import 'package:dsh_app/state/voice_state.dart';
 import 'package:dsh_app/ui/chat/composer.dart';
@@ -25,35 +27,152 @@ void main() {
     var container = ProviderContainer();
     var store = container.read(draftStoreProvider.notifier);
     final image = DraftAttachment.sniff('图片.png', tinyPng);
-    store.save('a', 'A 草稿', [image]);
-    store.save('b', 'B 草稿', const []);
-    store.clear('b');
+    final a = draftStorageKey(hostKey: 'local:local', sessionId: 'a');
+    final b = draftStorageKey(hostKey: 'local:local', sessionId: 'b');
+    store.save(a, 'A 草稿', [image]);
+    store.save(b, 'B 草稿', const []);
+    store.clear(b);
     await store.flush();
     container.dispose();
     container = ProviderContainer();
     store = container.read(draftStoreProvider.notifier);
     await store.flush();
     final drafts = container.read(draftStoreProvider).drafts;
-    expect(drafts['a']!.text, 'A 草稿');
-    expect(drafts['a']!.attachments, isEmpty);
-    expect(drafts.containsKey('b'), isFalse);
+    expect(drafts[a]!.text, 'A 草稿');
+    expect(drafts[a]!.attachments, isEmpty);
+    expect(drafts.containsKey(b), isFalse);
+    container.dispose();
+  });
+
+  test('unscoped v2 drafts remain recoverable beside host-scoped drafts', () async {
+    final scopedKey = draftStorageKey(hostKey: 'local:local', sessionId: 'scoped-chat');
+    SharedPreferences.setMockInitialValues({
+      DraftStore.preferenceKey: jsonEncode({
+        'new': {'t': '旧版新对话草稿', 'at': 30},
+        'old-chat': {'t': '旧版会话草稿', 'at': 20},
+        scopedKey: {'t': '新版本会话草稿', 'at': 40},
+      }),
+      DraftStore.legacyPreferenceKey: jsonEncode({
+        'older-chat': {'t': '更早版本的草稿', 'at': 10},
+      }),
+    });
+
+    final container = ProviderContainer();
+    final store = container.read(draftStoreProvider.notifier);
+    await store.flush();
+    final state = container.read(draftStoreProvider);
+    expect(state.drafts.keys, [scopedKey]);
+    expect(state.legacyDrafts.keys, containsAll(['new', 'old-chat', 'older-chat']));
+    expect(state.legacyDrafts['new']!.text, '旧版新对话草稿');
+    expect(state.legacyDrafts['old-chat']!.text, '旧版会话草稿');
+    expect(state.drafts[scopedKey]!.text, '新版本会话草稿');
+
+    final prefs = await SharedPreferences.getInstance();
+    final saved = jsonDecode(prefs.getString(DraftStore.preferenceKey)!) as Map;
+    final legacy = jsonDecode(prefs.getString(DraftStore.legacyPreferenceKey)!) as Map;
+    expect(saved.keys, [scopedKey]);
+    expect(legacy['new']['t'], '旧版新对话草稿');
+    expect(legacy['old-chat']['t'], '旧版会话草稿');
+    expect(legacy['older-chat']['t'], '更早版本的草稿');
+    container.dispose();
+  });
+
+  test('unscoped v2 web references remain recoverable and can be appended', () async {
+    final previousQuote = DraftWebQuote.fromContent(
+      BrowserPageContent(
+        url: Uri.https('example.com', '/older-article'),
+        title: 'Older article',
+        text: 'Passage from the old browser',
+        selection: true,
+        truncated: false,
+      ),
+    );
+    final currentQuote = DraftWebQuote.fromContent(
+      BrowserPageContent(
+        url: Uri.https('example.org', '/current-article'),
+        title: 'Current article',
+        text: 'Passage already in the composer',
+        selection: false,
+        truncated: false,
+      ),
+    );
+    final target = draftStorageKey(hostKey: 'local:local', sessionId: 'current-chat');
+    final image = DraftAttachment.sniff('current.png', tinyPng);
+    SharedPreferences.setMockInitialValues({
+      DraftStore.preferenceKey: jsonEncode({
+        'new': {
+          't': '旧版网页草稿',
+          'at': 30,
+          'webQuotes': [previousQuote.toJson()],
+        },
+      }),
+    });
+
+    final container = ProviderContainer();
+    final store = container.read(draftStoreProvider.notifier);
+    await store.flush();
+    final legacyQuote = container.read(draftStoreProvider).legacyDrafts['new']!.webQuotes.single;
+    expect(legacyQuote.id, previousQuote.id);
+    expect(legacyQuote.text, previousQuote.text);
+    store.save(target, '当前草稿', [image], webQuotes: [currentQuote]);
+    expect(
+      store.importLegacy(legacyKey: 'new', expectedText: '旧版网页草稿', expectedWebQuotes: [legacyQuote], targetKey: target),
+      isTrue,
+    );
+
+    final recovered = container.read(draftStoreProvider).drafts[target]!;
+    expect(recovered.text, '当前草稿\n\n旧版网页草稿');
+    expect(recovered.attachments.single, same(image));
+    expect(recovered.webQuotes.map((quote) => quote.id), [currentQuote.id, legacyQuote.id]);
+    await store.flush();
+    final preferences = await SharedPreferences.getInstance();
+    final migratedLegacy = jsonDecode(preferences.getString(DraftStore.legacyPreferenceKey)!) as Map;
+    expect(migratedLegacy['new']['webQuotes'].single['text'], 'Passage from the old browser');
+    container.dispose();
+  });
+
+  test('a picture pasted as its bytes is not put back, what was typed before it is (#1684)', () async {
+    // As Android reads them: what UTF-8 cannot decode is U+FFFD.
+    final jpeg = '\ufffd\ufffd\ufffd\ufffd\u0000\u0010JFIF\u0000MM\u0000*' * 1000;
+    final png = '\ufffdPNG\r\n\u001a\n\u0000\u0000\u0000\rIHDR' * 1000;
+    SharedPreferences.setMockInitialValues({
+      DraftStore.preferenceKey: jsonEncode({
+        draftStorageKey(hostKey: 'local:local', sessionId: 'pasted'): {'t': jpeg, 'at': 5},
+        draftStorageKey(hostKey: 'local:local', sessionId: 'png'): {'t': png, 'at': 4},
+        draftStorageKey(hostKey: 'local:local', sessionId: 'both'): {'t': '看看这张图 $jpeg', 'at': 3},
+        draftStorageKey(hostKey: 'local:local', sessionId: 'cafe'): {'t': 'café$png', 'at': 2},
+        draftStorageKey(hostKey: 'local:local', sessionId: 'typed'): {'t': '明天再问', 'at': 1},
+      }),
+    });
+    final container = ProviderContainer();
+    final store = container.read(draftStoreProvider.notifier);
+    await store.flush();
+    final drafts = container.read(draftStoreProvider).drafts;
+    expect(drafts.keys, [
+      draftStorageKey(hostKey: 'local:local', sessionId: 'both'),
+      draftStorageKey(hostKey: 'local:local', sessionId: 'cafe'),
+      draftStorageKey(hostKey: 'local:local', sessionId: 'typed'),
+    ]);
+    expect(drafts[draftStorageKey(hostKey: 'local:local', sessionId: 'both')]!.text, '看看这张图');
+    expect(drafts[draftStorageKey(hostKey: 'local:local', sessionId: 'cafe')]!.text, 'café');
+    expect(drafts[draftStorageKey(hostKey: 'local:local', sessionId: 'typed')]!.text, '明天再问');
     container.dispose();
   });
 
   test('what was typed before the saved drafts load wins', () async {
     SharedPreferences.setMockInitialValues({
       DraftStore.preferenceKey: jsonEncode({
-        'a': {'t': '旧文', 'at': 1},
-        'b': {'t': 'B 的旧文', 'at': 2},
+        draftStorageKey(hostKey: 'local:local', sessionId: 'a'): {'t': '旧文', 'at': 1},
+        draftStorageKey(hostKey: 'local:local', sessionId: 'b'): {'t': 'B 的旧文', 'at': 2},
       }),
     });
     final container = ProviderContainer();
     final store = container.read(draftStoreProvider.notifier);
-    store.save('a', '刚输入的', const []);
+    store.save(draftStorageKey(hostKey: 'local:local', sessionId: 'a'), '刚输入的', const []);
     await store.flush();
     final drafts = container.read(draftStoreProvider).drafts;
-    expect(drafts['a']!.text, '刚输入的');
-    expect(drafts['b']!.text, 'B 的旧文');
+    expect(drafts[draftStorageKey(hostKey: 'local:local', sessionId: 'a')]!.text, '刚输入的');
+    expect(drafts[draftStorageKey(hostKey: 'local:local', sessionId: 'b')]!.text, 'B 的旧文');
     container.dispose();
   });
 
@@ -61,7 +180,7 @@ void main() {
     final container = ProviderContainer();
     final store = container.read(draftStoreProvider.notifier);
     for (var i = 0; i < 35; i++) {
-      store.save('$i', '草稿 $i', const []);
+      store.save(draftStorageKey(hostKey: 'local:local', sessionId: '$i'), '草稿 $i', const []);
     }
     await store.flush();
     expect(container.read(draftStoreProvider).drafts, hasLength(30));
@@ -76,7 +195,9 @@ void main() {
     await pumpFrames(tester);
     final container = ProviderScope.containerOf(tester.element(find.byType(ChatScreen)));
     final image = DraftAttachment.sniff('图片.png', tinyPng);
-    container.read(draftStoreProvider.notifier).save(localDraft('b'), 'B 草稿', [image]);
+    container.read(draftStoreProvider.notifier).save(draftStorageKey(hostKey: 'local:local', sessionId: 'b'), 'B 草稿', [
+      image,
+    ]);
     await tester.enterText(find.byType(TextField), 'A 草稿');
     container.read(currentSessionProvider.notifier).select('b');
     await tester.pump();

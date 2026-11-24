@@ -1,4 +1,6 @@
-// Portions derived from PiPilot (https://github.com/CikeSeven/pi_pilot), MIT, Copyright (c) 2026 CikeSeven. See THIRD_PARTY_NOTICES.md.
+// SPDX-FileCopyrightText: 2026 CikeSeven
+// SPDX-License-Identifier: MIT
+// See THIRD_PARTY_NOTICES.md.
 
 import 'dart:async';
 import 'dart:math' as math;
@@ -12,6 +14,7 @@ import '../theme/glass.dart';
 import '../theme/motion.dart';
 import '../theme/semantic_colors.dart';
 import '../theme/shapes.dart';
+import '../theme/sheet_recede.dart';
 import '../theme/surfaces.dart';
 import 'sheet_title_bar.dart';
 import 'sheet_dismissal.dart';
@@ -59,6 +62,7 @@ Future<T?> showAppSheet<T>(
   bool isScrollControlled = false,
   bool glass = true,
   SheetDismissal? dismissal,
+  void Function(ModalRoute<Object?> route, Route<dynamic>? nextRoute)? onRouteChanged,
 }) {
   final policy = dismissal ?? (heightFactor == null ? SheetDismissal.drag : SheetDismissal.button);
   final draggable = policy == SheetDismissal.drag;
@@ -83,8 +87,14 @@ Future<T?> showAppSheet<T>(
   // to its content up to there. Width: Material's 640, centred between the
   // (mirrored) side insets.
   final short = MediaQuery.sizeOf(context).height < WindowClass.compactHeight;
-  return showModalBottomSheet<T>(
-    context: context,
+  final navigator = Navigator.of(context);
+  final localizations = MaterialLocalizations.of(context);
+  final route = _AppSheetRoute<T>(
+    onRouteChanged: onRouteChanged,
+    capturedThemes: InheritedTheme.capture(from: context, to: navigator.context),
+    barrierLabel: localizations.scrimLabel,
+    barrierOnTapHint: localizations.scrimOnTapHint(localizations.bottomSheetLabel),
+    modalBarrierColor: Theme.of(context).bottomSheetTheme.modalBarrierColor,
     useSafeArea: true,
     isScrollControlled: isScrollControlled || heightFactor != null,
     scrollControlDisabledMaxHeightRatio: short ? 1 : 9 / 16,
@@ -95,12 +105,14 @@ Future<T?> showAppSheet<T>(
     backgroundColor: glass ? Colors.transparent : null,
     elevation: 0,
     // 曲线也会被采纳(包括下拉松手后的剩余行程)。
-    sheetAnimationStyle: const AnimationStyle(
-      duration: AppMotion.sheetIn,
-      reverseDuration: AppMotion.sheetOut,
-      curve: AppMotion.sheetRise,
-      reverseCurve: AppMotion.sheetFall,
-    ),
+    sheetAnimationStyle: AppMotion.reduced(context)
+        ? AnimationStyle.noAnimation
+        : const AnimationStyle(
+            duration: AppMotion.sheetIn,
+            reverseDuration: AppMotion.sheetOut,
+            curve: AppMotion.sheetRise,
+            reverseCurve: AppMotion.sheetFall,
+          ),
     builder: sized((context) {
       final content = Column(
         mainAxisSize: MainAxisSize.min,
@@ -109,15 +121,109 @@ Future<T?> showAppSheet<T>(
           Flexible(child: builder(context)),
         ],
       );
-      final surface = glass
-          ? GlassSurface(
-              tier: GlassTier.sheet,
-              borderRadius: const BorderRadius.vertical(top: Radius.circular(AppShape.xl)),
+      Widget surface([Animation<double>? held]) => glass
+          ? _SheetGlass(
+              held: held,
               child: Material(type: MaterialType.transparency, child: content),
             )
           : content;
-      return holds == null ? surface : _HeldSheetDrag(holds: holds, child: surface);
+      return SheetRecedeSheet(
+        child: holds == null ? surface() : _HeldSheetDrag(holds: holds, builder: surface),
+      );
     }),
+  );
+  // Capture the exact route before push makes the owning page non-current.
+  onRouteChanged?.call(route, null);
+  return navigator.push(route).whenComplete(() => onRouteChanged?.call(route, null));
+}
+
+/// Only an opted-in owner observes this sheet, including a later route above
+/// it. A bool spanning the returned Future would also cover unrelated pages.
+class _AppSheetRoute<T> extends ModalBottomSheetRoute<T> {
+  _AppSheetRoute({
+    required super.builder,
+    required super.isScrollControlled,
+    super.capturedThemes,
+    super.barrierLabel,
+    super.barrierOnTapHint,
+    super.modalBarrierColor,
+    super.useSafeArea,
+    super.scrollControlDisabledMaxHeightRatio,
+    super.showDragHandle,
+    super.enableDrag,
+    super.isDismissible,
+    super.backgroundColor,
+    super.elevation,
+    super.sheetAnimationStyle,
+    this.onRouteChanged,
+  });
+  final void Function(ModalRoute<Object?> route, Route<dynamic>? nextRoute)? onRouteChanged;
+
+  @override
+  void didChangeNext(Route<dynamic>? nextRoute) {
+    super.didChangeNext(nextRoute);
+    onRouteChanged?.call(this, nextRoute);
+  }
+}
+
+/// A sheet's glass, which blurs only at rest. A moving blur re-samples what is
+/// behind it every frame, far over the frame budget on some GPUs; so while the
+/// route's animation runs or a finger has the sheet, the glass is an opaque
+/// fill, and once it stops the fill clears over [AppMotion.glassIn].
+class _SheetGlass extends StatefulWidget {
+  const _SheetGlass({this.held, required this.child});
+
+  /// How far a [_HeldSheetDrag] has the sheet off its place.
+  final Animation<double>? held;
+  final Widget child;
+
+  @override
+  State<_SheetGlass> createState() => _SheetGlassState();
+}
+
+class _SheetGlassState extends State<_SheetGlass> with SingleTickerProviderStateMixin {
+  late final AnimationController _settled = AnimationController(vsync: this, duration: AppMotion.glassIn);
+  Animation<double>? _route;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_route != null) return;
+    _route = ModalRoute.of(context)!.animation!..addStatusListener(_onRoute);
+    widget.held?.addListener(_sync);
+    _sync();
+  }
+
+  @override
+  void dispose() {
+    _route?.removeStatusListener(_onRoute);
+    widget.held?.removeListener(_sync);
+    _settled.dispose();
+    super.dispose();
+  }
+
+  void _onRoute(AnimationStatus _) => _sync();
+
+  void _sync() {
+    if (!_route!.isCompleted || (widget.held?.value ?? 0) != 0) {
+      if (_settled.value != 0) _settled.value = 0;
+    } else if (AppMotion.reduced(context)) {
+      _settled.value = 1;
+    } else if (!_settled.isForwardOrCompleted) {
+      unawaited(_settled.forward());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: _settled,
+    builder: (context, child) => GlassSurface(
+      tier: GlassTier.sheet,
+      borderRadius: const BorderRadius.vertical(top: Radius.circular(AppShape.xl)),
+      settled: _settled.value,
+      child: child,
+    ),
+    child: widget.child,
   );
 }
 
@@ -129,10 +235,12 @@ Future<T?> showAppSheet<T>(
 /// down, or past half its height, as `BottomSheet` decides) it asks the route
 /// with `maybePop`, and the content's [PopScope] answers.
 class _HeldSheetDrag extends StatefulWidget {
-  const _HeldSheetDrag({required this.holds, required this.child});
+  const _HeldSheetDrag({required this.holds, required this.builder});
 
   final SheetDragHolds holds;
-  final Widget child;
+
+  /// The sheet, told how far the drag has it off its place.
+  final Widget Function(Animation<double> offset) builder;
 
   @override
   State<_HeldSheetDrag> createState() => _HeldSheetDragState();
@@ -153,20 +261,31 @@ class _HeldSheetDragState extends State<_HeldSheetDrag> with SingleTickerProvide
   }
 
   void _update(DragUpdateDetails details) {
-    _offset.stop();
+    // Caught on its way back: the drag carries on from where the sheet is.
+    if (_offset.isAnimating) {
+      _offset.stop();
+      _dragged = _offset.value;
+    }
     _dragged += details.delta.dy;
     _offset.value = math.max(0, _dragged);
   }
 
-  void _settle() {
+  /// [velocity]: pixels a second, downwards.
+  void _settle([double velocity = 0]) {
     _dragged = 0;
-    unawaited(_offset.animateTo(0, duration: AppMotion.of(context, AppMotion.standard), curve: AppMotion.enter));
+    if (AppMotion.reduced(context) || _offset.value == 0) {
+      _offset.value = 0;
+      return;
+    }
+    final height = context.size?.height ?? MediaQuery.sizeOf(context).height;
+    unawaited(_offset.animateWith(AppMotion.settle(AppMotion.sheetSpring, _offset.value, 0, velocity, extent: height)));
   }
 
   void _end(DragEndDetails details) {
     final height = context.size?.height ?? double.infinity;
-    final closing = (details.primaryVelocity ?? 0) > _flingVelocity || _dragged > height * _closeFraction;
-    _settle();
+    final velocity = details.primaryVelocity ?? 0;
+    final closing = velocity > _flingVelocity || _dragged > height * _closeFraction;
+    _settle(velocity);
     if (closing) unawaited(Navigator.of(context).maybePop());
   }
 
@@ -186,7 +305,7 @@ class _HeldSheetDragState extends State<_HeldSheetDrag> with SingleTickerProvide
     child: AnimatedBuilder(
       animation: _offset,
       builder: (context, child) => Transform.translate(offset: Offset(0, _offset.value), child: child),
-      child: widget.child,
+      child: widget.builder(_offset),
     ),
   );
 }

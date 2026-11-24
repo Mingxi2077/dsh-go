@@ -4,6 +4,7 @@ import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
 
+import 'delta.dart';
 import 'release.dart';
 import 'update_config.dart';
 import 'update_http.dart';
@@ -77,7 +78,7 @@ class CancelToken {
   }
 }
 
-enum _Step { complete, cancelled, interrupted, unreachable, rejected, storage }
+enum _Step { complete, cancelled, interrupted, oversized, unreachable, rejected, storage }
 
 /// Downloads one file into [directory], resuming `<name>.part` with HTTP
 /// ranges, falling through the URLs in order, and only hands it over once
@@ -123,6 +124,7 @@ class ApkDownloader {
       target = File('${directory.path}/$fileName');
       part = File('${target.path}.part');
       if (await target.exists()) {
+        if (cancel?.isCancelled ?? false) return const DownloadCancelled();
         onVerifying?.call();
         if (await hasher(target) == sha256) return DownloadDone(target, null);
         await target.delete();
@@ -140,8 +142,11 @@ class ApkDownloader {
         if (step == _Step.cancelled) return const DownloadCancelled();
         if (step == _Step.storage) return const DownloadFailed(DownloadFailure.storage);
         if (step == _Step.complete) {
+          // The UI can still cancel while the file is closing or being renamed.
+          if (cancel?.isCancelled ?? false) return const DownloadCancelled();
           try {
             await part.rename(target.path);
+            if (cancel?.isCancelled ?? false) return const DownloadCancelled();
             onVerifying?.call();
             if (await hasher(target) == sha256) return DownloadDone(target, url);
             // Corrupt or tampered: start over from the next source.
@@ -163,6 +168,55 @@ class ApkDownloader {
     return DownloadFailed(failure);
   }
 
+  /// [fileName] built from [base] (the installed APK) and [patch], which is
+  /// downloaded from [urls] like any file (resume, fallbacks, its SHA-256).
+  /// The result lands where [download] would leave [fileName], only once it
+  /// is [expectedSize] bytes hashing to [sha256]; the patch is deleted after.
+  /// Failed when anything goes wrong: the caller downloads the whole file.
+  Future<DownloadOutcome> downloadPatched({
+    required ReleasePatch patch,
+    required File base,
+    required String fileName,
+    required String sha256,
+    required List<DownloadUrl> urls,
+    int? expectedSize,
+    void Function(DownloadProgress progress)? onProgress,
+    void Function()? onVerifying,
+    CancelToken? cancel,
+  }) async {
+    final got = await download(
+      fileName: patch.name,
+      sha256: patch.sha256,
+      urls: urls,
+      expectedSize: patch.size,
+      onProgress: onProgress,
+      onVerifying: onVerifying,
+      cancel: cancel,
+    );
+    if (got is! DownloadDone) return got;
+    final target = File('${directory.path}/$fileName');
+    // Built in the full download's `.part`: a build cut short leaves the start
+    // of the APK, which that download resumes (and still checks).
+    final part = File('${target.path}.part');
+    try {
+      await applyDeltaPatch(
+        base: base,
+        patch: got.file,
+        out: part,
+        baseSha256: patch.from,
+        targetSha256: sha256,
+        targetSize: expectedSize,
+      );
+      await part.rename(target.path);
+      return DownloadDone(target, got.from);
+    } on Object {
+      // Another base, a broken patch, or no room to build it.
+      return const DownloadFailed(DownloadFailure.checksum);
+    } finally {
+      await _deleteQuietly(got.file);
+    }
+  }
+
   Future<_Step> _fetch(
     DownloadUrl url,
     File part,
@@ -182,6 +236,11 @@ class ApkDownloader {
     }
     if (expectedSize != null && offset == expectedSize && offset > 0) return _Step.complete;
 
+    // A failed cache check or prior source may have left the caller verifying.
+    // Report the actual resume point before waiting for response headers.
+    onProgress?.call(DownloadProgress(received: offset, total: expectedSize, source: url.label));
+    if (cancel?.isCancelled ?? false) return _Step.cancelled;
+
     final UpdateHttpResponse response;
     try {
       response = await http.get(
@@ -195,14 +254,20 @@ class ApkDownloader {
         timeout: connectTimeout,
       );
     } on Object {
-      return _Step.unreachable;
+      return (cancel?.isCancelled ?? false) ? _Step.cancelled : _Step.unreachable;
+    }
+    // Cancellation can arrive while get is waiting for response headers.
+    if (cancel?.isCancelled ?? false) {
+      final body = response.body.listen(null, onError: (Object _) {});
+      unawaited(body.cancel().catchError((Object _) {}));
+      return _Step.cancelled;
     }
 
     var append = false;
     switch (response.status) {
       case 206:
         final start = RegExp(r'bytes (\d+)-').firstMatch(response.headers['content-range'] ?? '')?.group(1);
-        if (start != null && int.parse(start) != offset) {
+        if (start != null && int.tryParse(start) != offset) {
           await response.discard();
           await _deleteQuietly(part);
           return _Step.interrupted;
@@ -249,6 +314,11 @@ class ApkDownloader {
         .timeout(idleTimeout)
         .listen(
           (chunk) {
+            if (done.isCompleted) return;
+            if (total != null && chunk.length > total - received) {
+              done.complete(_Step.oversized);
+              return;
+            }
             sink.add(chunk);
             received += chunk.length;
             if (received - reported >= progressStep) {
@@ -272,9 +342,9 @@ class ApkDownloader {
       }),
     );
     var step = await done.future;
-    if (step == _Step.storage) {
-      // A cancelled response may still be awaiting its producer. Do not wait
-      // for it before reporting the storage failure, or leave its error loose.
+    if (step == _Step.storage || step == _Step.oversized) {
+      // Stop an unfinished response without waiting for its producer cleanup
+      // before reporting this failed attempt, or leaving its error loose.
       unawaited(sub.cancel().catchError((Object _) {}));
     }
     try {
@@ -284,13 +354,13 @@ class ApkDownloader {
     } on FileSystemException {
       return _Step.storage;
     }
+    if (step == _Step.oversized) {
+      await _deleteQuietly(part);
+      return _Step.interrupted;
+    }
     if (step == _Step.complete) {
       onProgress?.call(DownloadProgress(received: received, total: total, source: url.label));
       if (total != null && received < total) step = _Step.interrupted;
-      if (total != null && received > total) {
-        await _deleteQuietly(part);
-        step = _Step.interrupted;
-      }
     }
     return step;
   }
@@ -303,13 +373,13 @@ class ApkDownloader {
     }
   }
 
-  /// Deletes every file in [directory] except [keep] (and its `.part`).
-  Future<void> clean({String? keep}) async {
+  /// Deletes every file in [directory] except those in [keep] (and their `.part`).
+  Future<void> clean({Iterable<String> keep = const []}) async {
     try {
       if (!await directory.exists()) return;
       await for (final entity in directory.list()) {
         final name = entity.uri.pathSegments.lastWhere((s) => s.isNotEmpty, orElse: () => '');
-        if (keep != null && (name == keep || name == '$keep.part')) continue;
+        if (keep.any((k) => name == k || name == '$k.part')) continue;
         await entity.delete(recursive: true);
       }
     } on FileSystemException {

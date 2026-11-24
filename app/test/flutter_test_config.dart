@@ -5,27 +5,11 @@
 
 import 'dart:async';
 
-import 'package:dsh_app/l10n/l10n.dart';
-import 'package:dsh_app/performance/performance_state.dart';
-import 'package:dsh_app/pets/pet_sheets.dart';
-import 'package:dsh_app/state/locale_state.dart';
-
-import 'support/english_preview.dart';
-import 'support/quiet_performance.dart';
+import 'support/test_defaults.dart';
 import 'support/test_fonts.dart';
 
 Future<void> testExecutable(FutureOr<void> Function() testMain) async {
   await loadTestFonts();
-  // The chat page's pet is drawn only where a test asks for it
-  // (test/pets/): elsewhere a sheet decoding in a stray real-async window
-  // would make screens flicker between with and without a pet.
-  PetSheets.enabled = false;
-  // No device facts in tests: the app reads "unavailable" at once.
-  PerformanceChannel.create = QuietPerformanceChannel.new;
-  // Tests run in Chinese (goldens and finders were made in it); English
-  // tests opt in with AppLocale.use(AppLocale.en) + an English MaterialApp.
-  AppLanguageController.initial = AppLanguage.zh;
-  AppLocale.use(AppLocale.zhCN);
-  setUpEnglishPreview();
+  applyTestDefaults();
   await testMain();
 }

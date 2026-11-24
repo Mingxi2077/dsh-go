@@ -1,4 +1,6 @@
-// Portions derived from PiPilot (https://github.com/CikeSeven/pi_pilot), MIT, Copyright (c) 2026 CikeSeven. See THIRD_PARTY_NOTICES.md.
+// SPDX-FileCopyrightText: 2026 CikeSeven
+// SPDX-License-Identifier: MIT
+// See THIRD_PARTY_NOTICES.md.
 
 import 'dart:async';
 
@@ -7,12 +9,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
 
-import '../../../browser/browser_links.dart';
 import '../../../l10n/l10n.dart';
 import '../../../links/page_links.dart' show openReplyPageLink;
 import '../../browser/browser_entry.dart' show openReplyBrowserLink;
+import '../../../browser/browser_links.dart' show BrowserLinks;
 import '../../../state/artifacts.dart';
-import '../../../state/hosts_state.dart' show activeHostProvider;
 import '../../../state/table_tint_state.dart';
 import '../../../state/workspace_state.dart';
 import '../../common/edge_fade.dart';
@@ -26,6 +27,8 @@ import 'code_block.dart';
 import 'markdown_blocks.dart';
 import 'markdown_image.dart';
 import 'markdown_math.dart';
+import 'markdown_prepare.dart';
+import 'markdown_split.dart';
 import 'math_syntax.dart';
 import 'stream_repair.dart';
 import 'table_syntax.dart';
@@ -42,6 +45,24 @@ final Map<String, HtmlTag?> _htmlTags = {
   'summary': const HtmlTag.block(),
 };
 
+/// The HTML gpt_markdown parses with [_htmlTags]: where its blocks end.
+final _markdownHtml = GptMarkdownConfig(htmlTags: _htmlTags).markdownHtml;
+
+/// Inline patterns a part of the app lays over every [MarkdownBody] below it
+/// (the tavern colours its story's dialogue). Keep [patterns] one list per
+/// look: its identity is part of the parse cache's key.
+class MarkdownPatterns extends InheritedWidget {
+  const MarkdownPatterns({super.key, required this.patterns, required super.child});
+
+  final List<InlinePattern> patterns;
+
+  static List<InlinePattern>? maybeOf(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<MarkdownPatterns>()?.patterns;
+
+  @override
+  bool updateShouldNotify(MarkdownPatterns old) => !identical(old.patterns, patterns);
+}
+
 /// 助手正文的 Markdown 渲染。
 ///
 /// - 正文样式与用户气泡同源([AppType.chatBody]),流式与完成态不跳字号;
@@ -57,13 +78,22 @@ class MarkdownBody extends StatefulWidget {
     super.key,
     required this.text,
     this.streaming = false,
+    this.reveal = false,
     this.selectable = true,
     this.secondary = false,
     this.repairBareViews = false,
+    this.replyTypography = false,
   });
 
   final String text;
   final bool streaming;
+
+  /// The fluid tier's streamed reply: gpt_markdown paces the text itself, fades in
+  /// the newest words, and only rebuilds the part that can still change, so an update
+  /// costs the same however long the reply is. No cursor and no tail repair: it holds
+  /// back half-written markup on its own. Keep it on after [streaming] ends, for the
+  /// life of this body: the tree stays and nothing moves when the reply finishes.
+  final bool reveal;
   final bool selectable;
 
   /// 次级排版(思考过程):小一号、次级文字色,标题也不抢眼。
@@ -73,8 +103,18 @@ class MarkdownBody extends StatefulWidget {
   /// (见 [fenceBareDshUiViews])。别的 Markdown(文档、说明页)不开。
   final bool repairBareViews;
 
+  /// 助手回复正文:当主题包声明启用阅读字体/行高时应用阅读排版。
+  final bool replyTypography;
+
   /// 表格单列最宽多少;更长的单元格在列内换行,而不是把整表拉得很长。
   static const _maxColumnWidth = 260.0;
+
+  /// A reply this long, or one that streams, is drawn in blocks of about this
+  /// many characters, one GptMarkdown each behind its own repaint boundary
+  /// ([MarkdownBlockSplit]): new text re-renders and repaints only the last
+  /// block, however long the reply. A shorter static text is one GptMarkdown.
+  @visibleForTesting
+  static int blockLength = 2000;
 
   static final _themes = <String, Expando<GptMarkdownThemeData>>{};
   static final _secondaryThemes = <String, Expando<GptMarkdownThemeData>>{};
@@ -83,12 +123,27 @@ class MarkdownBody extends StatefulWidget {
   ///
   /// 缓存按语言 + 表格底色的组合分开:同一页里"跟随主题"和"无底色"是两份
   /// 主题,换设置后不必把旧的丢掉再重建。
-  static GptMarkdownThemeData _themeFor(ThemeData theme, bool secondary, L10n l10n, TableTint tint) {
+  ///
+  /// [reply]: an assistant reply under a theme pack, which restyles it (see
+  /// [_buildTheme]); everything it reads comes from [theme].
+  static GptMarkdownThemeData _themeFor(
+    ThemeData theme,
+    bool secondary,
+    L10n l10n,
+    TableTint tint, {
+    bool reply = false,
+  }) {
     final cache = (secondary ? _secondaryThemes : _themes).putIfAbsent(
-      '${l10n.localeName}|${tint.name}',
+      '${l10n.localeName}|${tint.name}${reply ? '|reply' : ''}',
       () => Expando<GptMarkdownThemeData>('markdownTheme'),
     );
-    return cache[theme] ??= _buildTheme(theme, l10n, secondary: secondary, tint: tint);
+    return cache[theme] ??= _buildTheme(
+      theme,
+      l10n,
+      secondary: secondary,
+      tint: tint,
+      reply: reply ? theme.extension<DshThemeStyle>() : null,
+    );
   }
 
   static GptMarkdownThemeData _buildTheme(
@@ -96,6 +151,7 @@ class MarkdownBody extends StatefulWidget {
     L10n l10n, {
     bool secondary = false,
     TableTint tint = TableTint.follow,
+    DshThemeStyle? reply,
   }) {
     final colors = theme.colorScheme;
     final dsh = theme.extension<DshColors>()!;
@@ -107,13 +163,21 @@ class MarkdownBody extends StatefulWidget {
       stripeColor: colors.onSurface.withValues(alpha: theme.brightness == Brightness.dark ? 0.06 : 0.05),
     );
     final shrink = secondary ? 0.9 : 1.0;
-    TextStyle heading(double size, {double height = 1.45}) => TextStyle(
-      fontSize: size * shrink,
-      fontWeight: FontWeight.w600,
-      height: height,
-      color: secondary ? colors.onSurfaceVariant : colors.onSurface,
-      leadingDistribution: TextLeadingDistribution.even,
-    );
+    final headingColor =
+        reply?.heading ?? (reply?.components.headingStyle == ThemeHeadingStyle.accent ? colors.primary : null);
+    final linkColor = reply?.link ?? colors.primary;
+    TextStyle heading(double size, {double height = 1.45}) {
+      final style = TextStyle(
+        fontSize: size * shrink,
+        fontWeight: FontWeight.w600,
+        height: height,
+        color: headingColor ?? (secondary ? colors.onSurfaceVariant : colors.onSurface),
+        leadingDistribution: TextLeadingDistribution.even,
+      );
+      // A heading does not inherit the body's font, so the pack's is set here.
+      return reply == null ? style : reply.headingTextStyle(reply.applyFontRole(style, reply.typography.uiFont));
+    }
+
     return GptMarkdownThemeData(
       brightness: theme.brightness,
       h1: heading(20, height: 1.4),
@@ -125,15 +189,15 @@ class MarkdownBody extends StatefulWidget {
       hrLineThickness: 0.5,
       hrLineColor: colors.outlineVariant,
       hrLinePadding: const EdgeInsets.symmetric(vertical: 12),
-      linkColor: colors.primary,
-      linkHoverColor: colors.primary,
+      linkColor: linkColor,
+      linkHoverColor: linkColor,
       autoAddDividerLineAfterH1: false,
       inlineCode: InlineCodeStyle(
         fontFamily: AppType.monoFamily,
         fontFamilyFallback: AppType.monoFallback,
         fontSizeFactor: 0.875,
-        color: dsh.codeWellFg,
-        backgroundColor: dsh.codeWellBg,
+        color: reply?.inlineCodeFg ?? dsh.codeWellFg,
+        backgroundColor: reply?.inlineCodeBg ?? dsh.codeWellBg,
         borderColor: dsh.codeWellBorder,
         borderWidth: 0.5,
         borderRadius: const Radius.circular(AppShape.xs),
@@ -168,8 +232,8 @@ class MarkdownBody extends StatefulWidget {
         // `<mark>`:荧光笔一样的暖黄底。
         highlight: HighlightStyle(backgroundColor: dsh.warningContainer, color: dsh.onWarningContainer),
         link: LinkStyle(
-          color: colors.primary,
-          hoverColor: colors.primary,
+          color: linkColor,
+          hoverColor: linkColor,
           decoration: TextDecoration.underline,
           decorationThickness: 0.6,
         ),
@@ -187,7 +251,7 @@ class MarkdownBody extends StatefulWidget {
           headerBackground: tableFills.header,
           rowStripeColor: tableFills.stripe,
           cellPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          columnWidth: const MinColumnWidth(IntrinsicColumnWidth(), FixedColumnWidth(_maxColumnWidth)),
+          columnWidth: const _CappedIntrinsicColumnWidth(_maxColumnWidth),
           overflow: TableOverflow.scroll,
         ),
       ),
@@ -214,6 +278,9 @@ class MarkdownBody extends StatefulWidget {
 
   static final _streamingPatterns = [_cursorPattern];
 
+  /// The cursor with a [MarkdownPatterns] list, one list per list.
+  static final _streamingWith = Expando<List<InlinePattern>>('streamingWith');
+
   // Builders stay static. gpt_markdown 1.4.0's config.isSame ignores
   // onLinkTap identity; its cached spans may retain this context-only callback.
   static void _onLinkTap(BuildContext context, String url, String title) {
@@ -223,8 +290,6 @@ class MarkdownBody extends StatefulWidget {
     final scope = MarkdownImageScope.maybeOf(context);
     final uri = linkToOpen(url);
     if (uri != null) {
-      // Preserve a reply's conversation; detached text opens without borrowing
-      // the currently selected conversation. App routes were handled above.
       if (openReplyBrowserLink(context, url, sessionId: scope?.sessionId)) return;
       unawaited(BrowserLinks.open(uri));
       return;
@@ -250,7 +315,13 @@ class MarkdownBody extends StatefulWidget {
     Navigator.of(context).push(
       ArtifactPreviewPage.route(
         sessionId: sessionId,
-        artifact: Artifact(path: path, origin: ArtifactOrigin.linked, turn: 0),
+        artifact: Artifact(
+          path: path,
+          origin: ArtifactOrigin.linked,
+          turn: MarkdownImageScope.maybeOf(context)?.turn ?? 0,
+          snapshotImage:
+              MarkdownImageScope.maybeOf(context)?.turn != null && artifactKindOf(path) == ArtifactKind.image,
+        ),
       ),
     );
   }
@@ -259,15 +330,8 @@ class MarkdownBody extends StatefulWidget {
   /// too: its preview says so); otherwise [site], after the browser prompt.
   static Future<void> _openFileOrSite(BuildContext context, String sessionId, String path, Uri site) async {
     WorkspaceSource? source;
-    bool Function() stillCurrent = () => context.mounted;
     try {
-      final container = ProviderScope.containerOf(context, listen: false);
-      final host = container.read(activeHostProvider);
-      stillCurrent = () =>
-          context.mounted &&
-          container.read(activeHostProvider) == host &&
-          MarkdownImageScope.maybeOf(context)?.sessionId == sessionId;
-      source = container.read(workspaceSourceProvider(sessionId));
+      source = ProviderScope.containerOf(context, listen: false).read(workspaceSourceProvider(sessionId));
     } catch (_) {
       // No provider scope above this text: nothing to look the file up in.
     }
@@ -282,16 +346,15 @@ class MarkdownBody extends StatefulWidget {
         // Offline or the Host failed: the site is what the link most likely meant.
       }
     }
-    if (!context.mounted || !stillCurrent()) return;
+    if (!context.mounted) return;
     if (file) {
       _preview(context, sessionId, path);
     } else {
       await openConfirmedLink(
         context,
         site,
-        stillCurrent: stillCurrent,
         opener: (url) async {
-          if (!openReplyBrowserLink(context, url.toString(), sessionId: sessionId)) await BrowserLinks.open(url);
+          if (!await BrowserLinks.open(url)) await BrowserLinks.external(url);
         },
       );
     }
@@ -442,6 +505,14 @@ class MarkdownBody extends StatefulWidget {
   static String? workspaceLinkPath(String url, {String? baseDir}) => resolveWorkspaceLink(url, baseDir: baseDir);
 
   static Widget _codeBuilder(BuildContext context, String name, String code, bool closed) {
+    // A closed block won't change. Handing back the same widget lets Flutter skip it,
+    // or every block of the reply would rebuild on every update.
+    final reveal = closed ? context.getInheritedWidgetOfExactType<_RevealStreaming>() : null;
+    if (reveal != null) return reveal.blocks['$name\n$code'] ??= _buildCode(context, name, code, closed);
+    return _buildCode(context, name, code, closed);
+  }
+
+  static Widget _buildCode(BuildContext context, String name, String code, bool closed) {
     final info = name.trim();
     final language = info.isEmpty ? null : info.split(RegExp(r'\s+')).first;
     // A visual reply (dsh-ui): drawn as native cards. The cursor sentinel inside an open fence means it is still
@@ -449,7 +520,7 @@ class MarkdownBody extends StatefulWidget {
     if (language == 'dsh-ui') {
       return DshUiBlock(
         source: code.replaceAll(_cursorSentinel, ''),
-        streaming: !closed && code.contains(_cursorSentinel),
+        streaming: !closed && (code.contains(_cursorSentinel) || _RevealStreaming.of(context)),
         closed: closed,
       );
     }
@@ -472,8 +543,19 @@ class MarkdownBody extends StatefulWidget {
   }
 
   /// 标题是读屏里能逐个跳转的 header 节点。
-  static Widget _headingBuilder(BuildContext context, int level, Widget content, HeadingStyle style) =>
-      Semantics(header: true, container: true, child: content);
+  static Widget _headingBuilder(BuildContext context, int level, Widget content, HeadingStyle style) {
+    final theme = GptMarkdownTheme.of(context);
+    final heading = [theme.h1, theme.h2, theme.h3, theme.h4, theme.h5, theme.h6][level - 1];
+    final size = (heading ?? const TextStyle()).merge(style.textStyle).fontSize ?? MarkdownImageFont.of(context);
+    return MarkdownImageFont(
+      size: size,
+      child: Semantics(
+        header: true,
+        container: true,
+        child: MarkdownReplyScope.of(context) ? _ReplyHeading(level: level, child: content) : content,
+      ),
+    );
+  }
 
   /// 任务清单 `- [ ]` / `- [x]`:只读的方框图标。包里默认用 Material 的
   /// [Checkbox],它要求祖先里有 Material,聊天列表里没有,会报错并溢出。
@@ -511,39 +593,26 @@ class MarkdownBody extends StatefulWidget {
   /// placed. With [repairBareViews] a bare `dsh-ui` JSON block gets its fence
   /// back first (see [fenceBareDshUiViews]).
   @visibleForTesting
-  static String prepareSource(String text, {bool streaming = false, bool repairBareViews = false}) =>
-      _prepareSource(text, streaming: streaming, repairBareViews: repairBareViews);
+  static String prepareSource(String text, {bool streaming = false, bool repairBareViews = false}) {
+    final source = _prepareMarkdown(text, repairBareViews: repairBareViews, streaming: streaming);
+    return streaming ? repairStreamingMarkdown(source, cursor: _cursorSentinel) : source;
+  }
 
-  static String _prepareSource(
-    String text, {
-    bool streaming = false,
-    bool repairBareViews = false,
-    StreamingMarkdownRepair? repair,
-  }) {
+  /// Characters a second when the model is slower than this; the reveal goes faster
+  /// by itself when it would fall behind. Near a comfortable reading pace, so the text
+  /// flows evenly instead of catching up in bursts.
+  static const _revealPace = 120.0;
+
+  /// How long the newest words take to fade in.
+  static const _revealFade = 0.24;
+
+  /// Shared preparation before tail repair. The reveal uses [streaming] false:
+  /// formulas are left to the library's own hold, while table headers become
+  /// bold as their delimiter arrives, so columns do not change on completion.
+  static String _prepareMarkdown(String text, {required bool repairBareViews, bool streaming = false}) {
     final repaired = repairBareViews ? fenceBareDshUiViews(text) : text;
-    final source = boldTableHeaders(blankLineBeforeTables(normalizeMath(repaired, streaming: streaming)));
-    if (!streaming) return source;
-    return _withCursor(repair?.repair(source) ?? repairStreamingMarkdown(source));
+    return prepareTables(normalizeMath(repaired, streaming: streaming));
   }
-
-  /// [text] with the cursor sentinel where the reader's eye is: at the end
-  /// of the last line, except that a closing fence or a display formula's
-  /// `\]` must stay alone on its line, and a table row takes it inside its
-  /// last cell rather than as a new cell after the pipe.
-  static String _withCursor(String text) {
-    final last = text.substring(text.lastIndexOf('\n') + 1).trim();
-    if (_fenceLine.hasMatch(last) || last.endsWith(r'\]')) {
-      return '$text\n$_cursorSentinel';
-    }
-    if (last.length > 1 && last.startsWith('|') && last.endsWith('|')) {
-      final pipe = text.lastIndexOf('|');
-      return '${text.substring(0, pipe).trimRight()} $_cursorSentinel '
-          '${text.substring(pipe)}';
-    }
-    return '$text$_cursorSentinel';
-  }
-
-  static final _fenceLine = RegExp(r'^(?:>\s*)*(?:`{3,}|~{3,})\s*$');
 
   static InlineSpan _inlineCodeBuilder(BuildContext context, String code, TextStyle style, InlineCodeStyle codeStyle) =>
       CodeTextSpan(
@@ -558,6 +627,7 @@ class MarkdownBody extends StatefulWidget {
 
 class _MarkdownBodyState extends State<MarkdownBody> {
   StreamingMarkdownRepair? _repair;
+  StreamingMarkdownPreparation? _preparation;
 
   // Preparation depends only on text and streaming, not theme, text scale or
   // selection. Keep one result for this mounted body; unrelated stream rows
@@ -565,13 +635,16 @@ class _MarkdownBodyState extends State<MarkdownBody> {
   late String _source = _prepare();
 
   String _prepare() {
-    _repair = widget.streaming ? (_repair ?? StreamingMarkdownRepair()) : null;
-    return MarkdownBody._prepareSource(
-      widget.text,
-      streaming: widget.streaming,
-      repairBareViews: widget.repairBareViews,
-      repair: _repair,
-    );
+    final streaming = widget.streaming && !widget.reveal;
+    final repairBareViews = widget.repairBareViews;
+    String prepare(String text) =>
+        MarkdownBody._prepareMarkdown(text, repairBareViews: repairBareViews, streaming: streaming);
+    if (widget.streaming && widget.text.length >= MarkdownBody.blockLength) {
+      _preparation ??= StreamingMarkdownPreparation(prepare);
+    }
+    final source = _preparation?.prepare(widget.text) ?? prepare(widget.text);
+    _repair = streaming ? (_repair ?? StreamingMarkdownRepair()) : null;
+    return _repair == null ? source : _repair!.repair(source, cursor: _cursorSentinel);
   }
 
   /// 这棵树里有没有 ProviderScope。只在依赖变化时向上找一次 —— 正文随流式
@@ -580,6 +653,27 @@ class _MarkdownBodyState extends State<MarkdownBody> {
   /// ProviderScope 挂在应用根上，装好之后不会中途消失，所以缓存到下一次
   /// didChangeDependencies 为止是安全的。
   bool _scoped = true;
+
+  /// Finished code blocks of a revealed reply: see [_RevealStreaming.blocks].
+  final _blocks = <String, Widget>{};
+
+  /// Drawn in blocks ([MarkdownBody.blockLength]). Decided once and kept: a
+  /// streamed reply keeps its tree when it finishes.
+  late bool _blocked = _wantsBlocks();
+
+  final _split = MarkdownBlockSplit(html: _markdownHtml, minLength: MarkdownBody.blockLength);
+
+  /// Each block's widget, handed back while its text, its place at the end
+  /// and [_builtStyle] stay the same: Flutter then skips the block entirely.
+  final _built = <({String text, bool live, Widget widget})>[];
+  TextStyle? _builtStyle;
+
+  /// How many blocks the last build had (none before the first): what is
+  /// already on screen has been seen, and only blocks past it are revealed
+  /// from empty.
+  int _shown = 0;
+
+  bool _wantsBlocks() => widget.streaming || widget.reveal || widget.text.length >= MarkdownBody.blockLength;
 
   @override
   void didChangeDependencies() {
@@ -590,33 +684,36 @@ class _MarkdownBodyState extends State<MarkdownBody> {
   @override
   void didUpdateWidget(MarkdownBody oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.text != widget.text ||
+    final modeChanged =
         oldWidget.streaming != widget.streaming ||
-        oldWidget.repairBareViews != widget.repairBareViews) {
+        oldWidget.reveal != widget.reveal ||
+        oldWidget.repairBareViews != widget.repairBareViews;
+    if (modeChanged) _preparation = null;
+    if (oldWidget.text != widget.text || modeChanged) {
       _source = _prepare();
     }
+    _blocked = _blocked || _wantsBlocks();
+    if (oldWidget.reveal != widget.reveal) _built.clear();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final l10n = context.l10n;
-    final theme = Theme.of(context);
-    final body = widget.secondary
-        ? AppType.chatBody(context, scale: 0.9, color: theme.colorScheme.onSurfaceVariant)
-        : AppType.chatBody(context, color: theme.colorScheme.onSurface);
-    final source = _source;
-
-    // 表格底色是用户设置，只有主题跟着它变；正文 widget 本身保持同一个实例，
-    // 切设置时不让 gpt_markdown 重新解析一遍。
-    final text = GptMarkdown(
-      source,
+  /// [data] as one GptMarkdown; [live] when it is still being written.
+  GptMarkdown _markdown(String data, TextStyle body, {required bool live, List<InlinePattern>? patterns}) {
+    // The element itself, not [State.context]: a link tapped after this body
+    // is gone asks it whether it is still mounted.
+    final context = this.context;
+    return GptMarkdown(
+      data,
       style: body,
       followLinkColor: false,
       htmlTags: _htmlTags,
       // The tail is repaired here (and open formulas shown as source), so
       // the package must not complete open `\(` / `\[` on its own.
-      isStreaming: false,
-      inlinePatterns: widget.streaming ? MarkdownBody._streamingPatterns : null,
+      isStreaming: widget.reveal && live,
+      animation: widget.reveal ? GptMarkdownAnimation.fade : GptMarkdownAnimation.none,
+      blockAnimation: widget.reveal ? GptMarkdownBlockAnimation.fadeIn : GptMarkdownBlockAnimation.none,
+      charactersPerSecond: MarkdownBody._revealPace,
+      revealFadeSeconds: MarkdownBody._revealFade,
+      inlinePatterns: patterns,
       onLinkTap: (url, title) => MarkdownBody._onLinkTap(context, url, title),
       codeBuilder: MarkdownBody._codeBuilder,
       inlineCodeBuilder: MarkdownBody._inlineCodeBuilder,
@@ -628,9 +725,89 @@ class _MarkdownBodyState extends State<MarkdownBody> {
       orderedListBuilder: MarkdownLists.ordered,
       unOrderedListBuilder: MarkdownLists.unordered,
     );
+  }
 
-    Widget withTint(TableTint tint) =>
-        GptMarkdownTheme(gptThemeData: MarkdownBody._themeFor(theme, widget.secondary, l10n, tint), child: text);
+  /// The blocks of [_source], built or handed back from [_built].
+  ///
+  /// Only the last block is live: it alone gets the cursor, the reveal's
+  /// streaming hold, and new text. A block that appears as a revealed reply
+  /// streams starts empty ([_RevealBlock]), so its words fade in.
+  _MarkdownBlocks _blocksFor(TextStyle body) {
+    if (_builtStyle != body) {
+      _built.clear();
+      _builtStyle = body;
+    }
+    final blocks = _split.update(_source);
+    final children = <Widget>[];
+    for (var i = 0; i < blocks.length; i++) {
+      final text = blocks[i];
+      final live = widget.streaming && i == blocks.length - 1;
+      var built = i < _built.length ? _built[i] : null;
+      if (built == null || built.live != live || !(identical(built.text, text) || built.text == text)) {
+        final Widget block = widget.reveal
+            ? _RevealBlock(
+                text: text,
+                fromEmpty: _shown > 0 && i >= _shown,
+                build: (text) => _markdown(text, body, live: live),
+              )
+            : _markdown(text, body, live: live, patterns: live ? MarkdownBody._streamingPatterns : null);
+        built = (text: text, live: live, widget: RepaintBoundary(child: block));
+        if (i < _built.length) {
+          _built[i] = built;
+        } else {
+          _built.add(built);
+        }
+      } else if (!identical(built.text, text)) {
+        // Keep the widget, and recognize the splitter's current string next time.
+        _built[i] = (text: text, live: live, widget: built.widget);
+      }
+      children.add(built.widget);
+    }
+    if (_built.length > blocks.length) _built.removeRange(blocks.length, _built.length);
+    _shown = blocks.length;
+    return _MarkdownBlocks(style: body, children: children);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.l10n;
+    final theme = Theme.of(context);
+    final themeStyle = DshThemeStyle.of(context);
+    final reply = widget.replyTypography && themeStyle.pack != null;
+    final baseBody = widget.secondary
+        ? AppType.chatBody(context, scale: 0.9, color: theme.colorScheme.onSurfaceVariant)
+        : AppType.chatBody(context, color: themeStyle.onAssistantBubble ?? theme.colorScheme.onSurface);
+    final body = (widget.replyTypography && themeStyle.components.useReadingFontForReply)
+        ? themeStyle.readingTextStyle(baseBody)
+        : baseBody;
+    final source = _source;
+    final extra = MarkdownPatterns.maybeOf(context);
+
+    // 表格底色是用户设置，只有主题跟着它变；正文 widget 本身保持同一个实例，
+    // 切设置时不让 gpt_markdown 重新解析一遍。
+    // A part of the app's own patterns (the tavern's) are matched over the
+    // whole text, so such a text stays one GptMarkdown.
+    final Widget text = _blocked && extra == null
+        ? _blocksFor(body)
+        : _markdown(
+            source,
+            body,
+            live: widget.streaming,
+            patterns: switch ((widget.streaming && !widget.reveal, extra)) {
+              (true, null) => MarkdownBody._streamingPatterns,
+              (false, null) => null,
+              (true, final extra?) => MarkdownBody._streamingWith[extra] ??= [
+                ...MarkdownBody._streamingPatterns,
+                ...extra,
+              ],
+              (false, final extra?) => extra,
+            },
+          );
+
+    Widget withTint(TableTint tint) => GptMarkdownTheme(
+      gptThemeData: MarkdownBody._themeFor(theme, widget.secondary, l10n, tint, reply: reply),
+      child: text,
+    );
 
     // Golden 和几何测试不套 ProviderScope:那时按默认那一档画。
     Widget markdown = _scoped
@@ -638,9 +815,128 @@ class _MarkdownBodyState extends State<MarkdownBody> {
         : withTint(TableTint.follow);
     // 表格、成块公式横向放不下时,两端淡出提示还能横滑。
     markdown = ScrollConfiguration(behavior: const EdgeFadeScrollBehavior(), child: markdown);
+    if (reply) {
+      markdown = MarkdownReplyScope(child: markdown);
+    } else if (MarkdownReplyScope.of(context)) {
+      markdown = MarkdownReplyScope(reply: false, child: markdown);
+    }
+    if (widget.reveal) markdown = _RevealStreaming(streaming: widget.streaming, blocks: _blocks, child: markdown);
     if (widget.selectable) markdown = SelectionArea(child: markdown);
-    return markdown;
+    return MarkdownImageFont(
+      size: body.fontSize!,
+      child: MarkdownGalleryScope(child: markdown),
+    );
   }
+}
+
+/// Content-sized like an intrinsic column, bounded by the chat's width limit.
+class _CappedIntrinsicColumnWidth extends TableColumnWidth {
+  const _CappedIntrinsicColumnWidth(this.limit);
+
+  final double limit;
+
+  double _widest(Iterable<RenderBox> cells, double Function(RenderBox) measure) {
+    var widest = 0.0;
+    for (final cell in cells) {
+      final width = measure(cell);
+      if (width >= limit) return limit;
+      if (width > widest) widest = width;
+    }
+    return widest;
+  }
+
+  @override
+  double minIntrinsicWidth(Iterable<RenderBox> cells, double containerWidth) =>
+      _widest(cells, (cell) => cell.getMinIntrinsicWidth(double.infinity));
+
+  @override
+  double maxIntrinsicWidth(Iterable<RenderBox> cells, double containerWidth) =>
+      _widest(cells, (cell) => cell.getMaxIntrinsicWidth(double.infinity));
+}
+
+/// A reply heading in the pack's heading style. A widget of its own, so it
+/// follows the theme without the Markdown above it being rebuilt.
+class _ReplyHeading extends StatelessWidget {
+  const _ReplyHeading({required this.level, required this.child});
+
+  final int level;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final themeStyle = DshThemeStyle.of(context);
+    final colors = Theme.of(context).colorScheme;
+    return switch (themeStyle.components.headingStyle) {
+      ThemeHeadingStyle.underline when level <= 2 => DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border(bottom: BorderSide(color: colors.outlineVariant)),
+        ),
+        child: SizedBox(
+          width: double.infinity,
+          child: Padding(padding: const EdgeInsets.only(bottom: 4), child: child),
+        ),
+      ),
+      ThemeHeadingStyle.marker => DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border(left: BorderSide(color: themeStyle.rule ?? colors.primary, width: 3)),
+        ),
+        child: Padding(padding: const EdgeInsets.only(left: 11), child: child),
+      ),
+      _ => child,
+    };
+  }
+}
+
+/// The blocks of a reply stacked as gpt_markdown stacks its own segments: the
+/// same gap between them, sized to their content, left-aligned.
+class _MarkdownBlocks extends StatelessWidget {
+  const _MarkdownBlocks({required this.style, required this.children});
+
+  /// The text style the blocks are drawn in; the gap is scaled from it.
+  final TextStyle style;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) => Column(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.start,
+    textDirection: TextDirection.ltr,
+    spacing: blockGap(context, GptMarkdownConfig(style: style)),
+    children: children,
+  );
+}
+
+/// One block of a revealed reply. A GptMarkdown shows the text it mounts with
+/// at once (it has been seen), so a block that comes into being as the reply
+/// streams first mounts empty, for a frame, and its words then fade in.
+class _RevealBlock extends StatefulWidget {
+  const _RevealBlock({required this.text, required this.fromEmpty, required this.build});
+
+  final String text;
+
+  /// Read when the block mounts: whether it starts empty.
+  final bool fromEmpty;
+  final Widget Function(String text) build;
+
+  @override
+  State<_RevealBlock> createState() => _RevealBlockState();
+}
+
+class _RevealBlockState extends State<_RevealBlock> {
+  late bool _empty = widget.fromEmpty;
+
+  @override
+  void initState() {
+    super.initState();
+    if (_empty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() => _empty = false);
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.build(_empty ? '' : widget.text);
 }
 
 /// 当前子树里有没有 ProviderScope;没有就按默认表格底色画。
@@ -651,4 +947,21 @@ bool _hasProviderScope(BuildContext context) {
   } on StateError {
     return false;
   }
+}
+
+/// Whether the reveal's reply is still streaming, for the builders below it: with no
+/// cursor in the source, an open fence can't tell "still arriving" from "cut short".
+class _RevealStreaming extends InheritedWidget {
+  const _RevealStreaming({required this.streaming, required this.blocks, required super.child});
+
+  final bool streaming;
+
+  /// Finished code blocks by name and content.
+  final Map<String, Widget> blocks;
+
+  static bool of(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<_RevealStreaming>()?.streaming ?? false;
+
+  @override
+  bool updateShouldNotify(_RevealStreaming oldWidget) => streaming != oldWidget.streaming;
 }

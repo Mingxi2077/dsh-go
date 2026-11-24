@@ -319,7 +319,7 @@ class _BrowserPageState extends ConsumerState<BrowserPage> {
       final tab = _selected;
       final page = tab == null || tab.url == null ? null : _pool[tab.id];
       final ready = page != null && page.ready && !page.rendererGone;
-      if (route?.isCurrent == true && ready && !_overview && !_editing && !_quoteSheetOpen) {
+      if (route?.isCurrent == true && tab?.webPreview == null && ready && !_overview && !_editing && !_quoteSheetOpen) {
         _selection?.show(
           page: page,
           label: appL10n.browserQuote,
@@ -385,14 +385,14 @@ class _BrowserPageState extends ConsumerState<BrowserPage> {
         // A new page for the tab: whatever was captured of the old one is
         // not this document.
         _dropPreview(tab.id);
-        final page = _make(tab.id, url);
+        final page = _make(tab, url);
         if (page != null) {
           for (final evicted in _pool.put(tab.id, page)) {
             _forget(evicted.tab, evicted.page);
             retired.add(evicted.page);
           }
           // Own the tab before initialization can notify or finish.
-          page.configureNavigation(tab.id);
+          if (tab.webPreview == null) page.configureNavigation(tab.id);
           unawaited(page.initialize(dark: _dark, textZoom: _textZoom).catchError((_) {}));
         }
       }
@@ -402,20 +402,23 @@ class _BrowserPageState extends ConsumerState<BrowserPage> {
     _dispose(retired);
   }
 
-  BrowserPageController? _make(String tab, Uri url) {
+  BrowserPageController? _make(BrowserTab entry, Uri url) {
+    final tab = entry.id;
     late final BrowserPageController page;
+    void onPageChanged(Uri url, String title) {
+      if (mounted && identical(_pool[tab], page)) {
+        unawaited(_workspace.updatePage(tab, url: url, title: title).catchError((_) {}));
+      }
+    }
+
     try {
-      page = ref.read(browserPageFactoryProvider)(
-        initialUrl: url,
-        onPageChanged: (url, title) {
-          // Only the page that owns the tab writes it: an old one never
-          // overwrites what replaced it.
-          if (mounted && identical(_pool[tab], page)) {
-            unawaited(_workspace.updatePage(tab, url: url, title: title).catchError((_) {}));
-          }
-        },
-      );
-      page.onDownloadRequested = (request) => _handleDownload(request, page, tab);
+      final preview = entry.webPreview;
+      if (preview != null) {
+        page = BrowserPageController(initialUrl: url, onPageChanged: onPageChanged, webPreview: preview);
+      } else {
+        page = ref.read(browserPageFactoryProvider)(initialUrl: url, onPageChanged: onPageChanged);
+        page.onDownloadRequested = (request) => _handleDownload(request, page, tab);
+      }
     } on FormatException {
       // A saved address the policy no longer opens: the tab goes.
       unawaited(_workspace.close(tab).catchError((_) => null));
@@ -523,7 +526,7 @@ class _BrowserPageState extends ConsumerState<BrowserPage> {
   /// closed), or in a new tab with [newTab].
   Future<void> _go(Uri url, {bool newTab = false}) async {
     final tab = _selected;
-    if (newTab || tab == null) {
+    if (newTab || tab == null || tab.webPreview != null) {
       try {
         await _workspace.open(_scope, url);
       } on StateError {
@@ -847,7 +850,7 @@ class _BrowserPageState extends ConsumerState<BrowserPage> {
 
   Future<void> _more() async {
     final page = _page;
-    final url = page?.url;
+    final url = _selected?.webPreview == null ? page?.url : null;
     final bookmark = url == null ? null : ref.read(browserLibraryProvider).bookmarkFor(url);
     final choice = await showBrowserMenu(context, page: url, bookmarked: bookmark != null);
     if (!mounted || choice == null) return;
@@ -980,7 +983,7 @@ class _BrowserPageState extends ConsumerState<BrowserPage> {
   Future<void> _quote({BrowserPageContent? initialContent}) async {
     if (!mounted || ModalRoute.of(context)?.isCurrent != true || _quoteSheetOpen) return;
     final page = _page;
-    if (page == null || !page.ready) return;
+    if (page == null || !page.ready || _selected?.webPreview != null) return;
     // initialContent must bind to the current page.
     if (initialContent != null && BrowserPolicy.savedUrl(page.url) != initialContent.url) return;
     _selection?.hide();
@@ -1328,21 +1331,26 @@ class _BrowserPageState extends ConsumerState<BrowserPage> {
     final l10n = context.l10n;
     final theme = Theme.of(context);
     final colors = DshColors.of(context);
-    final site = page == null ? null : browserSite(page.url);
+    final preview = _selected?.webPreview;
+    final site = preview != null
+        ? '127.0.0.1:${preview.remotePort}'
+        : page == null
+        ? null
+        : browserSite(page.url);
     final showWhale = page != null;
     final reducedMotion = MediaQuery.disableAnimationsOf(context);
     final whaleActive = !_overview && (ModalRoute.of(context)?.isCurrent ?? true);
     return Semantics(
-      button: true,
-      label: site ?? l10n.browserAddressHint,
-      hint: site == null ? null : l10n.browserAddressHint,
+      button: preview == null,
+      label: preview == null ? (site ?? l10n.browserAddressHint) : '${l10n.browserPreview}, $site',
+      hint: site != null && preview == null ? l10n.browserAddressHint : null,
       excludeSemantics: true,
       child: GlassSurface(
         key: const ValueKey('browser-address'),
         tier: GlassTier.chrome,
         stadium: true,
         grouped: true,
-        onTap: () => _startEdit(),
+        onTap: preview == null ? () => _startEdit() : null,
         child: SizedBox.expand(
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -1566,7 +1574,7 @@ class _BrowserPageState extends ConsumerState<BrowserPage> {
                   key: const ValueKey('browser-quote'),
                   icon: AppIcons.quote,
                   tooltip: l10n.browserQuote,
-                  onPressed: live && page.ready ? () => unawaited(_quote()) : null,
+                  onPressed: live && page.ready && tab?.webPreview == null ? () => unawaited(_quote()) : null,
                 ),
                 BrowserConversationButton(
                   key: const ValueKey('browser-return-to-chat'),

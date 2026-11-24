@@ -11,6 +11,7 @@ import '../../state/hosts_state.dart';
 import '../common/app_sheet.dart';
 import '../common/sheet_title_bar.dart';
 import '../common/status_chip.dart';
+import '../companion/companion_page.dart';
 import '../onboarding/local_install.dart';
 import '../settings/settings_widgets.dart';
 import '../theme/app_icons.dart';
@@ -97,8 +98,10 @@ class HostSheet extends ConsumerWidget {
     }
 
     // 本机 without its runtime: the row installs it, and switches to it once
-    // installed (leaving the install page keeps the current host).
+    // installed (leaving the install page keeps the current host). A build
+    // without the runtime has no 本机 row at all.
     final localMissing = ref.watch(localRuntimeProvider.select((s) => s.status.runtimeMissing));
+    final localAvailable = ref.watch(localRuntimeProvider.select((s) => s.available));
     void installLocal() {
       final navigator = Navigator.of(context);
       navigator.pop();
@@ -118,13 +121,14 @@ class HostSheet extends ConsumerWidget {
               SheetGroup(
                 margin: const EdgeInsets.fromLTRB(SheetTitleBar.inset, 0, SheetTitleBar.inset, 12),
                 children: [
-                  _HostRow(
-                    host: HostRef.local,
-                    title: l10n.commonThisPhone,
-                    subtitle: l10n.remoteThisPhoneDsh,
-                    active: active.isLocal,
-                    onTap: localMissing ? installLocal : () => pick(HostRef.local),
-                  ),
+                  if (localAvailable)
+                    _HostRow(
+                      host: HostRef.local,
+                      title: l10n.commonThisPhone,
+                      subtitle: l10n.remoteThisPhoneDsh,
+                      active: active.isLocal,
+                      onTap: localMissing ? installLocal : () => pick(HostRef.local),
+                    ),
                   for (final h in ssh)
                     _HostRow(
                       host: HostRef.ssh(h.id),
@@ -157,6 +161,17 @@ class HostSheet extends ConsumerWidget {
               SheetGroup(
                 margin: const EdgeInsets.fromLTRB(SheetTitleBar.inset, 0, SheetTitleBar.inset, 12),
                 children: [
+                  SettingsTile(
+                    icon: AppIcons.pet,
+                    tinted: false,
+                    title: l10n.companionTitle,
+                    subtitle: l10n.companionEntrySubtitle,
+                    onTap: () {
+                      final navigator = Navigator.of(context);
+                      navigator.pop();
+                      unawaited(navigator.push(MaterialPageRoute<void>(builder: (_) => const CompanionPage(sections: true))));
+                    },
+                  ),
                   SettingsTile(
                     icon: ssh.isEmpty && relayHosts.isEmpty ? AppIcons.add : AppIcons.configure,
                     tinted: false,

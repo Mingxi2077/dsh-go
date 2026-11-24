@@ -4,6 +4,7 @@
 
 import 'dart:async';
 
+import 'package:dsh_app/state/connection_state.dart';
 import 'package:dsh_app/state/session_search.dart';
 import 'package:dsh_app/state/sessions_state.dart';
 import 'package:dsh_app/ui/shell/session_search_page.dart' show searchDateLabel;
@@ -12,6 +13,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import '../plugins/support/fake_plugin_host.dart' show FakePluginCarrier;
 import 'support.dart';
 
 List<String> ids(List<SessionSearchResult> results) => [for (final r in results) r.session.sessionId];
@@ -141,6 +143,17 @@ void main() {
       expect(ids(r.archived), ['a1']);
     });
 
+    test('different paths with the same folder label stay hidden across sections', () {
+      final date = DateTime(2026, 10, 20);
+      final view = deriveSessionSearchResults(
+        query: 'project',
+        sessions: [searchSession('a', 'first', date, cwd: '/home/project/')],
+        archived: [searchSession('b', 'second', date, cwd: r'C:\work\project')],
+      );
+      expect(view.showFolders, isFalse);
+      expect(view.isEmpty, isTrue);
+    });
+
     test('the folder matches only when the sessions span several folders', () {
       final one = deriveSessionSearchResults(query: 'workspace', sessions: sessions);
       expect(one.isEmpty, isTrue);
@@ -200,12 +213,13 @@ void main() {
   });
 
   group('controller', () {
+    final sessionsOverride = sessionsProvider.overrideWith(
+      () => SearchSessions(sampleSearchSessions(), sampleArchivedSessions()),
+    );
+
     ProviderContainer containerWith(FakeContentSearch? backend) {
       final container = ProviderContainer(
-        overrides: [
-          sessionContentSearchProvider.overrideWithValue(backend),
-          sessionsProvider.overrideWith(() => SearchSessions(sampleSearchSessions(), sampleArchivedSessions())),
-        ],
+        overrides: [sessionContentSearchProvider.overrideWithValue(backend), sessionsOverride],
       );
       addTearDown(container.dispose);
       container.listen(sessionSearchProvider, (_, _) {});
@@ -223,6 +237,192 @@ void main() {
             composing: composing,
           ),
         );
+
+    void replaceBackend(ProviderContainer c, FakeContentSearch? backend) {
+      c.updateOverrides([sessionContentSearchProvider.overrideWithValue(backend), sessionsOverride]);
+    }
+
+    testWidgets('a connection becoming available searches the current offline query', (tester) async {
+      final c = containerWith(null);
+      final controller = c.read(sessionSearchProvider.notifier);
+      type(c, '登录');
+      await tester.pump(SessionSearchController.debounce);
+      expect(c.read(sessionSearchProvider).content, ContentSearchStatus.idle);
+      final backend = FakeContentSearch(results: {'登录': (items: loginHits, hasMore: true)});
+      replaceBackend(c, backend);
+      await tester.pump();
+      expect(c.read(sessionSearchProvider.notifier), same(controller));
+      expect(c.read(sessionSearchProvider).text, '登录');
+      await tester.pump(SessionSearchController.debounce);
+      expect(backend.calls, ['登录']);
+      expect(c.read(sessionSearchProvider).hits, loginHits);
+      await tester.pump(Duration.zero); // Riverpod's own refresh tick.
+    });
+
+    for (final refused in [false, true]) {
+      testWidgets('a retired backend ${refused ? "refusal" : "answer"} cannot publish into the new connection', (
+        tester,
+      ) async {
+        final old = FakeContentSearch(
+          results: {'登录': (items: loginHits, hasMore: true)},
+          error: refused ? searchDisabled : null,
+        )..gate = Completer<void>();
+        final current = FakeContentSearch()..gate = Completer<void>();
+        final c = containerWith(old);
+        addTearDown(() {
+          for (final backend in [old, current]) {
+            if (!backend.gate!.isCompleted) backend.gate!.complete();
+          }
+        });
+        type(c, '登录');
+        await tester.pump(SessionSearchController.debounce);
+        expect(old.calls, ['登录']);
+        replaceBackend(c, current);
+        await tester.pump();
+        await tester.pump(SessionSearchController.debounce);
+        old.gate!.complete();
+        await tester.pump();
+        expect(c.read(sessionSearchProvider).content, ContentSearchStatus.pending);
+        expect(c.read(sessionSearchProvider).hits, isEmpty);
+        expect(c.read(sessionSearchProvider).hasMore, isFalse);
+        expect(current.calls, ['登录']);
+        current.gate!.complete();
+        await tester.pump();
+        expect(c.read(sessionSearchProvider).content, ContentSearchStatus.ready);
+        expect(c.read(sessionSearchProvider).hits, isEmpty);
+        expect(current.knownUnsupported, isFalse);
+        await tester.pump(Duration.zero); // Riverpod's own refresh tick.
+      });
+    }
+
+    testWidgets('the same backend notification preserves its one pending query', (tester) async {
+      final backend = FakeContentSearch(results: {'登录': (items: loginHits, hasMore: false)})..gate = Completer<void>();
+      final c = containerWith(backend);
+      addTearDown(() {
+        if (!backend.gate!.isCompleted) backend.gate!.complete();
+      });
+      type(c, '登录');
+      await tester.pump(SessionSearchController.debounce);
+      replaceBackend(c, backend);
+      await tester.pump();
+      replaceBackend(c, backend);
+      await tester.pump(SessionSearchController.debounce);
+      expect(backend.calls, ['登录']);
+      backend.gate!.complete();
+      await tester.pump();
+      expect(c.read(sessionSearchProvider).hits, loginHits);
+      await tester.pump(Duration.zero); // Riverpod's own refresh tick.
+    });
+
+    testWidgets('a connection change preserves unfinished IME text without searching it', (tester) async {
+      final old = FakeContentSearch(results: {'登录': (items: loginHits, hasMore: true)})..gate = Completer<void>();
+      final c = containerWith(old);
+      addTearDown(() {
+        if (!old.gate!.isCompleted) old.gate!.complete();
+      });
+      type(c, '登录');
+      await tester.pump(SessionSearchController.debounce);
+      type(c, 'denglu', composing: const TextRange(start: 0, end: 6));
+      final backend = FakeContentSearch();
+      replaceBackend(c, backend);
+      await tester.pump();
+      await tester.pump(SessionSearchController.debounce);
+      expect(c.read(sessionSearchProvider).text, 'denglu');
+      expect(c.read(sessionSearchProvider).composing, isTrue);
+      expect(backend.calls, isEmpty);
+      old.gate!.complete();
+      await tester.pump();
+      expect(c.read(sessionSearchProvider).content, ContentSearchStatus.idle);
+      expect(c.read(sessionSearchProvider).hits, isEmpty);
+      type(c, '登录');
+      await tester.pump(SessionSearchController.debounce);
+      expect(backend.calls, ['登录']);
+      await tester.pump(Duration.zero); // Riverpod's own refresh tick.
+    });
+
+    testWidgets('a backend change restarts the ordinary debounce without sending early', (tester) async {
+      final old = FakeContentSearch();
+      final current = FakeContentSearch();
+      final c = containerWith(old);
+      type(c, '登录');
+      await tester.pump(const Duration(milliseconds: 100));
+      replaceBackend(c, current);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 249));
+      expect(old.calls, isEmpty);
+      expect(current.calls, isEmpty);
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(current.calls, ['登录']);
+      await tester.pump(Duration.zero);
+    });
+
+    testWidgets('connection metadata changes keep the same client backend and pending RPC', (tester) async {
+      final response = Completer<Object?>();
+      final carrier = FakePluginCarrier()..handlers['session/search'] = (_) => response.future;
+      final client = DshClient.withCarrier(carrier);
+      addTearDown(client.close);
+      addTearDown(() {
+        if (!response.isCompleted) response.complete({'items': [], 'hasMore': false});
+      });
+      HostConnection connection(String name) => HostConnection(client: client, isLocal: true, name: name);
+      final c = ProviderContainer(
+        overrides: [activeConnectionProvider.overrideWithValue(AsyncData(connection('first'))), sessionsOverride],
+      );
+      addTearDown(c.dispose);
+      c.listen(sessionSearchProvider, (_, _) {});
+      type(c, '登录');
+      await tester.pump(SessionSearchController.debounce);
+      expect(carrier.argsOf('session/search'), hasLength(1));
+      c.updateOverrides([
+        activeConnectionProvider.overrideWithValue(AsyncData(connection('renamed'))),
+        sessionsOverride,
+      ]);
+      expect(c.read(activeConnectionProvider).value!.name, 'renamed');
+      await tester.pump(SessionSearchController.debounce);
+      expect(carrier.argsOf('session/search'), hasLength(1));
+      response.complete({
+        'items': [
+          {'sessionId': 's1', 'snippet': '登录'},
+        ],
+        'hasMore': false,
+      });
+      await tester.pump();
+      expect(c.read(sessionSearchProvider).content, ContentSearchStatus.ready);
+      expect(c.read(sessionSearchProvider).hits.single.sessionId, 's1');
+      await tester.pump(Duration.zero);
+    });
+
+    testWidgets('a new client immediately followed by input sends only one debounced RPC', (tester) async {
+      final oldCarrier = FakePluginCarrier()..handlers['session/search'] = (_) => {'items': []};
+      final currentCarrier = FakePluginCarrier()..handlers['session/search'] = (_) => {'items': []};
+      final oldClient = DshClient.withCarrier(oldCarrier);
+      final currentClient = DshClient.withCarrier(currentCarrier);
+      addTearDown(oldClient.close);
+      addTearDown(currentClient.close);
+      final c = ProviderContainer(
+        overrides: [
+          activeConnectionProvider.overrideWithValue(AsyncData(HostConnection(client: oldClient, isLocal: true))),
+          sessionsOverride,
+        ],
+      );
+      addTearDown(c.dispose);
+      c.listen(sessionSearchProvider, (_, _) {});
+      type(c, 'old');
+      c.updateOverrides([
+        activeConnectionProvider.overrideWithValue(AsyncData(HostConnection(client: currentClient, isLocal: true))),
+        sessionsOverride,
+      ]);
+      // Do not pump/read the backend between the connection update and input.
+      type(c, 'new');
+      await tester.pump(const Duration(milliseconds: 249));
+      expect(oldCarrier.argsOf('session/search'), isEmpty);
+      expect(currentCarrier.argsOf('session/search'), isEmpty);
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(oldCarrier.argsOf('session/search'), isEmpty);
+      expect(currentCarrier.argsOf('session/search'), hasLength(1));
+      expect(currentCarrier.argsOf('session/search').single['request'], {'query': 'new'});
+      await tester.pump(Duration.zero);
+    });
 
     testWidgets('waits for a pause and only asks for the last query', (tester) async {
       final backend = FakeContentSearch(results: {'登录': (items: loginHits, hasMore: true)});
@@ -380,5 +580,138 @@ void main() {
     expect(searchDateLabel(DateTime(2026, 10, 23, 23, 59), searchNow), '昨天');
     expect(searchDateLabel(DateTime(2026, 10, 3), searchNow), '10月3日');
     expect(searchDateLabel(DateTime(2025, 12, 30), searchNow), '2025/12/30');
+  });
+
+  group('user-message and turn-outline corpus search', () {
+    test('extracts full first prompt, turn outline and human inbox while ignoring nested strings', () {
+      const checkpointJson = r'''
+{
+  "version": 7,
+  "record": {
+    "identity": {"formatVersion": 4, "createdAt": 1700000000000},
+    "rows": {
+      "contextTimeline": {
+        "ver": 1,
+        "seq": 20,
+        "val": {"note": "string containing \"turnOutline\": {\"val\": {\"turns\": []}}"}
+      },
+      "titleInput": {
+        "ver": 3,
+        "seq": 20,
+        "val": {
+          "first": {
+            "seq": 4,
+            "text": "帮我排查一下为什么正常模式启动会卡死在健康检查阶段，并且切换安全模式又能恢复"
+          },
+          "count": 2,
+          "lastSeq": 15
+        }
+      },
+      "turnOutline": {
+        "ver": 2,
+        "seq": 20,
+        "val": {
+          "turns": [
+            {
+              "turn": 1,
+              "seq": 4,
+              "prompt": "帮我排查一下为什么正常模式启动会卡死在…",
+              "response": "已定位到 PID 残留导致的门禁死锁。"
+            },
+            {
+              "turn": 2,
+              "seq": 14,
+              "prompt": "顺便加上回归测试",
+              "response": "已补充启动探针测试。"
+            }
+          ],
+          "draft": ""
+        }
+      },
+      "inbox": {
+        "ver": 1,
+        "seq": 20,
+        "val": {
+          "next-turn": [
+            {
+              "id": "m1",
+              "role": "user",
+              "source": {"kind": "user"},
+              "content": [{"type": "text", "text": "排队中的追问消息"}]
+            },
+            {
+              "id": "m2",
+              "role": "user",
+              "source": {"kind": "runtime-context"},
+              "content": [{"type": "text", "text": "系统注入的上下文不应被当成用户提问"}]
+            }
+          ],
+          "next-step": []
+        }
+      }
+    }
+  }
+}
+''';
+      final corpus = extractCheckpointJsonSearchCorpus(checkpointJson);
+      expect(corpus.userMessages, ['排队中的追问消息', '顺便加上回归测试', '帮我排查一下为什么正常模式启动会卡死在健康检查阶段，并且切换安全模式又能恢复']);
+      expect(corpus.assistantPreviews, ['已补充启动探针测试。', '已定位到 PID 残留导致的门禁死锁。']);
+    });
+
+    test('a repeated word can still match across user and assistant messages', () {
+      final session = searchSession('s', 'title', DateTime(2026, 10, 20));
+      final corpus = {
+        's': const SessionSearchCorpusEntry(userMessages: ['word'], assistantPreviews: ['word']),
+      };
+      expect(searchSessionCorpus('word word', [session], corpus).items.single.sessionId, 's');
+    });
+
+    test('matches CJK substrings, multi-turn user terms, and ranks user messages above reply previews', () {
+      final s1 = searchSession('s1', '日常杂谈 A', DateTime(2026, 10, 20));
+      final s2 = searchSession('s2', '日常杂谈 B', DateTime(2026, 10, 22));
+      final s3 = searchSession('s3', '日常杂谈 C', DateTime(2026, 10, 24));
+      final corpus = <String, SessionSearchCorpusEntry>{
+        // s1: single user message has both terms (tier 0)
+        's1': const SessionSearchCorpusEntry(userMessages: ['我想用 Shizuku 调用安卓 Shell 自动化命令']),
+        // s2: terms split across two user messages in the same session (tier 1)
+        's2': const SessionSearchCorpusEntry(userMessages: ['能不能接上 Shizuku', '再跑一条 Shell 命令']),
+        // s3: only the assistant preview has the terms (tier 2)
+        's3': const SessionSearchCorpusEntry(
+          userMessages: ['帮我看看怎么改'],
+          assistantPreviews: ['可以通过 Shizuku 执行 Shell 脚本。'],
+        ),
+      };
+      final page = searchSessionCorpus('shizuku shell', [s3, s2, s1], corpus);
+      expect(page.items.map((h) => h.sessionId), ['s1', 's2', 's3']);
+      expect(page.items.first.snippet, contains('Shizuku'));
+      expect(page.hasMore, isFalse);
+    });
+
+    testWidgets('HostContentSearch falls back to user corpus when Host SQLite index is disabled', (tester) async {
+      var rpcCalls = 0;
+      final carrier = FakePluginCarrier()
+        ..handlers['session/search'] = (_) {
+          rpcCalls++;
+          throw searchDisabled;
+        };
+      final client = DshClient.withCarrier(carrier);
+      addTearDown(client.close);
+
+      final hostSearch = HostContentSearch(
+        client,
+        fallbackSearch: (query) async =>
+            (items: <ContentHit>[(sessionId: 's4', snippet: '用户提问里包含 $query 的完整句子')], hasMore: false),
+      );
+
+      final first = await hostSearch.search('健康检查');
+      expect(rpcCalls, 1);
+      expect(first.items.single.sessionId, 's4');
+      expect(hostSearch.knownUnsupported, isFalse);
+
+      // Subsequent searches skip the disabled RPC and use the fallback directly.
+      final second = await hostSearch.search('启动卡死');
+      expect(rpcCalls, 1);
+      expect(second.items.single.snippet, contains('启动卡死'));
+    });
   });
 }

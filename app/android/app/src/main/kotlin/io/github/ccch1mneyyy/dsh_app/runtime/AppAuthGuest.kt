@@ -51,7 +51,7 @@ object AppAuthGuest {
 
     /**
      * Copies the bridge modules, then writes the overlay; files already up to date are left alone.
-     * False (and no overlay file) when anything could not be written, so the launch leaves it out.
+     * False when anything could not be written, so this launch leaves it out; cleanup is best effort.
      */
     fun writeFiles(context: Context, rootfs: File): Boolean {
         val patch = file(rootfs)
@@ -69,6 +69,25 @@ object AppAuthGuest {
             patch.delete()
             false
         }
+    }
+
+    /** SIWC is optional: a failed copy must not remove the existing auth overlay. */
+    fun writeSiwcFiles(context: Context, rootfs: File): Boolean = try {
+        val modules = context.assets.list("$ASSET_DIR/siwc").orEmpty().filter { it.endsWith(".mjs") }
+        if (!modules.containsAll(listOf("store.mjs", "oauth.mjs", "provider.mjs"))) {
+            throw IOException("SIWC assets are incomplete")
+        }
+        val dir = File(rootfs, "${GUEST_DIR.removePrefix("/")}/siwc")
+        if (!Files.isDirectory(dir.toPath(), LinkOption.NOFOLLOW_LINKS) && !dir.mkdir()) {
+            throw IOException("could not create SIWC asset directory")
+        }
+        for (name in modules) {
+            val bytes = context.assets.open("$ASSET_DIR/siwc/$name").use { it.readBytes() }
+            writeIfChanged(File(dir, name), bytes)
+        }
+        true
+    } catch (_: Exception) {
+        false
     }
 
     /** Sibling temp file renamed over [target]; only a regular file is compared (never a link or FIFO). */

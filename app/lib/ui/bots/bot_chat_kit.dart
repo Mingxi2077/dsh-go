@@ -12,6 +12,7 @@ import 'package:flutter/services.dart';
 
 import '../../l10n/l10n.dart';
 import '../../state/bots_state.dart';
+import '../chat/dsh_ui/dsh_ui.dart';
 import '../chat/render/markdown_body.dart';
 import '../chat/widgets/chat_card.dart';
 import '../chat/widgets/message_actions.dart';
@@ -46,6 +47,7 @@ class BotChatHeader extends StatelessWidget {
     required this.tone,
     required this.onDetails,
     this.scrolledUnder,
+    this.action,
   });
 
   final Widget face;
@@ -54,6 +56,10 @@ class BotChatHeader extends StatelessWidget {
   final StatusTone tone;
   final VoidCallback onDetails;
   final ValueNotifier<double>? scrolledUnder;
+
+  /// The round key on the right, in place of ⓘ (which repeats the title's
+  /// tap): its icon, label and what it does.
+  final (IconData, String, VoidCallback)? action;
 
   static const barHeight = 56.0;
   static const key44 = 44.0;
@@ -173,12 +179,15 @@ class BotChatHeader extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: 8),
-                  _RoundKey(
-                    key: const ValueKey('bot-details'),
-                    icon: AppIcons.info,
-                    tooltip: l10n.commonDetails,
-                    onTap: onDetails,
-                  ),
+                  if (action case (final icon, final label, final onTap))
+                    _RoundKey(key: const ValueKey('bot-action'), icon: icon, tooltip: label, onTap: onTap)
+                  else
+                    _RoundKey(
+                      key: const ValueKey('bot-details'),
+                      icon: AppIcons.info,
+                      tooltip: l10n.commonDetails,
+                      onTap: onDetails,
+                    ),
                 ],
               ),
             ),
@@ -221,20 +230,38 @@ class _RoundKey extends StatelessWidget {
 /// The page: the transcript fills the space between the header (floating
 /// over it) and the bottom column (cards, error, composer).
 class BotChatFrame extends StatelessWidget {
-  const BotChatFrame({super.key, required this.header, required this.body, required this.bottom});
+  const BotChatFrame({
+    super.key,
+    required this.header,
+    required this.body,
+    required this.bottom,
+    this.backdrop,
+    this.endDrawer,
+    this.scaffoldKey,
+  });
 
   final Widget header;
   final Widget body;
   final List<Widget> bottom;
 
+  /// What the page stands on, around [child]; null: the usual gradient ([AppBackdrop]).
+  final Widget Function(Widget child)? backdrop;
+
+  /// A panel that slides in from the right edge (opened through [scaffoldKey]).
+  final Widget? endDrawer;
+  final GlobalKey<ScaffoldState>? scaffoldKey;
+
   @override
   Widget build(BuildContext context) {
+    final backdrop = this.backdrop ?? (child) => AppBackdrop(child: child);
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: dshSystemOverlay(Theme.of(context).brightness),
-      child: AppBackdrop(
-        child: Scaffold(
+      child: backdrop(
+        Scaffold(
+          key: scaffoldKey,
           backgroundColor: Colors.transparent,
           resizeToAvoidBottomInset: true,
+          endDrawer: endDrawer,
           // A phone on its side: clear of the cutout on both sides.
           body: SideSafeArea(
             child: Column(
@@ -392,12 +419,23 @@ class BotTranscript extends StatefulWidget {
 }
 
 class _BotTranscriptState extends State<BotTranscript> {
-  bool _onScroll(ScrollNotification note) {
-    final metrics = note.metrics;
+  /// A scroll, or a size change without one (a reply growing, the window
+  /// resizing): the header's shade follows either; only a scroll asks for more.
+  bool _onScroll(Notification note) {
+    // The transcript's own (depth 0), not a code block's sideways scroll in a row.
+    final metrics = switch (note) {
+      ScrollNotification(:final metrics, depth: 0) || ScrollMetricsNotification(:final metrics, depth: 0) => metrics,
+      _ => null,
+    };
+    if (metrics == null) return false;
+    // Shaded whenever the transcript is longer than the screen, at its oldest end
+    // too, where an overscroll pulls the text under the header.
+    widget.scrolledUnder?.value = (metrics.maxScrollExtent / 24).clamp(0.0, 1.0);
     // Reversed: content above the top edge is what lies past the scroll end.
     final above = metrics.maxScrollExtent - metrics.pixels;
-    widget.scrolledUnder?.value = (above / 24).clamp(0.0, 1.0);
-    if (above < 400 && widget.hasEarlier && !widget.loadingEarlier) widget.onEarlier?.call();
+    if (note is ScrollNotification && above < 400 && widget.hasEarlier && !widget.loadingEarlier) {
+      widget.onEarlier?.call();
+    }
     return false;
   }
 
@@ -411,7 +449,7 @@ class _BotTranscriptState extends State<BotTranscript> {
       );
     }
     final extra = widget.hasEarlier ? 1 : 0;
-    return NotificationListener<ScrollNotification>(
+    return NotificationListener<Notification>(
       onNotification: _onScroll,
       child: ListView.builder(
         reverse: true,
@@ -644,7 +682,7 @@ class BotTypingLine extends StatelessWidget {
           ),
         ),
         const SizedBox(width: 6),
-        SizedBox(height: 14, child: TypingIndicator(color: dsh.textTertiary)),
+        TypingIndicator(color: dsh.textTertiary),
       ],
     );
   }
@@ -660,6 +698,7 @@ class BotUserMessage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (dshUiReplyChip(text) case final label?) return DshUiReplyChip(label: label, pending: pending);
     final l10n = context.l10n;
     final shown = images > 0 && text.isEmpty ? l10n.botsImagePlaceholder : text;
     return Align(

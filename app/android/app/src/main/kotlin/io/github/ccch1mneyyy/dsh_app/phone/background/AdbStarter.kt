@@ -44,9 +44,18 @@ class AdbStarter(private val context: Context, private val onChanged: () -> Unit
 
     @Volatile private var pairingMdns: AdbMdns? = null
     @Volatile private var connectMdns: AdbMdns? = null
-    @Volatile private var pairEndpoint: AdbEndpoint? = null
-    @Volatile private var connectEndpoint: AdbEndpoint? = null
+    private val pairDiscovery = AdbDiscoverySlot()
+    private val connectDiscovery = AdbDiscoverySlot()
     @Volatile private var channel: AdbChannel? = null
+    private val guard = Any()
+    private class Operation(val mayStart: () -> Boolean, val worker: Thread?) {
+        var valid = true
+        var candidate: AdbChannel? = null
+        var published = false
+        var whenAvailable: (() -> Unit)? = null
+    }
+    // The slot is held until the last manager call (including cleanup) has returned.
+    private var operation: Operation? = null
 
     fun status(): AdbStatus = AdbStatus(wirelessDebugging(), pairedFlag.exists(), channel?.alive() == true)
 
@@ -66,13 +75,13 @@ class AdbStarter(private val context: Context, private val onChanged: () -> Unit
     /** Begins mDNS discovery of the pairing service so [pair] can target the live port. */
     fun startPairing(): Map<String, Any?> {
         stopMdns()
-        pairEndpoint = null
-        connectEndpoint = null
+        val pairTicket = pairDiscovery.begin()
+        val connectTicket = connectDiscovery.begin()
         pairingMdns = AdbMdns(context, AdbMdns.SERVICE_TYPE_TLS_PAIRING) { address, port ->
-            AdbEndpoint.discovered(address, port)?.let { pairEndpoint = it; onChanged() }
+            if (pairDiscovery.publish(pairTicket, address, port)) onChanged()
         }.also { it.start() }
         connectMdns = AdbMdns(context, AdbMdns.SERVICE_TYPE_TLS_CONNECT) { address, port ->
-            AdbEndpoint.discovered(address, port)?.let { connectEndpoint = it; onChanged() }
+            if (connectDiscovery.publish(connectTicket, address, port)) onChanged()
         }.also { it.start() }
         return mapOf("ok" to true)
     }
@@ -80,7 +89,7 @@ class AdbStarter(private val context: Context, private val onChanged: () -> Unit
     /** Pairs with the 6-digit code. [port] overrides mDNS (for the App's manual fallback dialog). */
     fun pair(code: String, port: Int?): Map<String, Any?> {
         if (!code.matches(Regex("\\d{6}"))) return fail(AppStrings.get(context, R.string.pairing_invalid_code))
-        val discovered = pairEndpoint
+        val discovered = pairDiscovery.current()
         val host = if (port != null) loopback() else discovered?.address ?: loopback()
         val target = port ?: discovered?.port ?: return fail(AppStrings.get(context, R.string.pairing_port_missing))
         if (target !in 1..65535) return fail(AppStrings.get(context, R.string.background_adb_invalid_port))
@@ -91,21 +100,35 @@ class AdbStarter(private val context: Context, private val onChanged: () -> Unit
         } catch (e: Exception) {
             fail(AppStrings.get(context, R.string.pairing_error, e.javaClass.simpleName))
         } finally {
+            pairDiscovery.retire()
             runCatching { pairingMdns?.stop() }; pairingMdns = null
-            pairEndpoint = null
         }
     }
 
-    /** Connects to the local adbd and launches the privileged app_process. */
-    fun connect(port: Int? = null): PrivilegedChannel? {
+    /** Short ownership read; never reconnects, probes, or waits for transport work. */
+    internal fun isPublished(expected: PrivilegedChannel): Boolean = synchronized(guard) {
+        channel === expected && operation == null
+    }
+
+    /** Connects to the local adbd. mayStart is a nonblocking lease, checked before publication. */
+    fun connect(port: Int? = null, whenAvailable: (() -> Unit)? = null, mayStart: () -> Boolean = { true }): PrivilegedChannel? {
         if (port != null && port !in 1..65535) return null
-        channel?.takeIf { it.alive() }?.let { return it }
-        if (!pairedFlag.exists()) return null
-        channel?.let { runCatching { it.close() } }
-        channel = null
-        runCatching { manager.disconnect() }
+        val op = synchronized(guard) {
+            if (!mayStart()) return null
+            channel?.takeIf { it.alive() }?.let { return it }
+            operation?.let {
+                if (whenAvailable != null) it.whenAvailable = whenAvailable
+                return null
+            }
+            if (!pairedFlag.exists()) return null
+            Operation(mayStart, Thread.currentThread()).also { operation = it }
+        }
+        val discovered = connectDiscovery.current()
         return try {
-            val discovered = connectEndpoint
+            channel?.close()
+            channel = null
+            manager.disconnect()
+            if (!wanted(op)) return null
             val connected = if (port != null) {
                 // The connect port on Wireless debugging's main page is different
                 // from its short-lived pairing port. Manual input targets this device.
@@ -114,43 +137,113 @@ class AdbStarter(private val context: Context, private val onChanged: () -> Unit
                 val cached = runCatching {
                     manager.connect(discovered.address.hostAddress ?: "127.0.0.1", discovered.port)
                 }.getOrDefault(false)
+                if (!wanted(op)) return null
                 if (cached) true else {
                     // Toggling wireless debugging or changing networks rotates the port.
-                    connectEndpoint = null
-                    runCatching { manager.disconnect() }
+                    connectDiscovery.discard(discovered)
+                    manager.disconnect()
+                    if (!wanted(op)) return null
                     manager.autoConnect(context, TimeUnit.SECONDS.toMillis(8))
                 }
             } else {
                 manager.autoConnect(context, TimeUnit.SECONDS.toMillis(8))
             }
-            if (!connected && !manager.isConnected) return null
+            if (!wanted(op) || (!connected && !manager.isConnected)) return null
             val info = context.applicationInfo
             val stream = manager.openStream("shell:" + PrivilegedCommands.appProcess(info.sourceDir, info.splitSourceDirs?.toList().orEmpty()))
             val value = AdbChannel(stream)
+            synchronized(guard) { op.candidate = value }
+            if (!wanted(op)) return null
             val probe = value.execute(android.os.Bundle().apply { putString(Proto.OP, Proto.OP_PROBE) })
-            if (probe.getBoolean(Proto.OK) && probe.getString("revision") == Proto.REVISION) {
-                channel = value; onChanged(); value
-            } else { value.close(); null }
-        } catch (_: Exception) {
-            connectEndpoint = null
-            runCatching { manager.disconnect() }
+            if (!probe.getBoolean(Proto.OK) || probe.getString("revision") != Proto.REVISION) return null
+            value.negotiate(probe)
+            synchronized(guard) {
+                if (!op.valid || !op.mayStart()) return null
+                channel = value
+                op.published = true
+                value
+            }
+        } catch (e: Exception) {
+            if (e is InterruptedException) Thread.currentThread().interrupt()
+            connectDiscovery.discard(discovered)
             null
         } finally {
+            finish(op, preserve = op.published)
             onChanged()
         }
     }
 
+    private fun wanted(op: Operation): Boolean = synchronized(guard) { op.valid && op.mayStart() }
+
+    private fun finish(op: Operation, preserve: Boolean) {
+        // Clearing the slot and deciding whether cleanup is needed are one handoff. A disconnect
+        // after this handoff claims its own cleanup slot; before it, this worker owns cleanup.
+        var available: (() -> Unit)? = null
+        val cleanup = synchronized(guard) {
+            if (preserve && op.valid) {
+                operation = null
+                available = op.whenAvailable
+                false
+            } else true
+        }
+        if (cleanup) {
+            op.candidate?.close()
+            runCatching { manager.disconnect() }
+            synchronized(guard) { operation = null; available = op.whenAvailable }
+        }
+        // Only a connect rejected by this slot registered a waiter. Its captured keep ticket
+        // decides whether it is still wanted; ordinary failures do not schedule their own retry.
+        available?.invoke()
+    }
+
+    fun cancelUnwantedPending() {
+        val candidate = synchronized(guard) {
+            val op = operation ?: return
+            if (op.published || op.mayStart()) return
+            op.valid = false
+            op.worker?.interrupt()
+            op.candidate
+        }
+        candidate?.close()
+    }
+
+    fun disconnectIfCurrent(expected: PrivilegedChannel?) {
+        if (expected == null) return
+        retire(expected)
+    }
+
     fun disconnect() {
-        channel?.let { runCatching { it.close() } }
-        channel = null
-        runCatching { manager.disconnect() }
+        retire(null)
         stopMdns()
-        pairEndpoint = null
-        connectEndpoint = null
         onChanged()
     }
 
+    private fun retire(expected: PrivilegedChannel?) {
+        var published: PrivilegedChannel? = null
+        var candidate: PrivilegedChannel? = null
+        val cleanup = synchronized(guard) {
+            if (expected != null && channel !== expected) return
+            published = channel; channel = null
+            val pending = operation
+            if (pending != null) {
+                pending.valid = false
+                pending.worker?.interrupt()
+                candidate = pending.candidate
+                null
+            } else {
+                Operation({ false }, null).also { it.valid = false; operation = it }
+            }
+        }
+        published?.close(); candidate?.close()
+        if (cleanup != null) Thread({ finish(cleanup, preserve = false); onChanged() }, "dsh-adb-disconnect").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
     private fun stopMdns() {
+        pairDiscovery.retire()
+        connectDiscovery.retire()
         runCatching { pairingMdns?.stop() }; pairingMdns = null
         runCatching { connectMdns?.stop() }; connectMdns = null
     }

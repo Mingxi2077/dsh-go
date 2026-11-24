@@ -1,4 +1,6 @@
-// Portions derived from DS Bot (https://github.com/Fei2411/DeepSeek-Bot), Apache-2.0, Copyright 2026 Fei2411 and the DS Bot contributors. See THIRD_PARTY_NOTICES.md.
+// SPDX-FileCopyrightText: 2026 Fei2411 and the DS Bot contributors
+// SPDX-License-Identifier: Apache-2.0
+// See THIRD_PARTY_NOTICES.md.
 // Modified: `views.js` normalisation, checks and summary translated to Dart;
 // lenient instead of strict (unknown properties ignored, a broken child becomes
 // a placeholder, limits truncate); a smaller catalog plus `compare` and
@@ -1344,7 +1346,7 @@ String dshUiPlainText(String markdown) {
     final line = lines[i];
     final match = open.firstMatch(line);
     if (match == null) {
-      // 别的围栏：整块照抄，里面的 dsh-ui 字样不当作开头。
+      // 别的围栏：整块原样保留，里面的 dsh-ui 字样不当作开头。
       final other = anyOpen.firstMatch(line);
       out.add(line);
       i++;
@@ -1377,29 +1379,32 @@ String dshUiPlainText(String markdown) {
 bool _closes(String line, String fence) {
   final t = line.trim();
   if (t.length < fence.length) return false;
-  final ch = fence[0];
-  return t.split('').every((c) => c == ch);
+  final ch = fence.codeUnitAt(0);
+  return t.codeUnits.every((c) => c == ch);
 }
 
-/// 模型偶尔不写围栏:把视图 JSON 直接当正文发出来(AGENTS.md 早先的示例就是
-/// 这种写法,模型照着学会)。渲染前把这些裸 JSON 补成 ```` ```dsh-ui ```` 围栏,
+/// A line starting with `{` after what `trimLeft` strips (U+0085 is not in `\s`).
+final _bareObjectLine = RegExp(r'(?:^|\n)(?:[^\S\n]|\u0085)*\{');
+
+/// 模型偶尔不写围栏:把视图 JSON 直接当正文发出来。渲染前把这些裸 JSON
+/// 补成 ```` ```dsh-ui ```` 围栏,
 /// 后面的围栏链路就能照常画成卡片。
 ///
 /// 只认「单独成段、能完整解析成视图」的 JSON 对象:行内提到的 JSON、已有围栏
 /// 里的内容、还没写完的流式半截都原样保留。
 String fenceBareDshUiViews(String markdown) {
-  if (!markdown.contains('{')) return markdown;
+  if (!markdown.contains('{') || !markdown.contains('"') || !_bareObjectLine.hasMatch(markdown)) return markdown;
   final lines = markdown.split('\n');
-  final out = <String>[];
+  List<String>? out;
   var i = 0;
   while (i < lines.length) {
     final fence = _openingFence(lines[i]);
     if (fence != null) {
-      // 别人的围栏:整块照抄,里面的裸 JSON 不补。
-      out.add(lines[i]);
+      // 别人的围栏:整块原样保留,里面的裸 JSON 不补。
+      out?.add(lines[i]);
       i++;
       while (i < lines.length) {
-        out.add(lines[i]);
+        out?.add(lines[i]);
         final closed = _closes(lines[i], fence);
         i++;
         if (closed) break;
@@ -1409,6 +1414,7 @@ String fenceBareDshUiViews(String markdown) {
     if (lines[i].trimLeft().startsWith('{')) {
       final block = _jsonBlockAt(lines, i);
       if (block != null && parseDshUi(block.source) is DshUiParsed) {
+        out ??= lines.take(i).toList();
         out.add('```dsh-ui');
         out.add(block.source);
         out.add('```');
@@ -1416,10 +1422,10 @@ String fenceBareDshUiViews(String markdown) {
         continue;
       }
     }
-    out.add(lines[i]);
+    out?.add(lines[i]);
     i++;
   }
-  return out.join('\n');
+  return out?.join('\n') ?? markdown;
 }
 
 /// 这一行开了一个围栏时返回围栏标记(``` 或 ~~~),否则 null。

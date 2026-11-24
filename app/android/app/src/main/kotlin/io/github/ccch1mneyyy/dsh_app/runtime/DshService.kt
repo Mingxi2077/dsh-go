@@ -12,8 +12,11 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
+import android.net.Uri
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import io.github.ccch1mneyyy.dsh_app.MainActivity
 import io.github.ccch1mneyyy.dsh_app.R
@@ -22,8 +25,11 @@ import io.github.ccch1mneyyy.dsh_app.phone.PhoneControl
 /** Foreground service that keeps the local DSH process alive in the background. */
 class DshService : Service() {
 
+    private val protection by lazy { AndroidBackgroundProtection.get(this) }
+    private var locationForeground = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var networkWatch: NetworkAccess.Watch? = null
     private var installSink: RuntimeController.EventSink? = null
     private var installPercent = -1
     private var installUpgrade = false
@@ -34,6 +40,8 @@ class DshService : Service() {
         val controller = RuntimeController.get(this)
         when (intent?.action) {
             ACTION_INSTALL -> {
+                protection.detach(this)
+                controller.clearServiceRecovery()
                 // First unpack or an upgrade: keep the process (and the CPU) up until it is done.
                 ensureChannel(this)
                 installUpgrade = intent.getBooleanExtra("upgrade", false)
@@ -58,83 +66,121 @@ class DshService : Service() {
                     installSink = sink
                     controller.addSink(sink)
                 }
-                return START_NOT_STICKY
             }
             ACTION_INSTALL_DONE -> {
                 installSink?.let { controller.removeSink(it) }
                 installSink = null
                 if (controller.phase != RuntimeController.Phase.STARTING && controller.phase != RuntimeController.Phase.RUNNING) {
+                    running = false
                     stopForegroundCompat()
-                    stopSelf(startId)
                 }
                 postInstallAlert(this, intent.getBooleanExtra(EXTRA_INSTALL_OK, true))
-                return START_NOT_STICKY
             }
             ACTION_PHONE_STOP -> {
-                // 「停止操作」 on the notification: stop the phone task, keep the engine.
+                // 「停止操作」 on the notification: stop the task it was shown for, keep the engine.
+                val taskId = intent.data?.takeIf { it.scheme == PHONE_TASK_SCHEME }?.schemeSpecificPart?.toLongOrNull()
                 // l10n:keep agent stop reason
-                PhoneControl.get(this).stopTask("用户在通知里停止")
-                return START_NOT_STICKY
+                if (taskId != null) PhoneControl.get(this).stopShownTask("用户在通知里停止", taskId)
+            }
+            ACTION_PHONE_PAUSE -> {
+                // 暂停 / 继续 on the live activity (the phone's own island): only the task it was shown for.
+                val taskId = intent.data?.takeIf { it.scheme == PHONE_TASK_SCHEME }?.schemeSpecificPart?.toLongOrNull()
+                if (taskId != null) PhoneControl.get(this).pauseTask(taskId, intent.getBooleanExtra(EXTRA_PAUSE, true))
+            }
+            ACTION_PHONE_BACK -> {
+                // A tap on the live activity: back to the chat, as the floating bar's 回到 DSH Go — a task on
+                // the person's own screen pauses first, or it would go on tapping in DSH Go itself.
+                val taskId = intent.data?.takeIf { it.scheme == PHONE_TASK_SCHEME }?.schemeSpecificPart?.toLongOrNull()
+                if (taskId != null) {
+                    val control = PhoneControl.get(this)
+                    val live = control.liveTask()?.takeIf { it.id == taskId }
+                    if (live != null && !live.paused && control.background.previewTarget(taskId) == null) control.pauseTask(taskId, true)
+                    control.reopen(control.taskSession(taskId), null)
+                }
             }
             ACTION_STOP -> {
-                if (controller.phase == RuntimeController.Phase.INSTALLING) return START_NOT_STICKY
-                controller.stopProcess()
-                running = false
-                stopForegroundCompat()
-                stopSelf()
-                return START_NOT_STICKY
+                if (controller.phase != RuntimeController.Phase.INSTALLING) {
+                    val expected = if (intent.hasExtra(EXTRA_STOP_GENERATION))
+                        intent.getIntExtra(EXTRA_STOP_GENERATION, -1) else null
+                    if (controller.stopProcess(expected, intent.getStringExtra(EXTRA_STOP_OWNER))) {
+                        protection.detach(this)
+                        running = false
+                        stopForegroundCompat()
+                    }
+                }
             }
-            else -> {
+            ACTION_START, null -> if (controller.prepareServiceStart(recreated = intent == null)) {
                 ensureChannel(this)
                 val notification = buildNotification(this, controller)
                 foreground(notification)
                 running = true
+                protection.attach(this)
                 acquireWakeLock()
                 registerNetworkCallback(controller)
                 logBackgroundPolicy(controller)
                 controller.startProcess()
             }
         }
-        return START_NOT_STICKY
+        // A newer accepted command may still be waiting for onStartCommand, including a no-op stop.
+        if (!running && installSink == null) stopSelf(startId)
+        return if (running && installSink == null && controller.canRecreateService()) START_STICKY else START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        protection.detach(this)
         running = false
         installSink?.let { RuntimeController.get(this).removeSink(it) }
         installSink = null
+        networkWatch?.let { RuntimeController.get(this).onNetworkWatchStopped(it) }
+        networkWatch = null
         networkCallback?.let { callback ->
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             runCatching { cm.unregisterNetworkCallback(callback) }
         }
         networkCallback = null
-        RuntimeController.get(this).onNetworkWatchStopped()
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         super.onDestroy()
     }
 
-    private fun foreground(notification: Notification) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
+    private fun foreground(notification: Notification, location: Boolean = locationForeground) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification)
+            return
         }
+        val baseType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        } else ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE
+        val locationType = if (location) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0
+        startForeground(NOTIFICATION_ID, notification, baseType or locationType)
     }
+
+    internal fun setLocationForeground(enabled: Boolean): Boolean = runCatching {
+        foreground(buildNotification(this, RuntimeController.get(this)), location = enabled)
+        locationForeground = enabled
+    }.isSuccess
 
     private fun registerNetworkCallback(controller: RuntimeController) {
         if (networkCallback != null) return
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val watch = controller.onNetworkWatchStarted()
+        networkWatch = watch
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
-                controller.refreshDns(properties)
+                controller.refreshDns(watch, properties)
             }
 
             // API 29+: the system cut (or restored) this uid's network, e.g. a vendor background policy.
             override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
-                controller.onNetworkBlocked(blocked, MainActivity.inForeground)
+                controller.onNetworkBlocked(watch, blocked, MainActivity.inForeground)
             }
         }
-        if (runCatching { cm.registerDefaultNetworkCallback(callback) }.isSuccess) networkCallback = callback
+        if (runCatching { cm.registerDefaultNetworkCallback(callback) }.isSuccess) {
+            networkCallback = callback
+        } else {
+            controller.onNetworkWatchStopped(watch)
+            networkWatch = null
+        }
     }
 
     private fun logBackgroundPolicy(controller: RuntimeController) {
@@ -171,6 +217,25 @@ class DshService : Service() {
         const val ACTION_START = "io.github.ccch1mneyyy.dsh_app.START"
         const val ACTION_STOP = "io.github.ccch1mneyyy.dsh_app.STOP"
         const val ACTION_PHONE_STOP = "io.github.ccch1mneyyy.dsh_app.PHONE_STOP"
+        const val ACTION_PHONE_PAUSE = "io.github.ccch1mneyyy.dsh_app.PHONE_PAUSE"
+        const val ACTION_PHONE_BACK = "io.github.ccch1mneyyy.dsh_app.PHONE_BACK"
+        private const val PHONE_TASK_SCHEME = "dsh-phone-task"
+        private const val EXTRA_PAUSE = "pause"
+        private const val EXTRA_STOP_GENERATION = "stopGeneration"
+        private const val EXTRA_STOP_OWNER = "stopOwner"
+
+        /** 停止操作 for exactly [taskId]. The id is the intent's data, so every task gets its own
+         * PendingIntent: a newer task's button never rewrites the one still on screen. */
+        fun phoneStopIntent(context: Context, taskId: Long): Intent = Intent(context, DshService::class.java)
+            .setAction(ACTION_PHONE_STOP).setData(Uri.fromParts(PHONE_TASK_SCHEME, taskId.toString(), null))
+
+        /** 暂停 ([pause]) or 继续 for exactly [taskId], from the live activity. */
+        fun phonePauseIntent(context: Context, taskId: Long, pause: Boolean): Intent = Intent(context, DshService::class.java)
+            .setAction(ACTION_PHONE_PAUSE).setData(Uri.fromParts(PHONE_TASK_SCHEME, taskId.toString(), null)).putExtra(EXTRA_PAUSE, pause)
+
+        /** A tap on the live activity for [taskId]: back to its chat, the task paused first when it is on the person's screen. */
+        fun phoneBackIntent(context: Context, taskId: Long): Intent = Intent(context, DshService::class.java)
+            .setAction(ACTION_PHONE_BACK).setData(Uri.fromParts(PHONE_TASK_SCHEME, taskId.toString(), null))
 
         /** With [ACTION_INSTALL_DONE]: the unpack finished (true) or stopped. */
         const val EXTRA_INSTALL_OK = "ok"
@@ -241,6 +306,7 @@ class DshService : Service() {
                 .setOnlyAlertOnce(true)
                 .build()
 
+        private val notificationMain = Handler(Looper.getMainLooper())
         @Volatile private var running = false
 
         /**
@@ -262,12 +328,20 @@ class DshService : Service() {
 
         fun updateNotification(context: Context) {
             if (!running) return
+            // Build and publish with Service start/stop on the main looper, without an old snapshot.
+            if (Looper.myLooper() != Looper.getMainLooper()) {
+                val app = context.applicationContext
+                notificationMain.post { updateNotification(app) }
+                return
+            }
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.notify(NOTIFICATION_ID, buildNotification(context, RuntimeController.get(context)))
         }
 
-        fun stopSelfIfRunning(context: Context) {
-            if (running) context.startService(Intent(context, DshService::class.java).setAction(ACTION_STOP))
+        fun stopSelfIfRunning(context: Context, generation: Int, owner: String) {
+            if (running) context.startService(Intent(context, DshService::class.java).setAction(ACTION_STOP)
+                .putExtra(EXTRA_STOP_GENERATION, generation)
+                .putExtra(EXTRA_STOP_OWNER, owner))
         }
 
         private fun ensureChannel(context: Context) {
@@ -301,11 +375,13 @@ class DshService : Service() {
             } else {
                 @Suppress("DEPRECATION") Notification.Builder(context)
             }
-            // While DSH operates the phone: say what it does and offer 停止操作.
-            val phoneLine = PhoneControl.peek()?.foregroundLine()
-            if (phoneLine != null) {
+            // While DSH operates the phone: say what it does and offer 停止操作 for that task.
+            val phone = PhoneControl.peek()
+            val phoneTask = phone?.liveTask()
+            val phoneLine = phoneTask?.let { phone?.foregroundLine(it) }
+            if (phoneTask != null) {
                 val stopPhone = PendingIntent.getService(
-                    context, 2, Intent(context, DshService::class.java).setAction(ACTION_PHONE_STOP),
+                    context, 2, phoneStopIntent(context, phoneTask.id),
                     PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
                 )
                 builder.addAction(Notification.Action.Builder(null, AppStrings.get(context, R.string.service_stop_phone), stopPhone).build())

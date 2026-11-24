@@ -1,7 +1,10 @@
+import 'dart:async';
+import 'dart:io' show Platform;
+
 import 'package:dsh_app/performance/performance_state.dart';
 import 'package:dsh_app/performance/refresh_rate.dart';
+import 'package:dsh_app/state/android_features.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,9 +15,13 @@ void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
     RefreshRateService.instance.resetForTest();
+    RefreshRateService.operatingSystem = Platform.operatingSystem;
   });
 
-  tearDown(() => RefreshRateService.instance.resetForTest());
+  tearDown(() {
+    RefreshRateService.instance.resetForTest();
+    RefreshRateService.operatingSystem = Platform.operatingSystem;
+  });
 
   Future<void> waitLoaded(ProviderContainer container) async {
     final notifier = container.read(performancePrefsProvider.notifier);
@@ -66,129 +73,310 @@ void main() {
     expect(modes, ['auto', 'max']);
   });
 
-  group('activity requests', () {
-    final service = RefreshRateService.instance;
+  /// Every call on the channel, as `method` then its only argument.
+  List<String> record() {
+    final calls = <String>[];
     final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-    late List<MethodCall> calls;
-
-    List<bool> activeCalls() => calls
-        .where((call) => call.method == 'setFrameActive')
-        .map((call) => (call.arguments as Map)['active'] as bool)
-        .toList();
-
-    setUp(() {
-      calls = [];
-      TestWidgetsFlutterBinding.instance.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-      messenger.setMockMethodCallHandler(RefreshRateService.channel, (call) async {
-        calls.add(call);
-        return null;
-      });
+    messenger.setMockMethodCallHandler(RefreshRateService.channel, (call) async {
+      calls.add('${call.method} ${(call.arguments as Map<Object?, Object?>).values.single}');
+      return null;
     });
+    addTearDown(() => messenger.setMockMethodCallHandler(RefreshRateService.channel, null));
+    return calls;
+  }
 
-    tearDown(() => messenger.setMockMethodCallHandler(RefreshRateService.channel, null));
-
-    testWidgets('programmatic animation can request before its first frame and expire', (tester) async {
-      service.start(observeActivity: false);
-      await service.requestActivity();
-      expect(activeCalls(), [true]); // No pump/frame has happened yet.
-      await tester.pump(const Duration(milliseconds: 600));
-      await service.requestActivity();
-      expect(activeCalls(), [true]); // Renewal does not send another channel message.
-      await tester.pump(const Duration(milliseconds: 699));
-      expect(activeCalls(), [true]);
-      await tester.pump(const Duration(milliseconds: 1));
-      expect(activeCalls(), [true, false]);
-    });
-
-    testWidgets('startup and Flutter frames renew without per-frame channel traffic', (tester) async {
-      service.start(observeActivity: true);
-      service.start(observeActivity: true);
-      expect(activeCalls(), [true]);
-      for (var i = 0; i < 5; i++) {
-        tester.binding.scheduleFrame();
-        await tester.pump(const Duration(milliseconds: 200));
-      }
-      expect(activeCalls(), [true]);
-      expect(calls.where((call) => call.method == 'setRefreshRateMode'), hasLength(1));
-      service.resetForTest();
-    });
-
-    testWidgets('pointer requests before a Flutter frame after idle', (tester) async {
-      await tester.pumpWidget(const SizedBox());
-      service.start(observeActivity: true);
-      await tester.pump(RefreshRateService.idleAfter);
-      expect(activeCalls(), [true, false]);
-      tester.binding.pointerRouter.route(const PointerDownEvent(pointer: 42));
-      tester.binding.pointerRouter.route(const PointerUpEvent(pointer: 42));
-      expect(activeCalls(), [true, false, true]); // Still no animation frame.
-      service.resetForTest();
-    });
-
-    for (final mode in [RefreshRateMode.system, RefreshRateMode.max]) {
-      testWidgets('$mode does not acquire Flutter auto leases', (tester) async {
-        service.start(observeActivity: false);
-        await service.setMode(mode);
-        await service.requestActivity();
-        await tester.pump(const Duration(seconds: 2));
-        expect(activeCalls(), isEmpty);
-      });
+  /// [count] frames [gap] apart, starting [gap] after [from]. Returns the last frame's time.
+  Duration frames(int count, Duration gap, {Duration from = Duration.zero}) {
+    var at = from;
+    for (var i = 0; i < count; i++) {
+      at += gap;
+      RefreshRateService.instance.frameForTest(at);
     }
+    return at;
+  }
 
-    testWidgets('background rejects activity and resume resends the retained mode', (tester) async {
-      service.start(observeActivity: true);
-      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
-      await service.requestActivity();
-      await tester.pump(const Duration(seconds: 1));
-      expect(activeCalls(), [true, false]);
-      await service.setMode(RefreshRateMode.system);
-      calls.clear();
-      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+  /// [frames], each arriving [gap] later as on a device: the release is timed from
+  /// the last frame's own time stamp.
+  Future<Duration> play(WidgetTester tester, int count, Duration gap, {Duration from = Duration.zero}) async {
+    var at = from;
+    for (var i = 0; i < count; i++) {
+      await tester.pump(gap);
+      at += gap;
+      RefreshRateService.instance.frameForTest(at);
+    }
+    return at;
+  }
+
+  const cadence = Duration(milliseconds: 8);
+  const blink = Duration(milliseconds: 500);
+
+  group('on Android', () {
+    setUp(() => RefreshRateService.operatingSystem = 'android');
+
+    testWidgets('any frame is activity, and its traffic is one edge each way', (tester) async {
+      final calls = record();
+      final service = RefreshRateService.instance;
+      service.start();
+      frames(1, blink);
       await tester.pump();
-      expect(activeCalls(), isEmpty);
-      expect(calls.single.method, 'setRefreshRateMode');
-      expect(calls.single.arguments, {'mode': 'system'});
-      service.resetForTest();
+      expect(calls, ['setRefreshRateMode auto', 'setFrameActive true']);
+      await tester.pump(RefreshRateService.idleAfter);
+      expect(calls, ['setRefreshRateMode auto', 'setFrameActive true', 'setFrameActive false']);
     });
 
-    testWidgets('switching out of auto releases immediately and cannot leak a timer', (tester) async {
-      service.start(observeActivity: false);
+    testWidgets('a programmatic animation keeps the preference active until idle', (tester) async {
+      final calls = record();
+      final service = RefreshRateService.instance;
+      service.start();
       await service.requestActivity();
-      await service.setMode(RefreshRateMode.system);
-      await tester.pump(const Duration(seconds: 1));
-      expect(activeCalls(), [true, false]);
-      await service.setMode(RefreshRateMode.auto);
       await service.requestActivity();
-      expect(activeCalls(), [true, false, true]);
-      service.resetForTest();
+      expect(calls, ['setRefreshRateMode auto', 'setFrameActive true']);
+      await tester.pump(RefreshRateService.idleAfter);
+      expect(calls, ['setRefreshRateMode auto', 'setFrameActive true', 'setFrameActive false']);
     });
 
-    testWidgets('reset does not leave an active persistent callback or timer', (tester) async {
-      for (var i = 0; i < 3; i++) {
-        service.start(observeActivity: true);
-        service.resetForTest();
+    testWidgets('a blinking cursor still holds it up, as it always did', (tester) async {
+      final calls = record();
+      RefreshRateService.instance.start();
+      var at = Duration.zero;
+      for (var i = 0; i < 10; i++) {
+        at = frames(1, blink, from: at);
+        await tester.pump(blink);
       }
-      calls.clear();
-      await tester.pump(const Duration(seconds: 1));
-      expect(calls, isEmpty);
+      expect(calls, ['setRefreshRateMode auto', 'setFrameActive true']);
+      await tester.pump(RefreshRateService.idleAfter);
+      expect(calls.last, 'setFrameActive false');
     });
 
-    test('diagnostics preserves a requested/actual mismatch without claiming FPS', () async {
-      messenger.setMockMethodCallHandler(RefreshRateService.channel, (call) async {
-        calls.add(call);
-        return {'requestedRefreshRateHz': 120.0, 'reportedRefreshRateHz': 60.0, 'measuredAppFps': null};
-      });
-      final result = await service.diagnostics();
-      expect(result?['requestedRefreshRateHz'], 120.0);
-      expect(result?['reportedRefreshRateHz'], 60.0);
-      expect(result?['measuredAppFps'], isNull);
-      expect(calls.single.method, 'getRefreshRateDiagnostics');
-      expect(calls.single.arguments, isNull);
+    testWidgets('long motion says active once, with no renewals and no timer per frame', (tester) async {
+      final calls = record();
+      RefreshRateService.instance.start();
+      var timers = 0;
+      final counted = Zone.current.fork(
+        specification: ZoneSpecification(
+          createTimer: (self, parent, zone, duration, callback) {
+            timers++;
+            return parent.createTimer(zone, duration, callback);
+          },
+        ),
+      );
+      var at = Duration.zero;
+      for (var i = 0; i < 1000; i++) {
+        await tester.pump(cadence);
+        at += cadence;
+        counted.run(() => RefreshRateService.instance.frameForTest(at));
+      }
+      await tester.pump();
+      expect(calls, ['setRefreshRateMode auto', 'setFrameActive true']);
+      await tester.pump(RefreshRateService.idleAfter);
+      expect(calls.last, 'setFrameActive false');
+      // 8 s of frames: about one timer per 700 ms, where it was one per frame.
+      expect(timers, lessThan(20));
     });
 
-    test('unsupported platform is harmless for settings and diagnostics', () async {
-      messenger.setMockMethodCallHandler(RefreshRateService.channel, null);
+    testWidgets('modes pass through and frames do nothing outside auto', (tester) async {
+      final calls = record();
+      final service = RefreshRateService.instance;
+      service.start();
+      await service.setMode(RefreshRateMode.max);
+      frames(10, cadence);
       await service.setMode(RefreshRateMode.system);
-      expect(await service.diagnostics(), isNull);
+      await tester.pump();
+      expect(calls, ['setRefreshRateMode auto', 'setRefreshRateMode max', 'setRefreshRateMode system']);
     });
   });
+
+  group('on HarmonyOS', () {
+    setUp(() => RefreshRateService.operatingSystem = 'ohos');
+
+    testWidgets('the mode reaches the platform: it is a real choice here', (tester) async {
+      final calls = record();
+      final service = RefreshRateService.instance;
+      service.start();
+      await service.setMode(RefreshRateMode.max);
+      await service.setMode(RefreshRateMode.system);
+      await tester.pump();
+      expect(calls, ['setRefreshRateMode auto', 'setRefreshRateMode max', 'setRefreshRateMode system']);
+    });
+
+    testWidgets('a blinking cursor never starts it', (tester) async {
+      final calls = record();
+      RefreshRateService.instance.start();
+      var at = Duration.zero;
+      for (var i = 0; i < 20; i++) {
+        at = frames(1, blink, from: at);
+        await tester.pump(blink);
+      }
+      expect(calls, ['setRefreshRateMode auto']);
+    });
+
+    testWidgets('a keystroke\'s couple of frames never start it', (tester) async {
+      final calls = record();
+      RefreshRateService.instance.start();
+      var at = Duration.zero;
+      for (var i = 0; i < 20; i++) {
+        at = frames(1, const Duration(milliseconds: 200), from: at);
+        at = frames(RefreshRateService.motionFrames - 1, cadence, from: at);
+      }
+      await tester.pump();
+      expect(calls, ['setRefreshRateMode auto']);
+    });
+
+    testWidgets('frames at animation cadence start it within a few frames', (tester) async {
+      final calls = record();
+      RefreshRateService.instance.start();
+      var at = frames(1, blink);
+      at = frames(RefreshRateService.motionFrames - 1, cadence, from: at);
+      await tester.pump();
+      expect(calls, ['setRefreshRateMode auto']);
+      frames(1, cadence, from: at);
+      await tester.pump();
+      expect(calls, ['setRefreshRateMode auto', 'setFrameActive true']);
+      await tester.pump(RefreshRateService.idleAfter);
+    });
+
+    testWidgets('a 30 Hz panel still counts as motion', (tester) async {
+      final calls = record();
+      RefreshRateService.instance.start();
+      frames(RefreshRateService.motionFrames + 1, const Duration(milliseconds: 34), from: blink);
+      await tester.pump();
+      expect(calls.last, 'setFrameActive true');
+      await tester.pump(RefreshRateService.idleAfter);
+    });
+
+    testWidgets('it ends after the motion even with a cursor still blinking', (tester) async {
+      final calls = record();
+      RefreshRateService.instance.start();
+      var at = await play(tester, 10, cadence, from: blink);
+      await tester.pump(blink);
+      at = frames(1, blink, from: at);
+      await tester.pump(const Duration(milliseconds: 199));
+      expect(calls, ['setRefreshRateMode auto', 'setFrameActive true']);
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(calls, ['setRefreshRateMode auto', 'setFrameActive true', 'setFrameActive false']);
+      frames(1, blink, from: at);
+      await tester.pump(RefreshRateService.idleAfter);
+      expect(calls.length, 3);
+    });
+
+    testWidgets('one slow frame in a long motion doesn\'t release it', (tester) async {
+      final calls = record();
+      RefreshRateService.instance.start();
+      var at = await play(tester, 10, cadence, from: blink);
+      at = await play(tester, 1, const Duration(milliseconds: 80), from: at);
+      await play(tester, 10, cadence, from: at);
+      await tester.pump();
+      expect(calls, ['setRefreshRateMode auto', 'setFrameActive true']);
+      await tester.pump(RefreshRateService.idleAfter);
+    });
+
+    testWidgets('motion renews about once a second, so the native side can stop without it', (tester) async {
+      final calls = record();
+      RefreshRateService.instance.start();
+      // 2.5 s of frames from the first active: renewed at 1 s and at 2 s.
+      final at = await play(tester, RefreshRateService.motionFrames, cadence, from: blink);
+      await play(tester, 2500 ~/ cadence.inMilliseconds, cadence, from: at);
+      await tester.pump();
+      expect(calls, ['setRefreshRateMode auto', 'setFrameActive true', 'setFrameActive true', 'setFrameActive true']);
+      await tester.pump(RefreshRateService.idleAfter);
+      expect(calls.last, 'setFrameActive false');
+    });
+
+    testWidgets('frames do nothing outside auto', (tester) async {
+      final calls = record();
+      final service = RefreshRateService.instance;
+      service.start();
+      await service.setMode(RefreshRateMode.max);
+      frames(10, cadence, from: blink);
+      await tester.pump();
+      expect(calls, ['setRefreshRateMode auto', 'setRefreshRateMode max']);
+    });
+
+    testWidgets('leaving max for auto starts inactive, as the native side does', (tester) async {
+      final calls = record();
+      final service = RefreshRateService.instance;
+      service.start();
+      frames(10, cadence, from: blink);
+      await service.setMode(RefreshRateMode.max);
+      await service.setMode(RefreshRateMode.auto);
+      await tester.pump();
+      expect(calls, [
+        'setRefreshRateMode auto',
+        'setFrameActive true',
+        'setRefreshRateMode max',
+        'setRefreshRateMode auto',
+      ]);
+      await tester.pump(RefreshRateService.idleAfter);
+      expect(calls.length, 4);
+    });
+  });
+
+  group('frame cache', () {
+    /// A channel that only records; the OS is the provider's, as the app reads it.
+    (ProviderContainer, List<bool>) app(String os) {
+      final sent = <bool>[];
+      final container = ProviderContainer(
+        overrides: [
+          operatingSystemProvider.overrideWithValue(os),
+          performanceChannelProvider.overrideWithValue(_RecordingChannel(sent)),
+        ],
+      );
+      addTearDown(container.dispose);
+      return (container, sent);
+    }
+
+    test('on HarmonyOS it defaults on and says nothing at startup', () async {
+      final (container, sent) = app('ohos');
+      await waitLoaded(container);
+      expect(container.read(performancePrefsProvider).frameCache, isTrue);
+      expect(sent, isEmpty);
+    });
+
+    test('on HarmonyOS a stored off applies at startup', () async {
+      SharedPreferences.setMockInitialValues({'performance.frame_cache': false});
+      final (container, sent) = app('ohos');
+      await waitLoaded(container);
+      expect(container.read(performancePrefsProvider).frameCache, isFalse);
+      expect(sent, [false]);
+    });
+
+    test('on HarmonyOS a change is stored and applied', () async {
+      final (container, sent) = app('ohos');
+      await waitLoaded(container);
+      final notifier = container.read(performancePrefsProvider.notifier);
+      await notifier.setFrameCache(false);
+      await notifier.setFrameCache(true);
+      expect(sent, [false, true]);
+      expect((await SharedPreferences.getInstance()).getBool('performance.frame_cache'), isTrue);
+    });
+
+    test('on HarmonyOS diagnostics say which way it was', () async {
+      final holder = Provider<Map<String, Object?>>(performanceDiagnostics);
+      final (container, _) = app('ohos');
+      await waitLoaded(container);
+      expect((container.read(holder)['preferences'] as Map)['frameCache'], isTrue);
+    });
+
+    test('on Android nothing reaches the channel and diagnostics keep their shape', () async {
+      SharedPreferences.setMockInitialValues({'performance.frame_cache': false});
+      final holder = Provider<Map<String, Object?>>(performanceDiagnostics);
+      final (container, sent) = app('android');
+      await waitLoaded(container);
+      await container.read(performancePrefsProvider.notifier).setFrameCache(true);
+      expect(sent, isEmpty);
+      expect(container.read(holder)['preferences'], isNot(contains('frameCache')));
+    });
+  });
+}
+
+class _RecordingChannel extends PerformanceChannel {
+  _RecordingChannel(this.sent);
+  final List<bool> sent;
+
+  @override
+  Future<PerformanceSnapshot> snapshot() async => const PerformanceSnapshot(loaded: true);
+  @override
+  Stream<PerformanceSnapshot> get changes => const Stream.empty();
+  @override
+  Future<void> setFrameCache(bool enabled) async => sent.add(enabled);
 }

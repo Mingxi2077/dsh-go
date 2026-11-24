@@ -35,7 +35,6 @@ function text(value, max = 256) {
     || /[\u0000-\u001f]/.test(value)) fail('invalid_record');
   return value;
 }
-function copy(value) { return structuredClone(value); }
 function validDay(value) {
   if (typeof value !== 'string' || !DAY.test(value)) return false;
   const date = new Date(value + 'T00:00:00Z');
@@ -89,8 +88,11 @@ function validateState(value) {
     ids.add(record.rid); amount(record.estimateMicros, true);
     if (record.outputDate !== undefined && !validDay(record.outputDate)) fail('corrupt');
     const normalized = normalizeRequest(record.request);
-    if (record.payload !== undefined && (Buffer.byteLength(JSON.stringify(record.payload)) > 32768
-      || createHash('sha256').update(JSON.stringify(record.payload)).digest('hex') !== normalized.paramsHash)) fail('corrupt');
+    if (record.payload !== undefined) {
+      const payload = JSON.stringify(record.payload);
+      if (Buffer.byteLength(payload) > 32768
+        || createHash('sha256').update(payload).digest('hex') !== normalized.paramsHash) fail('corrupt');
+    }
     if (requestIdentity(normalized, record.estimateMicros) !== record.identity) fail('corrupt');
     if (record.providerTaskId !== undefined
       && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(record.providerTaskId)) fail('corrupt');
@@ -192,14 +194,13 @@ export function createBudgetLedger(trustedDirectory, { clock = Date.now, checkpo
   async function prepare() {
     await mkdir(trustedDirectory, { recursive: true, mode: 0o700 });
     await guardDirectory();
-    // Existence does not prove durability: a previous creator may have died
-    // after mkdir and before syncing the parent entry. Every caller repairs
-    // the complete ancestor barrier, including the filesystem root, before
-    // reading or admitting work. If any ancestor cannot be synced, fail closed.
-    // No ancestor's mode or contents is changed.
+    // Repair ancestors even when a previous creator died after mkdir. The
+    // Direct runtime synced its installed rootfs before startup; otherwise
+    // only the filesystem root is an established durability boundary.
+    const directRoot = globalThis[Symbol.for('dsh.go.direct')]?.root;
     for (let path = trustedDirectory; ; path = dirname(path)) {
       await syncDirectory(path);
-      if (dirname(path) === path) break;
+      if (path === directRoot || dirname(path) === path) break;
     }
     await guardDirectory();
   }
@@ -233,7 +234,7 @@ export function createBudgetLedger(trustedDirectory, { clock = Date.now, checkpo
           validateState(state);
           await durableReplace(filename, state, outcome.label);
         }
-        return copy(outcome.result(state));
+        return outcome.result(state); // state was parsed for this transaction alone
       }, { signal });
     } catch (error) {
       if (error instanceof BudgetError) throw error;
@@ -251,6 +252,17 @@ export function createBudgetLedger(trustedDirectory, { clock = Date.now, checkpo
   return {
     async snapshot(options) {
       return transaction(state => result(false, 'read', state), options);
+    },
+    async releaseReserved(options) {
+      return transaction(state => {
+        let released = 0;
+        for (const record of state.requests) {
+          if (record.state !== 'reserved') continue;
+          record.state = 'released';
+          released++;
+        }
+        return result(released > 0, 'release-reserved', released);
+      }, options);
     },
     async setDailyLimit(limitMicros, expectedRevision, options) {
       amount(limitMicros); amount(expectedRevision);

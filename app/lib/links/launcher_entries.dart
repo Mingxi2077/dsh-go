@@ -1,14 +1,17 @@
 // The ways in from outside the app other than links and
 // shares — the launcher icon's long-press shortcuts (新对话, 语音输入, the
-// three latest conversations) and the Quick Settings tile (新对话). Native
+// three latest conversations), the Quick Settings tile (新对话), and a
+// screenshot taken explicitly from the floating pet. Native
 // side: android/.../shortcuts/ (EntryActivity, ShortcutsPlugin — MethodChannel
 // `dsh/shortcuts`) and tile/NewChatTileService.kt. Routed by
-// lib/ui/shell/system_entry_host.dart.
+// lib/ui/shell/system_entry_host.dart. HarmonyOS has the two static shortcuts
+// (ohos/.../ShortcutsPlugin.ets): no tile, and no public API for recent ones.
 
 import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../companion/companion_agent_phone_tools.dart' show companionPhoneWindow;
 import '../l10n/l10n.dart';
 import '../state/connection_state.dart';
 import '../state/hosts_state.dart';
@@ -25,16 +28,42 @@ sealed class LauncherEntry {
     final sessionId = raw['sessionId'];
     final host = raw['host'];
     final text = raw['text'] is String ? raw['text'] as String : '';
+    final path = raw['path'];
+    final taskId = raw['taskId'];
+    final taskRev = raw['taskRev'];
+    final companion = companionPhoneWindow(sessionId is String ? sessionId : null);
     return switch (raw['kind']) {
       'new' => NewChatEntry(text: text),
       'voice' => NewChatEntry(voice: true, text: text),
+      'companion_assistant' => CompanionAssistantEntry(
+        page: raw['page'] is String ? raw['page'] as String : null,
+        returnToApp: raw['returnToApp'] == true,
+      ),
+      'screenshot' when path is String && path.startsWith('/') && !path.contains('\u0000') => ScreenshotEntry(path),
+      // A companion phone task's way back comes on its own session id: she is
+      // no conversation in the chat.
+      'chat' when companion != null => OpenCompanionEntry(room: companion == 'room'),
       'chat' when sessionId is String && sessionId.isNotEmpty => OpenChatEntry(
         HostRef.decode(host is String ? host : null),
         sessionId,
       ),
+      'companion_task'
+          when taskId is String && taskId.isNotEmpty && !taskId.contains('\u0000') && taskRev is int && taskRev > 0 =>
+        OpenCompanionTaskEntry(taskId, taskRev),
       _ => null,
     };
   }
+
+  /// Her full-mode session works the phone too. Its way back (a finished
+  /// task, 回到 DSH Go, a prompt) is her room like her own runs', never a chat.
+  /// Her room shows the [active] host's conversation: one on another host
+  /// opens as the chat it is there.
+  LauncherEntry forCompanion(bool Function(HostRef host, String sessionId) hers, {required HostRef active}) =>
+      switch (this) {
+        OpenChatEntry(:final host, :final sessionId) when host == active && hers(host, sessionId) =>
+          const OpenCompanionEntry(room: true),
+        _ => this,
+      };
 }
 
 /// A new conversation; [voice] starts dictation in its composer.
@@ -46,12 +75,46 @@ class NewChatEntry extends LauncherEntry {
   final bool voice;
 }
 
+/// The Android digital assistant opened the room, optionally with a system Assist snapshot.
+class CompanionAssistantEntry extends LauncherEntry {
+  const CompanionAssistantEntry({this.page, this.returnToApp = false});
+
+  final String? page;
+  final bool returnToApp;
+}
+
+/// A pet screenshot in the app's private cache, authenticated by the native
+/// entry bridge. It is attached to a new-chat draft, never sent automatically.
+class ScreenshotEntry extends LauncherEntry {
+  const ScreenshotEntry(this.path);
+
+  final String path;
+}
+
 /// One of the recent conversations.
 class OpenChatEntry extends LauncherEntry {
   const OpenChatEntry(this.host, this.sessionId);
 
   final HostRef host;
   final String sessionId;
+}
+
+/// Back from a companion phone task (it finished, 回到 DSH Go, a prompt
+/// opened): her [room] when it was asked for there; from her floating self or
+/// her notification, the app as the person left it.
+class OpenCompanionEntry extends LauncherEntry {
+  const OpenCompanionEntry({required this.room});
+
+  final bool room;
+}
+
+/// A trusted reminder notification opens its stored task, without choosing a
+/// host or claiming that the current revision is the one that fired.
+class OpenCompanionTaskEntry extends LauncherEntry {
+  const OpenCompanionTaskEntry(this.taskId, this.taskRev);
+
+  final String taskId;
+  final int taskRev;
 }
 
 /// A conversation as a launcher shortcut.
@@ -86,10 +149,14 @@ class LauncherBridge extends NativeInbox<LauncherEntry> {
   /// What the launcher has, as far as this run knows.
   List<RecentShortcut>? _published;
 
+  /// Publishes not answered yet: one of them may still replace [_published].
+  int _sending = 0;
+
   /// Publishes [recents] (newest first) unless the launcher already has
   /// them. True when the launcher has them now.
   Future<bool> setRecent(List<RecentShortcut> recents) async {
-    if (_published != null && listEquals(_published, recents)) return true;
+    if (_sending == 0 && _published != null && listEquals(_published, recents)) return true;
+    _sending++;
     try {
       final ok = await channel.invokeMethod<bool>('setRecent', {
         'items': [for (final r in recents) r.toJson()],
@@ -101,6 +168,8 @@ class LauncherBridge extends NativeInbox<LauncherEntry> {
       return false;
     } on PlatformException {
       return false;
+    } finally {
+      _sending--;
     }
   }
 }

@@ -4,8 +4,8 @@ import { describe, expect, it } from 'vitest';
 
 import worker from '../src/index';
 import { ALPHABET, ID_LENGTH, TIERS, newId, objectKey, parseTtl, tierOfId } from '../src/ids';
-import { clientKey } from '../src/limits';
-import { makeEnv } from './fakes';
+import { clientKey, uploadQuota } from '../src/limits';
+import { makeEnv, serve, workerFirst } from './fakes';
 
 const ORIGIN = 'https://go.dshtui.com';
 
@@ -153,6 +153,49 @@ describe('upload', () => {
     expect([...ctx.kv.values.keys()].join()).not.toContain('203.0.113.7');
   });
 
+  for (const storage of ['available', 'missing', 'failing']) {
+    it(`pauses uploads at zero even when quota storage is ${storage}`, async () => {
+      const ctx = makeEnv({ UPLOADS_PER_HOUR: '0' });
+      if (storage === 'missing') ctx.env.QUOTA = undefined;
+      if (storage === 'failing') ctx.kv.failReads = ctx.kv.failWrites = true;
+      let writes = 0;
+      const put = ctx.bucket.put.bind(ctx.bucket);
+      ctx.bucket.put = async (...args) => { writes++; return put(...args); };
+      const response = await worker.fetch(post(blob()), ctx.env);
+      expect(response.status).toBe(429);
+      expect(await response.json()).toEqual({ error: 'rate_limited' });
+      expect(Number(response.headers.get('Retry-After'))).toBeGreaterThan(0);
+      expect(writes).toBe(0);
+      expect(ctx.kv.values.size).toBe(0);
+    });
+  }
+
+  it('keeps reads and authorized deletion available while uploads are paused', async () => {
+    const ctx = makeEnv();
+    const link = await uploadOne(ctx, 'forever');
+    ctx.env.UPLOADS_PER_HOUR = '0';
+    expect((await worker.fetch(post(blob()), ctx.env)).status).toBe(429);
+    const response = await worker.fetch(get(`/api/v1/c/${link.id}`), ctx.env);
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(blob());
+    expect((await worker.fetch(del(link.id, { Authorization: `Bearer ${link.deleteToken}` }), ctx.env)).status).toBe(204);
+  });
+
+  it('preserves existing default and invalid quota configuration behavior', async () => {
+    for (const setting of [undefined, '', '  ', 'not-a-number']) {
+      const ctx = makeEnv({ UPLOADS_PER_HOUR: setting });
+      ctx.kv.get = async () => '19';
+      expect((await uploadQuota(ctx.env, 'synthetic', 0)).allowed, String(setting)).toBe(true);
+      ctx.kv.get = async () => '20';
+      expect((await uploadQuota(ctx.env, 'synthetic', 0)).allowed, String(setting)).toBe(false);
+    }
+    const negative = makeEnv({ UPLOADS_PER_HOUR: '-1' });
+    expect((await uploadQuota(negative.env, 'synthetic', 0)).allowed).toBe(false);
+    const infinite = makeEnv({ UPLOADS_PER_HOUR: 'Infinity' });
+    infinite.kv.get = async () => '20';
+    expect((await uploadQuota(infinite.env, 'synthetic', 0)).allowed).toBe(true);
+  });
+
   it('does not count rejected uploads', async () => {
     const ctx = makeEnv({ UPLOADS_PER_HOUR: '1' });
     expect((await worker.fetch(post(blob(8)), ctx.env)).status).toBe(400);
@@ -209,6 +252,63 @@ describe('read', () => {
 });
 
 describe('delete', () => {
+  it('limits invalid admin headers before reading R2 metadata', async () => {
+    for (const config of [{}, { ADMIN_KEY: undefined }, { ADMIN_KEY: 'short' }]) {
+      for (const header of ['', 'wrong-admin-key']) {
+        const ctx = makeEnv(config);
+        const link = await uploadOne(ctx);
+        ctx.readLimit.allow = 0;
+        let heads = 0;
+        const head = ctx.bucket.head.bind(ctx.bucket);
+        ctx.bucket.head = async (key) => { heads++; return head(key); };
+        const res = await worker.fetch(del(link.id, { 'X-Admin-Key': header }), ctx.env);
+        expect(res.status).toBe(429);
+        expect(await res.json()).toEqual({ error: 'rate_limited' });
+        expect(res.headers.get('Retry-After')).toBe('60');
+        expect(ctx.readLimit.keys).toEqual(['198.51.100.1']);
+        expect(heads).toBe(0);
+        expect(ctx.bucket.objects.size).toBe(1);
+      }
+    }
+  });
+
+  it('keeps invalid admin priority over a valid owner token when quota is available', async () => {
+    const ctx = makeEnv();
+    const link = await uploadOne(ctx);
+    const headers = { 'X-Admin-Key': 'wrong', Authorization: `Bearer ${link.deleteToken}` };
+    const res = await worker.fetch(del(link.id, headers), ctx.env);
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'forbidden' });
+    expect(ctx.readLimit.keys).toEqual(['198.51.100.1']);
+    expect(ctx.bucket.objects.size).toBe(1);
+    expect((await worker.fetch(del('eZZZZZZZZZ', headers), ctx.env)).status).toBe(404);
+  });
+
+  it('exempts authenticated admins without calling the limiter or quota KV', async () => {
+    const ctx = makeEnv();
+    const link = await uploadOne(ctx);
+    ctx.readLimit.allow = 0;
+    let kvReads = 0;
+    ctx.kv.get = async () => { kvReads++; throw new Error('unused'); };
+    const headers = { 'X-Admin-Key': ctx.env.ADMIN_KEY! };
+    expect((await worker.fetch(del(link.id, headers), ctx.env)).status).toBe(204);
+    expect((await worker.fetch(del(link.id, headers), ctx.env)).status).toBe(404);
+    expect(ctx.readLimit.keys).toEqual([]);
+    expect(kvReads).toBe(0);
+  });
+
+  it('retains missing credentials and owner-token rate limiting', async () => {
+    const ctx = makeEnv();
+    const link = await uploadOne(ctx);
+    ctx.readLimit.allow = 0;
+    const missing = await worker.fetch(del(link.id, {}), ctx.env);
+    expect(missing.status).toBe(401);
+    expect(await missing.json()).toEqual({ error: 'unauthorized' });
+    expect(ctx.readLimit.keys).toEqual([]);
+    expect((await worker.fetch(del(link.id, { Authorization: `Bearer ${link.deleteToken}` }), ctx.env)).status).toBe(429);
+    expect(ctx.bucket.objects.size).toBe(1);
+  });
+
   it('needs the link\'s own token', async () => {
     const ctx = makeEnv();
     const a = await uploadOne(ctx);
@@ -242,9 +342,21 @@ describe('delete', () => {
 });
 
 describe('pages', () => {
+  // The site is files served without the Worker; the Worker runs first only
+  // for its own routes and the files it hides.
+  it('runs the Worker first only for its routes', () => {
+    for (const p of ['/api/v1/c', '/api/usage/v1', '/api/github/stars', '/c/Ab3dE5gH9k', '/market/index.json', '/market',
+      '/p/@scope/plugin', '/beta', '/beta/update.json', '/download', '/download/get', '/share', '/c.html', '/index.html']) {
+      expect(workerFirst(p), p).toBe(true);
+    }
+    for (const p of ['/', '/app.js', '/assets/dsh-go.svg', '/share/', '/share/index.html', '/share/share.js', '/robots.txt', '/favicon.svg']) {
+      expect(workerFirst(p), p).toBe(false);
+    }
+  });
+
   it('serves the viewer for /c/<id> with a strict policy', async () => {
     const ctx = makeEnv();
-    const res = await worker.fetch(get('/c/Ab3dE5gH9k'), ctx.env);
+    const res = await serve(get('/c/Ab3dE5gH9k'), ctx.env);
     expect(res.status).toBe(200);
     expect(res.headers.get('Content-Type')).toContain('text/html');
     const csp = res.headers.get('Content-Security-Policy')!;
@@ -255,33 +367,34 @@ describe('pages', () => {
     expect(res.headers.get('X-Frame-Options')).toBe('DENY');
     expect(res.headers.get('Referrer-Policy')).toBe('no-referrer');
     expect(await res.text()).toContain('dv-root');
-    expect((await worker.fetch(get('/c/Ab3dE5gH9k/'), ctx.env)).status).toBe(200);
+    expect((await serve(get('/c/Ab3dE5gH9k/'), ctx.env)).status).toBe(200);
   });
 
   it('serves the landing page under /share/', async () => {
     const ctx = makeEnv();
-    expect((await worker.fetch(get('/share'), ctx.env)).status).toBe(301);
-    const page = await worker.fetch(get('/share/'), ctx.env);
+    expect((await serve(get('/share'), ctx.env)).status).toBe(301);
+    const page = await serve(get('/share/'), ctx.env);
     expect(page.status).toBe(200);
     expect(page.headers.get('Content-Security-Policy')).toContain("frame-ancestors 'none'");
     expect(page.headers.get('X-Robots-Tag')).toBe('noindex');
     expect(await page.text()).toContain('share.js');
-    const js = await worker.fetch(get('/share/share.js'), ctx.env);
+    const js = await serve(get('/share/share.js'), ctx.env);
     expect(js.status).toBe(200);
     expect(js.headers.get('X-Content-Type-Options')).toBe('nosniff');
     expect(js.headers.get('Cache-Control')).toBe('public, max-age=3600');
-    expect((await worker.fetch(get('/share/viewer.js'), ctx.env)).status).toBe(200);
+    expect((await serve(get('/share/viewer.js'), ctx.env)).status).toBe(200);
   });
 
   it('404s everything else', async () => {
     const ctx = makeEnv();
     for (const p of ['/c.html', '/c/', '/c/a_b', '/nope', '/share/nope.html', '/api/v2/c', '/api/v1/c/x/y',
       '/index.html', '/home/', '/home/index.html', '/home/app.js', '/assets/', '/assets/nope.webp', '/assets/features/']) {
-      expect((await worker.fetch(get(p), ctx.env)).status, p).toBe(404);
+      expect((await serve(get(p), ctx.env)).status, p).toBe(404);
     }
-    expect((await worker.fetch(new Request(`${ORIGIN}/c/Ab3dE5gH9k`, { method: 'POST' }), ctx.env)).status).toBe(405);
-    expect((await worker.fetch(get('/api/v1/c'), ctx.env)).status).toBe(405);
-    expect((await worker.fetch(get('/robots.txt'), ctx.env)).status).toBe(200);
+    expect((await serve(new Request(`${ORIGIN}/c/Ab3dE5gH9k`, { method: 'POST' }), ctx.env)).status).toBe(405);
+    expect((await serve(new Request(`${ORIGIN}/app.js`, { method: 'POST' }), ctx.env)).status).toBe(405);
+    expect((await serve(get('/api/v1/c'), ctx.env)).status).toBe(405);
+    expect((await serve(get('/robots.txt'), ctx.env)).status).toBe(200);
   });
 });
 
@@ -291,7 +404,7 @@ describe('home page', () => {
   it('is served at / with its own policy, indexable', async () => {
     const ctx = makeEnv();
     for (const method of ['GET', 'HEAD']) {
-      const res = await worker.fetch(new Request(`${ORIGIN}/`, { method }), ctx.env);
+      const res = await serve(new Request(`${ORIGIN}/`, { method }), ctx.env);
       expect(res.status).toBe(200);
       expect(res.headers.get('Content-Type')).toContain('text/html');
       expect(res.headers.get('Content-Security-Policy')).toBe(
@@ -305,7 +418,7 @@ describe('home page', () => {
       expect(res.headers.get('Cache-Control')).toBe('no-cache');
       expect(res.headers.has('X-Robots-Tag')).toBe(false);
     }
-    const body = await (await worker.fetch(get('/?from=qr'), ctx.env)).text();
+    const body = await (await serve(get('/?from=qr'), ctx.env)).text();
     expect(body).toContain('<title>DSH Go · 万物皆插件，随身而行</title>');
     expect(body).toContain('<link rel="canonical" href="https://go.dshtui.com/">');
     expect(body).toContain('<script src="app.js" defer></script>');
@@ -315,13 +428,13 @@ describe('home page', () => {
     const ctx = makeEnv();
     for (const [path, type] of [
       ['/assets/features/01-local-engine.webp', 'image/webp'],
-      ['/assets/author/download-qr.png', 'image/png'],
+      ['/assets/author/download-qr-v2.png', 'image/png'],
       ['/assets/dsh-go.svg', 'image/svg+xml'],
       ['/app.js', 'text/javascript'],
       ['/site-config.js', 'text/javascript'],
       ['/styles.css', 'text/css'],
     ]) {
-      const res = await worker.fetch(get(path!), ctx.env);
+      const res = await serve(get(path!), ctx.env);
       expect(res.status, path).toBe(200);
       expect(res.headers.get('Content-Type'), path).toContain(type);
       expect(res.headers.get('Cache-Control'), path).toBe('public, max-age=3600');
@@ -348,16 +461,16 @@ describe('home page', () => {
     expect(page).toContain('href="https://dshtui.com/"');
     expect(page).toContain('href="https://github.com/ccch1mneyyy/dsh-TUI"');
     const images = [...site('site-config.js').matchAll(/(?:avatar|qrImage):\s*"([^"]+)"/g)].map((m) => m[1]!);
-    expect(images).toEqual(['assets/dsh-go.svg', 'assets/author/download-qr.png']);
+    expect(images).toEqual(['assets/dsh-go.svg', 'assets/author/download-qr-v2.png']);
     const ctx = makeEnv();
     for (const ref of new Set([...refs, ...images])) {
-      expect((await worker.fetch(get('/' + ref), ctx.env)).status, ref).toBe(200);
+      expect((await serve(get('/' + ref), ctx.env)).status, ref).toBe(200);
     }
   });
 
   it('is the only thing robots.txt lets crawlers fetch', async () => {
     const ctx = makeEnv();
-    const lines = (await (await worker.fetch(get('/robots.txt'), ctx.env)).text()).trim().split('\n');
+    const lines = (await (await serve(get('/robots.txt'), ctx.env)).text()).trim().split('\n');
     expect(lines.slice(0, 2)).toEqual(['User-agent: *', 'Allow: /$']);
     expect(lines).toContain('Allow: /app.js$');
     expect(lines).toContain('Allow: /assets/features/01-local-engine.webp$');
@@ -367,13 +480,13 @@ describe('home page', () => {
 
   it('leaves the other routes alone', async () => {
     const ctx = makeEnv();
-    const viewer = await worker.fetch(get('/c/Ab3dE5gH9k'), ctx.env);
+    const viewer = await serve(get('/c/Ab3dE5gH9k'), ctx.env);
     expect(viewer.status).toBe(200);
     expect(viewer.headers.get('X-Robots-Tag')).toBe('noindex');
     expect(viewer.headers.get('Content-Security-Policy')).toMatch(/script-src 'sha256-/);
-    expect((await worker.fetch(get('/share/'), ctx.env)).status).toBe(200);
-    expect((await worker.fetch(get('/favicon.svg'), ctx.env)).status).toBe(200);
-    expect((await worker.fetch(get('/update.json'), ctx.env)).status).toBe(404);
-    expect((await worker.fetch(new Request(`${ORIGIN}/`, { method: 'POST' }), ctx.env)).status).toBe(405);
+    expect((await serve(get('/share/'), ctx.env)).status).toBe(200);
+    expect((await serve(get('/favicon.svg'), ctx.env)).status).toBe(200);
+    expect((await serve(get('/update.json'), ctx.env)).status).toBe(404);
+    expect((await serve(new Request(`${ORIGIN}/`, { method: 'POST' }), ctx.env)).status).toBe(405);
   });
 });

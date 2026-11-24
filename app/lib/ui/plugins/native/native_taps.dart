@@ -18,6 +18,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../browser/browser_links.dart';
+import '../../../clipboard/paste_reader.dart';
 import '../../../l10n/l10n.dart';
 import '../../../plugins/native/native_capabilities.dart';
 import '../../../plugins/native/native_effects.dart';
@@ -25,14 +26,16 @@ import '../../../plugins/native/native_files.dart';
 import '../../../plugins/native/native_model.dart';
 import '../../../plugins/native/native_state.dart';
 import '../../../plugins/native/native_surface.dart';
+import '../../../state/android_features.dart';
 import '../../../state/chat_state.dart';
 import '../../../state/composer_insert.dart';
 import '../../../state/hosts_state.dart';
 import '../../../state/sessions_state.dart';
 import '../../../ui_config/ui_config_model.dart';
 import '../../features/all_features_page.dart' show dshWebOpenerProvider;
+import '../../common/app_dialog.dart';
 import '../../features/feature_catalog.dart';
-import '../../settings/index/settings_pages.dart' show settingsPageForLink;
+import '../../settings/index/settings_pages.dart' show SettingsIndex, settingsPageForLink;
 import '../../settings/settings_screen.dart';
 import 'native_panel.dart';
 import 'native_voice_consent.dart';
@@ -256,7 +259,7 @@ Future<bool> runNativeTap(
 }) async {
   if (!context.mounted || !ref.context.mounted) return false;
   final clock = ref.read(nativeClockProvider);
-  final tappedAt = gestureAt ?? clock();
+  var tappedAt = gestureAt ?? clock();
   if (userGesture && nativeTapIsFresh(tappedAt, clock())) HapticFeedback.selectionClick();
   final l10n = context.l10n;
   final plugin = ref.read(nativeContributionsProvider).plugin(package);
@@ -277,7 +280,8 @@ Future<bool> runNativeTap(
 
   // What may travel with this tap, after asking once.
   final wants = switch (surface) {
-    NativeSurface.composerActions => {if (plugin.wantsDraft) 'draft', if (plugin.wantsClipboard) 'clipboard'},
+    NativeSurface.composerActions ||
+    NativeSurface.composerTools => {if (plugin.wantsDraft) 'draft', if (plugin.wantsClipboard) 'clipboard'},
     NativeSurface.messageActions => {if (plugin.wantsMessage && message != null) 'message'},
     _ => const <String>{},
   };
@@ -293,12 +297,24 @@ Future<bool> runNativeTap(
   }
   String? clipboard;
   if (wants.contains('clipboard')) {
-    try {
-      clipboard = (await Clipboard.getData(Clipboard.kTextPlain))?.text;
-    } catch (_) {
-      clipboard = null;
+    if (ref.read(operatingSystemProvider) == 'ohos') {
+      // 允许 above only said what may travel with a tap; the system's own button
+      // still grants this read, and pressing it is the gesture from here on.
+      final result = await ref.read(pasteReaderProvider).begin().finish();
+      if (!context.mounted || !guard.current) return false;
+      if (pasteFailureText(result) case final message?) _toast(context, message);
+      // An empty clipboard goes on without one, as on Android; the rest end the tap.
+      if (result.status != PasteStatus.text && result.status != PasteStatus.empty) return false;
+      clipboard = result.text;
+      tappedAt = clock();
+    } else {
+      try {
+        clipboard = (await Clipboard.getData(Clipboard.kTextPlain))?.text;
+      } catch (_) {
+        clipboard = null;
+      }
+      if (!context.mounted || !guard.current) return false;
     }
-    if (!context.mounted || !guard.current) return false;
   }
 
   work.start(control, NativeWork(owner: owner));
@@ -350,6 +366,32 @@ Future<bool> runNativeTap(
   }
 }
 
+/// Hands back the file requests of an answer nobody acts on (the panel went
+/// away meanwhile): the bridge gave them out already, and the next pick on the
+/// connection would wait for them. execute closes them as cancelled before
+/// any picker opens.
+Future<void> _releaseFiles(
+  NativeFileCoordinator? files,
+  List<NativeEffect> effects,
+  DshGoInvocation invocation,
+  DateTime tappedAt,
+  DateTime Function() now,
+) async {
+  final stream = invocation.stream;
+  if (files == null || stream == null) return;
+  for (final effect in effects.whereType<PickFileEffect>()) {
+    await files.execute(
+      effect,
+      pkg: invocation.pkg,
+      stream: stream,
+      userGesture: false,
+      tappedAt: tappedAt,
+      now: now,
+      isCurrent: () => false,
+    );
+  }
+}
+
 Future<bool> _invoke(
   BuildContext context,
   WidgetRef ref, {
@@ -375,6 +417,8 @@ Future<bool> _invoke(
   final diagnostics = ref.read(nativeDiagnosticsProvider.notifier);
   final work = ref.read(nativeWorkProvider.notifier);
   final clock = ref.read(nativeClockProvider);
+  // Read now: the panel may be gone (and its ref with it) when the answer comes.
+  final files = ref.read(nativeFileCoordinatorProvider);
   final DshGoInvokeResult result;
   final invokedAt = clock();
   try {
@@ -393,7 +437,10 @@ Future<bool> _invoke(
     }
     return false;
   }
-  if (!guard.current) return false;
+  if (!guard.current) {
+    await _releaseFiles(files, parseNativeEffects(result.effects, []), invocation, tappedAt, clock);
+    return false;
+  }
   diagnostics.invoked(package, result.elapsed);
   void dataEffect(NativeEffect effect) {
     if (!guard.current) return;
@@ -683,7 +730,7 @@ Future<void> _runEffect(
       if (target == null) {
         issues.add(NativeIssue('/effects', l10n.plugslotsIssueUnknownPage('panel:$panel')));
       } else {
-        await Navigator.of(context).push(NativePanelPage.route(panel: target, sessionId: sessionId));
+        await openNativePanel(context, target, sessionId: sessionId);
       }
     case LinkEffect(:final url):
       await openConfirmedLink(context, url, stillCurrent: stillCurrent);
@@ -749,7 +796,16 @@ Future<void> runComposerCommand(BuildContext context, WidgetRef ref, String line
 }
 
 /// An app page by its ui.json / 全部功能 id, `new-chat` or `settings`.
-Future<void> openNativePage(BuildContext context, WidgetRef ref, String page, {String? sessionId}) async {
+Future<void> openNativePage(BuildContext context, WidgetRef ref, String id, {String? sessionId}) async {
+  final os = ref.read(operatingSystemProvider);
+  // On HarmonyOS, Android's own pages lead to its form of them; with none, say so.
+  final page = os == 'ohos' ? SettingsIndex.ohosLink(id) : id;
+  if (!ref.read(androidSystemFeaturesProvider) && SettingsIndex.androidOnlyLink(page, ios: os == 'ios')) {
+    _toast(context, context.l10n.harmonyPageUnavailable);
+    return;
+  }
+  // A page only HarmonyOS has is no page at all elsewhere.
+  if (os != 'ohos' && SettingsIndex.ohosOnlyLink(page)) return;
   final navigator = Navigator.of(context);
   switch (page) {
     case 'new-chat':
@@ -783,16 +839,15 @@ Future<void> openNativePage(BuildContext context, WidgetRef ref, String page, {S
 }
 
 /// An https page in the browser, after a confirmation that names its host.
-/// [opener] can retain the caller's scope; it runs only after confirmation while current.
 Future<void> openConfirmedLink(
   BuildContext context,
   Uri url, {
   bool Function()? stillCurrent,
-  Future<void> Function(Uri)? opener,
+  Future<void> Function(Uri url)? opener,
 }) async {
   if (url.scheme != 'https' || !context.mounted || stillCurrent?.call() == false) return;
   final l10n = context.l10n;
-  final ok = await showDialog<bool>(
+  final ok = await showAppDialog<bool>(
     context: context,
     builder: (dialog) => AlertDialog(
       title: Text(l10n.pluginsOpenBrowserHost(url.host)),
@@ -803,9 +858,11 @@ Future<void> openConfirmedLink(
     ),
   );
   if (ok == true && context.mounted && stillCurrent?.call() != false) {
-    try {
-      await (opener ?? BrowserLinks.open)(url);
-    } catch (_) {}
+    if (opener == null) {
+      await BrowserLinks.open(url);
+    } else {
+      await opener(url);
+    }
   }
 }
 
@@ -818,7 +875,7 @@ Future<bool> _askWants(BuildContext context, String title, Set<String> wants) as
       : wants.contains('draft')
       ? l10n.plugslotsWantsDraft(title)
       : l10n.plugslotsWantsClipboard(title);
-  final ok = await showDialog<bool>(
+  final ok = await showAppDialog<bool>(
     context: context,
     builder: (dialog) => AlertDialog(
       title: Text(heading),

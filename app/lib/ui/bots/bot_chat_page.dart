@@ -13,6 +13,7 @@ import '../../state/settings_state.dart';
 import '../../state/bots_state.dart';
 import '../../state/connection_state.dart';
 import '../chat/composer.dart';
+import '../chat/dsh_ui/dsh_ui.dart';
 import '../chat/model_sheet.dart';
 import '../chat/widgets/approval_card.dart';
 import '../common/status_dot.dart';
@@ -69,10 +70,15 @@ class _BotChatPageState extends ConsumerState<BotChatPage> {
     super.dispose();
   }
 
-  Future<void> _send(BotActionScope target, String part) async {
-    if (!mounted || target.botId != widget.botId || !target.current(context, ref)) return;
+  /// Whether what the person sends now still goes to this page's Bot.
+  bool _sendsTo(BotActionScope target, String part) {
+    if (!mounted || target.botId != widget.botId || !target.current(context, ref)) return false;
     final status = ref.read(dsBotProvider);
-    if (!status.ready || status.team?.bot(widget.botId)?.sessionId != part) return;
+    return status.ready && status.team?.bot(widget.botId)?.sessionId == part;
+  }
+
+  Future<void> _send(BotActionScope target, String part) async {
+    if (!_sendsTo(target, part)) return;
     await sendBotDraft(
       context,
       ref,
@@ -81,6 +87,10 @@ class _BotChatPageState extends ConsumerState<BotChatPage> {
       send: (text) => ref.read(botChatProvider(widget.botId).notifier).send(text),
     );
   }
+
+  /// A card's answer, sent as the person's message (`[dsh-ui reply] …`).
+  Future<bool> _reply(BotActionScope target, String part, String text) async =>
+      _sendsTo(target, part) && await ref.read(botChatProvider(widget.botId).notifier).send(text);
 
   Future<void> _pickModel(DsBot bot, BotActionScope scope) => pickBotModel(context, ref, bot, scope: scope);
 
@@ -95,12 +105,15 @@ class _BotChatPageState extends ConsumerState<BotChatPage> {
     if (team == null || bot == null || mobileUnavailable) {
       return AppPage.list(
         title: 'Bot',
-        children: [
-          DsBotUnavailableMessage(status: status, goneIcon: AppIcons.bot, goneTitle: l10n.botsBotGone),
-        ],
+        children: [DsBotUnavailableMessage(status: status, goneIcon: AppIcons.bot, goneTitle: l10n.botsBotGone)],
       );
     }
-    final chat = ref.watch(botChatProvider(widget.botId));
+    final feed = botChatProvider(widget.botId);
+    // The transcript owns the live row. Its words only rebuild that row.
+    ref.watch(
+      feed.select((s) => (s.items, s.pending, s.loading, s.loadingEarlier, s.hasEarlier, s.error, s.streaming != null)),
+    );
+    final chat = ref.read(feed);
     final work = status.live.bots[bot.id];
     final ownTurn = work != null && work.roomId == null;
     final question = team.questionOf(bot);
@@ -152,14 +165,25 @@ class _BotChatPageState extends ConsumerState<BotChatPage> {
                 child: switch (row) {
                   BotTimeRow(:final time) => BotTimeLine(time),
                   BotPendingRow(:final pending) => BotUserMessage(text: pending.text, pending: true),
-                  BotStreamingRow(:final text) =>
-                    text.isEmpty
-                        ? const Align(alignment: Alignment.centerLeft, child: _Thinking())
-                        : BotReplyText(text: text, streaming: true),
+                  BotStreamingRow() => Consumer(
+                    builder: (context, ref, _) {
+                      final text = ref.watch(feed.select((s) => s.streaming));
+                      return text == null || text.isEmpty
+                          ? const Align(alignment: Alignment.centerLeft, child: _Thinking())
+                          : BotReplyText(text: text, streaming: true);
+                    },
+                  ),
                   BotTypingRow() => const SizedBox.shrink(),
                   BotItemRow(:final item) => switch (item.kind) {
                     DsBotItemKind.user => BotUserMessage(text: item.text, images: item.images),
-                    DsBotItemKind.bot => BotReplyText(text: item.text),
+                    DsBotItemKind.bot => _WithCards(
+                      chat: chat,
+                      item: item,
+                      sessionId: bot.sessionId,
+                      running: ownTurn,
+                      onReply: readOnly ? null : (text) => _reply(sendTarget, bot.sessionId, text),
+                      child: BotReplyText(text: item.text),
+                    ),
                     DsBotItemKind.event => BotEventLine(
                       text: chatEventText(item, roomName: rooms[item.roomId]),
                       icon: AppIcons.swap,
@@ -269,7 +293,10 @@ class _Thinking extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Padding(
     padding: const EdgeInsets.symmetric(vertical: 6),
-    child: SizedBox(height: 14, child: TypingIndicator(color: DshColors.of(context).textTertiary)),
+    child: Align(
+      alignment: AlignmentDirectional.centerStart,
+      child: TypingIndicator(color: DshColors.of(context).textTertiary),
+    ),
   );
 }
 
@@ -360,6 +387,52 @@ class _OwnApprovalsState extends ConsumerState<_OwnApprovals> {
             ),
           ),
       ],
+    );
+  }
+}
+
+/// A reply's dsh-ui cards, answered here as in a chat: whether one still can be comes from
+/// what followed it in this Bot's transcript.
+class _WithCards extends StatelessWidget {
+  const _WithCards({
+    required this.chat,
+    required this.item,
+    required this.sessionId,
+    required this.running,
+    required this.onReply,
+    required this.child,
+  });
+
+  final BotChatState chat;
+  final DsBotItem item;
+  final String sessionId;
+  final bool running;
+  final DshUiSend? onReply;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final index = chat.items.indexOf(item);
+    final state = index < 0 || (!item.text.contains('dsh-ui') && !item.text.contains('{'))
+        ? DshUiState.expired
+        : dshUiStateAfter(
+            [
+              for (final later in chat.items.skip(index + 1))
+                if (later.kind == DsBotItemKind.user)
+                  (user: true, text: later.text)
+                else if (later.kind == DsBotItemKind.bot)
+                  (user: false, text: later.text),
+            ],
+            running: running,
+            pending: [for (final p in chat.pending) p.text],
+          );
+    return DshUiScope(
+      sessionId: sessionId,
+      messageId: item.id ?? '',
+      state: state,
+      onReply: onReply,
+      onAskResend: onReply,
+      child: child,
     );
   }
 }

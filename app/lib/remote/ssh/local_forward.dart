@@ -20,6 +20,7 @@ class LocalForwarder {
   final TunnelOpener _open;
   final Set<_Pair> _pairs = {};
   final Set<Socket> _pending = {};
+  final _done = Completer<void>();
   bool _closed = false;
 
   static Future<LocalForwarder> bind(TunnelOpener open) async {
@@ -30,6 +31,7 @@ class LocalForwarder {
   }
 
   int get port => _server.port;
+  Future<void> get done => _done.future;
 
   /// Number of live socket ↔ channel pairs.
   int get activeConnections => _pairs.length;
@@ -73,10 +75,11 @@ class LocalForwarder {
   }
 
   Future<void> close() async {
-    if (_closed) return;
+    if (_closed) return done;
     _closed = true;
     dropConnections();
     await _server.close();
+    _done.complete();
   }
 }
 

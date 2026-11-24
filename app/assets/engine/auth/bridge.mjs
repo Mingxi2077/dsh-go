@@ -40,6 +40,8 @@ export const PROVIDERS = Object.freeze({
   }),
 })
 
+const SIWC_PROVIDER = 'openai-siwc'
+
 /** Owner scope of pi-ai's credential records (`credentialKey('llm-pi-ai', id)`). */
 const RECORD_SCOPE = 'llm-pi-ai'
 /** Settings namespace (loader entry id) of the llm-pi-ai adapter in the base bundle. */
@@ -237,6 +239,10 @@ export class AuthBridge {
   #ttlMs
   #probePort
   #settingsNs
+  #fetch
+  #siwc
+  #usageFlight = new Map()
+  #usageLast = new Map()
   #attempts = new Map()
   #liveByProvider = new Map()
   /** Route and grant changes run one at a time, so a repair cannot interleave with a sign-out. */
@@ -250,6 +256,8 @@ export class AuthBridge {
     ttlMs = ATTEMPT_TTL_MS,
     probePort = portIsFree,
     settingsNs = SETTINGS_NS,
+    fetch = globalThis.fetch,
+    siwc = () => undefined,
   }) {
     this.#get = get
     this.#log = log
@@ -258,11 +266,117 @@ export class AuthBridge {
     this.#ttlMs = ttlMs
     this.#probePort = probePort
     this.#settingsNs = settingsNs
+    this.#fetch = fetch
+    this.#siwc = siwc
   }
 
   // ── Remote methods ──────────────────────────────────────────────────────
 
-  /** `appAuth/list`: both subscriptions, signed in or not. */
+  /**
+   * Both usage endpoints are undocumented and can change or reject access.
+   * Anthropic restricts third-party use of Claude OAuth; availability here is
+   * not authorization or a guarantee of compliance with its terms. Users must
+   * check their own authorization. No login changes, impersonation, token refresh
+   * or credential writes are performed by this query.
+   */
+  async usage(provider) {
+    const spec = this.#spec(provider)
+    if (spec.siwc) return { provider, status: 'unsupported', windows: [] }
+    const result = (status, reason) => ({ provider, status, windows: [], ...(reason ? { reason } : {}) })
+    try {
+      const credentials = this.#get('credentials')
+      if (!credentials) return result('unavailable', 'invalid_response')
+      const record = await credentials.readRecord(recordKeyFor(provider))
+      if (!record || record.kind !== 'grant') return result('not_signed_in')
+      const payload = record.payload
+      if (!isObject(payload) || typeof payload.access !== 'string' || !payload.access ||
+          typeof payload.expires !== 'number' || !Number.isFinite(payload.expires)) return result('unavailable', 'invalid_response')
+      if (payload.expires <= this.#now()) return result('unavailable', 'expired')
+      const access = payload.access
+      const existing = this.#usageFlight.get(provider)
+      if (existing?.access === access) return await existing.promise
+      if (existing || this.#now() - (this.#usageLast.get(provider) ?? -Infinity) < 10000) return result('unavailable', 'rate_limited')
+      const promise = this.#queryUsage(provider, access, credentials, result)
+      const flight = { access, promise }
+      this.#usageFlight.set(provider, flight)
+      try { return await promise } finally {
+        if (this.#usageFlight.get(provider) === flight) this.#usageFlight.delete(provider)
+      }
+    } catch {
+      return result('unavailable', 'invalid_response')
+    }
+  }
+
+  async #queryUsage(provider, access, credentials, result) {
+    try {
+      const headers = { Authorization: `Bearer ${access}`, Accept: 'application/json' }
+      const url = provider === 'anthropic'
+        ? 'https://api.anthropic.com/api/oauth/usage'
+        : 'https://chatgpt.com/backend-api/wham/usage'
+      if (provider === 'anthropic') headers['anthropic-beta'] = 'oauth-2025-04-20'
+      else {
+        const id = jwtClaims(access)?.['https://api.openai.com/auth']?.chatgpt_account_id
+        if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(id)) return result('unavailable', 'invalid_response')
+        headers['ChatGPT-Account-Id'] = id
+      }
+      this.#usageLast.set(provider, this.#now())
+      const response = await this.#fetch(url, { method: 'GET', headers, redirect: 'error', signal: AbortSignal.timeout(10000) })
+      if (!response.ok) {
+        response.body?.cancel().catch(() => {})
+        const reason = response.status === 401 ? 'auth_required' : response.status === 403 ? 'permission_denied' : response.status === 429 ? 'rate_limited' : 'invalid_response'
+        return result('unavailable', reason)
+      }
+      if (!response.body) return result('unavailable', 'invalid_response')
+      const reader = response.body.getReader()
+      const chunks = []
+      let size = 0
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          size += value.byteLength
+          if (size > 65536) { await reader.cancel(); return result('unavailable', 'invalid_response') }
+          chunks.push(value)
+        }
+      } finally { reader.releaseLock() }
+      let data
+      try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { return result('unavailable', 'invalid_response') }
+      if (!isObject(data)) return result('unavailable', 'invalid_response')
+      const latest = await credentials.readRecord(recordKeyFor(provider))
+      if (latest?.kind !== 'grant' || latest.payload?.access !== access) return result('unavailable', 'invalid_response')
+      const windows = []
+      const add = (id, window, percent, reset) => {
+        if (!isObject(window) || typeof percent !== 'number' || !Number.isFinite(percent) || percent < 0 || percent > 100) return
+        const timestamp = typeof reset === 'number' ? reset * 1000 : typeof reset === 'string' ? Date.parse(reset) : NaN
+        const date = new Date(timestamp)
+        windows.push({ id, usedPercent: percent, resetAt: Number.isFinite(date.getTime()) ? date.toISOString() : null })
+      }
+      if (provider === 'anthropic') {
+        for (const id of ['five_hour', 'seven_day', 'seven_day_sonnet', 'seven_day_opus']) {
+          const window = data[id]
+          add(id, window, window?.utilization, window?.resets_at)
+        }
+      } else {
+        for (const id of ['primary', 'secondary']) {
+          const window = data.rate_limit?.[`${id}_window`]
+          const before = windows.length
+          add(id, window, window?.used_percent, window?.reset_at)
+          if (windows.length > before && Number.isSafeInteger(window.limit_window_seconds) && window.limit_window_seconds > 0) {
+            windows[windows.length - 1].windowSeconds = window.limit_window_seconds
+          }
+        }
+      }
+      if (!windows.length) return result('unavailable', 'invalid_response')
+      const view = { provider, status: 'ok', windows }
+      if (provider === 'openai-codex' && typeof data.plan_type === 'string' && /^[a-zA-Z0-9_-]{1,40}$/.test(data.plan_type)) view.plan = data.plan_type
+      return view
+    } catch {
+      // Never expose upstream errors or credentials.
+      return result('unavailable', 'network')
+    }
+  }
+
+  /** `appAuth/list`: available subscription channels, signed in or not. */
   async list() {
     const credentials = this.#get('credentials')
     const providers = []
@@ -290,12 +404,31 @@ export class AuthBridge {
       }
       providers.push(entry)
     }
+    const siwc = this.#siwc()
+    if (siwc) {
+      const status = await siwc.oauth.status().catch((error) => ({
+        signedIn: false,
+        signOutPending: error?.code === 'siwc_store_failed',
+      }))
+      const account = status.account?.email
+      providers.push({
+        id: SIWC_PROVIDER,
+        signedIn: status.signedIn,
+        planEnabled: status.planEnabled === true,
+        ...(account ? { account } : {}),
+        ...(status.reconnectAvailable === true ? { reconnectAvailable: true } : {}),
+        ...(status.signOutPending === true ? { signOutPending: true } : {}),
+      })
+    }
     return { providers }
   }
 
   /** `appAuth/begin`: starts a sign-in and returns its id at once; progress is polled. */
-  async begin(provider) {
+  async begin(provider, newAccount) {
     const spec = this.#spec(provider)
+    if (newAccount === true && !spec.siwc) {
+      throw new this.#RemoteError('app-auth/unknown-provider', '不支持这个登录方式', {})
+    }
     this.#prune()
     // Tapping "sign in" again replaces the attempt in flight (DSH runs one per key).
     const previous = this.#liveByProvider.get(provider)
@@ -312,7 +445,7 @@ export class AuthBridge {
       this.#abort(attempt)
     }, this.#ttlMs)
     attempt.timer.unref?.()
-    attempt.done = this.#run(attempt, spec, previous !== undefined)
+    attempt.done = this.#run(attempt, spec, previous !== undefined, newAccount === true)
     return { attemptId: attempt.id }
   }
 
@@ -352,12 +485,26 @@ export class AuthBridge {
 
   /** `appAuth/signOut`: removes the route (when the bridge owns it) and deletes the grant. */
   async signOut(provider) {
-    this.#spec(provider)
+    const spec = this.#spec(provider)
     const live = this.#liveByProvider.get(provider)
     if (live !== undefined) {
       live.cancelRequested = true
       this.#abort(live)
-      await settleWithin(live.done, 5000)
+      if (!spec.siwc) await settleWithin(live.done, 5000)
+    }
+    if (spec.siwc) {
+      // Block new token requests and stop existing streams before waiting on remote revocation.
+      const signOut = spec.siwc.oauth.signOut()
+      spec.siwc.invalidate()
+      try {
+        await signOut
+      } catch (error) {
+        if (error?.code === 'siwc_revocation_unconfirmed') {
+          throw new this.#RemoteError('app-auth/revocation-unconfirmed', '已退出本机。请在 ChatGPT 设置中检查应用授权', {})
+        }
+        throw new this.#RemoteError('app-auth/sign-out-failed', ERRORS.signOut, {})
+      }
+      return {}
     }
     try {
       await this.#serialized(async () => {
@@ -379,6 +526,12 @@ export class AuthBridge {
     return {}
   }
 
+  /** A detached LLM owner no longer accepts an uncommitted OpenAI sign-in. */
+  withdrawOpenAiAttempt() {
+    const attempt = this.#liveByProvider.get(SIWC_PROVIDER)
+    if (attempt) this.cancel(attempt.id)
+  }
+
   /** Withdraws every attempt (plugin unload). */
   dispose() {
     for (const attempt of this.#attempts.values()) {
@@ -390,8 +543,9 @@ export class AuthBridge {
 
   // ── one attempt ─────────────────────────────────────────────────────────
 
-  async #run(attempt, spec, replaced) {
+  async #run(attempt, spec, replaced, newAccount) {
     const { provider } = attempt
+    if (spec.siwc) return this.#runSiwc(attempt, spec.siwc, newAccount)
     const key = recordKeyFor(provider)
     try {
       const authorization = this.#get('authorization')
@@ -433,6 +587,24 @@ export class AuthBridge {
         this.#log(`${provider}: sign-in failed: ${redact(causes(error).map((e) => `${e?.name ?? ''}${e?.code ? `[${e.code}]` : ''}: ${e?.message ?? e}`).join(' <- '))}`)
         this.#finish(attempt, 'failed', describeFailure(error))
       }
+    }
+  }
+
+  async #runSiwc(attempt, siwc, newAccount) {
+    try {
+      await siwc.oauth.signIn({
+        newAccount,
+        signal: attempt.controller.signal,
+        notify: (url) => this.#onNotice(attempt, { url }),
+      })
+      siwc.invalidate()
+      // A returned authorization has already committed. Late cancellation did not undo it.
+      this.#finish(attempt, 'done')
+    } catch (error) {
+      if (attempt.controller.signal.aborted) this.#finishWithdrawn(attempt)
+      else this.#finish(attempt, 'failed', error?.code === 'siwc_access_denied' ? ERRORS.denied
+        : error?.code === 'siwc_network' ? ERRORS.network
+          : error?.code === 'siwc_sign_out_incomplete' ? ERRORS.signOut : ERRORS.generic)
     }
   }
 
@@ -531,6 +703,10 @@ export class AuthBridge {
   }
 
   #spec(provider) {
+    if (provider === SIWC_PROVIDER) {
+      const siwc = this.#siwc()
+      if (siwc) return { siwc }
+    }
     const spec = typeof provider === 'string' && Object.hasOwn(PROVIDERS, provider) ? PROVIDERS[provider] : undefined
     if (spec === undefined) throw new this.#RemoteError('app-auth/unknown-provider', '不支持这个登录方式', {})
     return spec

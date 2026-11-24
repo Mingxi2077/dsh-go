@@ -1,14 +1,17 @@
 import 'dart:async';
 
 import 'package:dsh_client/dsh_client.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../browser/browser_workspace.dart';
+import 'artifact_files.dart' show imageSnapshotHost;
+import 'chat_state.dart' show chatProvider;
 import 'composer_quote.dart';
 import 'connection_state.dart';
 import 'draft_store.dart';
 import 'drawer_view_state.dart';
 import 'hosts_state.dart';
+import 'image_snapshots.dart';
 import 'read_list_cache.dart';
 import 'read_list_identity.dart';
 import 'sessions_state.dart';
@@ -30,47 +33,52 @@ class _HostSessionDeletion implements SessionDeletionBackend {
 
 final sessionDeletionBackendProvider = Provider<SessionDeletionBackend>((ref) => const _HostSessionDeletion());
 
-final sessionDeletionAvailableProvider = FutureProvider.autoDispose<bool>((ref) async {
+/// What this App knows about the Host's permanent-deletion capability.
+///
+/// [unknown] is a real answer and is not a refusal: the App may simply not have
+/// a live connection yet, or the mux may not have a ready generation. Only a
+/// Host that answered is [supported] or [unsupported]; the UI must never turn
+/// "not asked yet" into "this host does not support it".
+enum SessionDeletionSupport { unknown, supported, unsupported }
+
+final sessionDeletionAvailableProvider = FutureProvider.autoDispose<SessionDeletionSupport>((ref) async {
   final connection = ref.watch(readListLiveConnectionProvider);
-  if (connection == null || connection.client.mux.generation == null) return false;
+  if (connection == null) return SessionDeletionSupport.unknown;
+  // A new ready generation may answer differently (reconnect, Host restart).
+  // This listener is registered before the readiness check on purpose: the
+  // "not ready yet" answer below must be re-probed as soon as the mux is up,
+  // even though the connection object itself does not change.
   final ready = connection.client.mux.generations.listen((_) => ref.invalidateSelf());
   ref.onDispose(() => unawaited(ready.cancel()));
-  return ref.watch(sessionDeletionBackendProvider).supported(connection.client);
+  if (connection.client.mux.generation == null) return SessionDeletionSupport.unknown;
+  final backend = ref.watch(sessionDeletionBackendProvider);
+  final supported = await backend.supported(connection.client);
+  return supported ? SessionDeletionSupport.supported : SessionDeletionSupport.unsupported;
 });
 
-/// Authority captured before an action sheet/confirmation. Listeners remember
-/// *any* departure, so A -> B -> A cannot revive an old deletion confirmation.
+/// Consent captured before an action sheet/confirmation, re-checked at every
+/// destructive step.
+///
+/// It survives a mux reconnect: deleting is one HTTP request, not an operation
+/// on the event stream, so a network blip must not turn into "host changed".
+/// A real departure still retires it for good, so A -> B -> A cannot revive an
+/// old confirmation: a host switch or a replaced connection is remembered.
 class SessionDeletionOwner {
-  SessionDeletionOwner._(this.container, this.connection, this.host, this.generation, this.readyNumber);
+  SessionDeletionOwner._(this.container, this.connection, this.host);
 
   static SessionDeletionOwner? capture(ProviderContainer container) {
     final connection = container.read(readListLiveConnectionProvider);
-    final generation = connection?.client.mux.generation;
-    if (connection == null || generation == null) return null;
-    final owner = SessionDeletionOwner._(
-      container,
-      connection,
-      container.read(activeHostProvider),
-      generation,
-      connection.client.mux.lastReadyGenerationNumber,
-    );
+    if (connection == null) return null;
+    final owner = SessionDeletionOwner._(container, connection, container.read(activeHostProvider));
     final host = container.listen(activeHostProvider, (_, next) {
       if (next != owner.host) owner._retired = true;
-    });
-    final live = container.listen(readListLiveConnectionProvider, (_, next) {
-      if (!identical(next, connection)) owner._retired = true;
     });
     final active = container.listen(activeConnectionProvider, (_, next) {
       if (next.isLoading || next.hasError || !identical(next.value, connection)) owner._retired = true;
     });
-    final mux = connection.client.mux.states.listen((_) {
-      if (!identical(connection.client.mux.generation, generation)) owner._retired = true;
-    });
     owner._close = () {
       host.close();
-      live.close();
       active.close();
-      unawaited(mux.cancel());
     };
     return owner;
   }
@@ -78,8 +86,6 @@ class SessionDeletionOwner {
   final ProviderContainer container;
   final HostConnection connection;
   final HostRef host;
-  final MuxGeneration generation;
-  final int readyNumber;
   bool _retired = false;
   bool _closed = false;
   late final void Function() _close;
@@ -91,12 +97,7 @@ class SessionDeletionOwner {
       return !active.isLoading &&
           !active.hasError &&
           identical(active.value, connection) &&
-          container.read(activeHostProvider) == host &&
-          identical(container.read(readListLiveConnectionProvider), connection) &&
-          identical(connection.client.mux.generation, generation) &&
-          connection.client.mux.lastReadyGenerationNumber == readyNumber &&
-          !_retired &&
-          !_closed;
+          container.read(activeHostProvider) == host;
     } on StateError {
       return false;
     }
@@ -139,18 +140,14 @@ class SessionDeletionController extends Notifier<bool> {
     final backend = ref.read(sessionDeletionBackendProvider);
     final client = owner.connection.client;
     final identity = ref.read(readListIdentityProvider);
+    final snapshots = ref.read(imageSnapshotsProvider);
+    final snapshotHost = imageSnapshotHost(owner.connection);
     state = true;
     try {
       if (!owned()) return const SessionDeletionResult(retired: true);
-      // Recheck after confirmation; support is not inferred from an old read.
-      final bool supported;
-      try {
-        supported = await backend.supported(client);
-      } catch (error) {
-        return SessionDeletionResult(failures: {for (final id in ids) id: _failureCode(error)}, retired: !owned());
-      }
-      if (!owned()) return const SessionDeletionResult(retired: true);
-      if (!supported) return SessionDeletionResult(failures: {for (final id in ids) id: 'unavailable'});
+      // No pre-flight capability call: the delete request itself answers
+      // `unavailable` on a Host without the route, and that is the only place
+      // that answer is needed. One intent, one request.
       for (final id in ids) {
         if (!owned()) break;
         final sessions = ref.read(sessionsProvider.notifier);
@@ -162,28 +159,26 @@ class SessionDeletionController extends Notifier<bool> {
         try {
           if (!owned()) break;
           await backend.delete(client, id);
+          // Disk cleanup must not delay an acknowledged deletion or the next
+          // item in the batch. It belongs to the captured Host, even if retired.
+          unawaited(
+            snapshots.removeSession(snapshotHost, id).catchError((Object error) {
+              debugPrint('Image snapshot cleanup failed: ${error.runtimeType}');
+            }),
+          );
+          // A late response belongs to its old Host, never to a new screen.
+          if (!owned()) break;
           deleted.add(id);
-          // Success still clears its captured Host's global scope after a
-          // departure. Only the current UI and further requests need ownership.
-          if (!ref.mounted) break;
           ref.read(readListCacheProvider).invalidateKind(ReadListKind.sessions, identity);
-          final hostKey = '${owner.host.kind.name}:${owner.host.id}';
-          final draftKey = draftStorageKey(hostKey: hostKey, sessionId: id);
+          final draftKey = draftStorageKey(hostKey: '${owner.host.kind.name}:${owner.host.id}', sessionId: id);
           ref.read(draftStoreProvider.notifier).forget(draftKey);
-          if (!ref.mounted) break;
+          if (!owned()) break;
           ref.read(composerQuoteProvider.notifier).clear(draftKey);
-          if (!ref.mounted) break;
-          final browserScope = BrowserScope(hostKey: hostKey, sessionId: id);
-          ref.read(browserReferenceInboxProvider.notifier).discard(browserScope);
-          if (!ref.mounted) break;
-          try {
-            await ref.read(browserWorkspaceProvider.notifier).clear(browserScope);
-          } on Object {
-            // The Host already confirmed deletion. Browser cleanup must not
-            // undo that result or prevent the remaining local cleanup.
-          }
           if (!owned()) break;
           sessions.confirmDeleted(id);
+          // "本对话都允许" keeps its controller (and the whole transcript)
+          // alive for good; a deleted session has nothing left to approve.
+          if (ref.exists(chatProvider(id))) ref.read(chatProvider(id).notifier).setAutoApprove(false);
           if (!owned()) break;
           if (ref.read(currentSessionProvider) == id) ref.read(currentSessionProvider.notifier).select(null);
           if (!owned()) break;

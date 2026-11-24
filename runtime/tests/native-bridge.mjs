@@ -143,11 +143,23 @@ const post = (path, body, headers = {}) => request("POST", path, { headers: { ..
 const invoke = (body, headers) => post("/dsh-go/v1/invoke", { v: 1, ...body }, headers);
 const contributions = async (q = CAPS, headers) => get(`/dsh-go/v1/contributions?${q}`, headers);
 
+section("bridge protocol capabilities");
+const bridgeCapabilities = await get("/dsh-go/v1/capabilities");
+check(bridgeCapabilities.status === 200 && bridgeCapabilities.json?.v === 1 && typeof bridgeCapabilities.json?.bridge === "string",
+  `capabilities -> ${bridgeCapabilities.status}, v=${bridgeCapabilities.json?.v}, bridge=${bridgeCapabilities.json?.bridge}`);
+check(["inventory", "native-ui", "native-stream", "native-media", "native-files"].every(name => bridgeCapabilities.json?.capabilities?.includes(name)),
+  "capabilities declare implemented native routes even without a plugin");
+const capabilitiesMethod = await post("/dsh-go/v1/capabilities", {});
+check(capabilitiesMethod.status === 405 && capabilitiesMethod.json?.error?.code === "method-not-allowed", "capabilities only accepts GET");
+const absentRoute = await get("/dsh-go/v1/unknown-route");
+check(absentRoute.status === 404 && absentRoute.json?.error?.code === "route-not-found", "unknown route has a distinct route-not-found code");
+
 if (EMPTY) {
   section("no plugin declares dshGo: nothing changes");
   const r = await contributions();
   check(r.status === 200 && Array.isArray(r.json?.plugins) && r.json.plugins.length === 0, `contributions -> ${r.status}, plugins ${JSON.stringify(r.json?.plugins)}`);
   check(r.json?.limits?.viewBytes === 32768 && r.json?.bridge, `limits and bridge ${r.json?.bridge} present`);
+  check(r.json?.bridge === bridgeCapabilities.json?.bridge, "capabilities and contributions use the same implementation version");
   const v = await get(`/dsh-go/v1/views/${USAGE}/usage?${CAPS}`);
   check(v.status === 404 && v.json?.error?.code === "not-found", `view of a missing plugin -> ${v.status} ${v.json?.error?.code}`);
   const ws = await wsConnect(C);
@@ -163,7 +175,7 @@ if (EMPTY) {
 
 // ------------------------------------------------------------------ guard
 section("guard: every native route needs the cookie");
-for (const [method, path] of [["GET", `/dsh-go/v1/contributions?${CAPS}`], ["GET", `/dsh-go/v1/views/${USAGE}/usage`], ["POST", "/dsh-go/v1/invoke"], ["GET", `/dsh-go/v1/assets/${STATIC}/img/dot.png`]]) {
+for (const [method, path] of [["GET", "/dsh-go/v1/capabilities"], ["GET", `/dsh-go/v1/contributions?${CAPS}`], ["GET", `/dsh-go/v1/views/${USAGE}/usage`], ["POST", "/dsh-go/v1/invoke"], ["GET", `/dsh-go/v1/assets/${STATIC}/img/dot.png`]]) {
   const anon = await request(method, path, method === "POST" ? { body: { v: 1 } } : {});
   check(anon.status === 401, `${method} ${path.split("?")[0]} without cookie -> ${anon.status}`);
   const evil = await request(method, path, { headers: { ...C, origin: "http://evil.example" }, ...(method === "POST" ? { body: { v: 1 } } : {}) });
@@ -179,6 +191,7 @@ section("contributions");
 await sleep(300);
 const c1 = await contributions();
 check(c1.status === 200 && c1.json?.v === 1 && typeof c1.json?.rev === "string", `GET contributions -> ${c1.status} rev=${c1.json?.rev} in ${c1.ms} ms`);
+check(c1.json?.bridge === bridgeCapabilities.json?.bridge, "capabilities and contributions use the same implementation version");
 check(c1.ms < 300, `local round trip ${c1.ms} ms < 300 ms`);
 const plugins = c1.json?.plugins ?? [];
 const pkgs = plugins.map((p) => p.pkg);
@@ -209,7 +222,7 @@ for (const want of ["unknown-field@/dshGo/future", "invalid-field@/dshGo/wants/1
   "invalid-field@/dshGo/contributes/composer.actions/2/id", "invalid-field@/dshGo/contributes/composer.actions/3/effect",
   "missing-field@/dshGo/contributes/message.actions/0/label", "invalid-field@/dshGo/contributes/composer.strip/0/panel",
   "invalid-field@/dshGo/contributes/panels/0/placement/1", "view-file@/dshGo/contributes/panels/1/view", "unknown-surface@/dshGo/contributes/pets",
-  "too-long@/dshGo/title", "no-handler@/dshGo/contributes/composer.actions/1"]) {
+  "too-long@/dshGo/title", "no-handler@/dshGo/contributes/composer.actions/3"]) {
   check(scodes.includes(want), `static issue ${want}`);
 }
 check(JSON.stringify(stat?.contributes["composer.actions"].map((a) => [a.id, a.ready])) === '[["hello",true],["weird",false]]', "static actions: hello ready (effect), weird not ready");
@@ -305,14 +318,40 @@ const lastRev = p2.rev;
 ws.close();
 await ws.closed;
 await get(`/native-fixture/emit?scope=${encodeURIComponent('{"sessionId":"s1"}')}&n=2`);
+// The fixture's emit is coalesced asynchronously. Observe the new revision
+// before reconnecting, or a fast runner can legitimately receive sync for the
+// old revision while the timer has not published the requested count yet.
+let published;
+const publishDeadline = Date.now() + 2000;
+do {
+  published = await get(`/dsh-go/v1/views/${USAGE}/usage?${CAPS.replace("zh-CN", "en")}&sessionId=s1`);
+  if (published.status === 200 && published.json?.data?.count === 8 && published.json.rev !== lastRev) break;
+  await sleep(20);
+} while (Date.now() < publishDeadline);
+check(published.status === 200 && published.json?.data?.count === 8 && published.json.rev !== lastRev,
+  "fixture publish did not reach the view before reconnect");
 const ws2 = await wsConnect(C);
 ws2.send({ t: "hello", v: [1], locale: "en" });
 await ws2.next((m) => m.t === "welcome");
 ws2.send({ t: "sub", sub: "s1", pkg: USAGE, id: "usage", scope: { sessionId: "s1" }, rev: lastRev });
-const catchup = await ws2.next((m) => m.sub === "s1");
-check(catchup?.t === "data" && catchup.data?.count === 8 && catchup.rev !== lastRev, `reconnect with old rev -> full data count=${catchup?.data?.count}`);
+let catchup = await ws2.next((m) => m.sub === "s1");
+// The emit HTTP response is not a feed publication barrier. If the 4 Hz flush
+// is still pending, attach first confirms the old published rev, then patches it.
+if (catchup?.t === "sync") {
+  check(catchup.rev === lastRev, `pending flush -> sync at requested rev ${catchup.rev}`);
+  const update = await ws2.next((m) => m.sub === "s1");
+  check(update?.t === "patch" && update.base === lastRev && typeof update.rev === "string" && update.rev !== lastRev
+    && JSON.stringify(update.merge) === '{"count":8,"nested":{"b":8}}',
+    `pending flush -> exact patch from old rev: ${JSON.stringify(update)}`);
+  // Preserve the stale-rev/full-snapshot assertion after observing publication.
+  ws2.send({ t: "sub", sub: "s1", pkg: USAGE, id: "usage", scope: { sessionId: "s1" }, rev: lastRev });
+  catchup = await ws2.next((m) => m.sub === "s1");
+  check(catchup?.rev === update?.rev, "stale-rev snapshot uses the published patch rev");
+}
+check(catchup?.t === "data" && catchup.data?.count === 8 && typeof catchup.rev === "string" && catchup.rev !== lastRev, `reconnect with old rev -> full data count=${catchup?.data?.count}`);
 ws2.send({ t: "sub", sub: "s1", pkg: USAGE, id: "usage", scope: { sessionId: "s1" }, rev: catchup.rev });
-check((await ws2.next((m) => m.sub === "s1"))?.t === "sync", "re-sub with current rev -> sync");
+const currentSync = await ws2.next((m) => m.sub === "s1");
+check(currentSync?.t === "sync" && currentSync.rev === catchup.rev, "re-sub with current rev -> sync");
 
 // protocol errors, idle, limits
 const bad1 = await wsConnect(C);

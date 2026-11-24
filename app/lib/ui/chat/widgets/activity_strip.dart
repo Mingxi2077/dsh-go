@@ -4,6 +4,7 @@
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -97,7 +98,7 @@ class _ActivityStripSlotState extends ConsumerState<ActivityStripSlot> with Sing
   @override
   Widget build(BuildContext context) {
     final sessionId = widget.sessionId;
-    final activity = ref.watch(chatProvider(sessionId).select(runActivityOf));
+    final activity = ref.watch(runActivityProvider(sessionId));
     final pulse = ref.watch(runPulseProvider(sessionId));
     return ListenableBuilder(
       listenable: pulse,
@@ -218,6 +219,8 @@ class _ActivityStripState extends State<ActivityStrip> {
       child: GlassSurface(
         tier: GlassTier.chrome,
         stadium: true,
+        // One backdrop sample with the deck's other bars (chat page).
+        grouped: true,
         onTap: widget.onTap,
         onLongPress: _showStats,
         child: ConstrainedBox(
@@ -242,7 +245,10 @@ class _ActivityStripState extends State<ActivityStrip> {
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              WhaleTail(level: widget.speedLevel, color: whale, height: 20),
+                              // 自己一层:鲸尾每帧在动,不连累玻璃里的其余内容重绘。
+                              RepaintBoundary(
+                                child: WhaleTail(level: widget.speedLevel, color: whale, height: 20),
+                              ),
                               const SizedBox(width: 6),
                             ],
                           ),
@@ -295,6 +301,10 @@ class _Line extends StatelessWidget {
   final Duration? elapsed;
   final String? stats;
 
+  // Leave the transition unkeyed so AnimatedSwitcher assigns each fade its own key.
+  // The same activity can return while an older copy is still fading out.
+  static Widget _fade(Widget child, Animation<double> animation) => FadeTransition(opacity: animation, child: child);
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -345,6 +355,9 @@ class _Line extends StatelessWidget {
         Expanded(
           child: AnimatedSwitcher(
             duration: AppMotion.of(context, AppMotion.quick),
+            transitionBuilder: !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS
+                ? _fade
+                : AnimatedSwitcher.defaultTransitionBuilder,
             layoutBuilder: (current, previous) =>
                 Stack(alignment: Alignment.centerLeft, children: [...previous, ?current]),
             child: Row(

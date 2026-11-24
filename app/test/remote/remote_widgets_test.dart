@@ -4,6 +4,8 @@
 import 'dart:convert';
 import 'dart:ui' show Tristate;
 
+import 'package:dsh_app/state/android_features.dart';
+import 'package:dsh_app/l10n/l10n.dart';
 import 'package:dsh_app/remote/secret_store.dart';
 import 'package:dsh_app/runtime/runtime_state.dart';
 import 'package:dsh_app/state/connection_state.dart';
@@ -103,10 +105,7 @@ void main() {
     for (final provider in ['GitHub', '知乎', 'Google']) {
       expect(find.widgetWithText(FilledButton, '使用 $provider 登录'), findsOneWidget);
     }
-    expect(
-      tester.getTopLeft(find.text('使用 GitHub 登录')).dy,
-      lessThan(tester.getTopLeft(find.text('使用 知乎 登录')).dy),
-    );
+    expect(tester.getTopLeft(find.text('使用 GitHub 登录')).dy, lessThan(tester.getTopLeft(find.text('使用 知乎 登录')).dy));
     await tester.tap(find.text('使用 GitHub 登录'));
     await tester.pump();
     expect(relay.loginProviderIds, ['github']);
@@ -143,6 +142,46 @@ void main() {
     final second = tester.getRect(find.byKey(const ValueKey('remote-status-second')));
     expect(first.right, closeTo(second.right, 0.1));
     semantics.dispose();
+  });
+
+  testWidgets('the signed-in account sits on top, on its own, above its hosts', (tester) async {
+    await pump(tester, const RemoteScreen());
+    await frames(tester, 3);
+    final account = find.byKey(const ValueKey('remote-account'));
+    expect(account, findsOneWidget);
+    expect(find.descendant(of: account, matching: find.text('退出')), findsOneWidget);
+    expect(find.descendant(of: account, matching: find.text('家里的 Mac')), findsNothing);
+    expect(tester.getRect(account).bottom, lessThan(tester.getTopLeft(find.text('家里的 Mac')).dy));
+    expect(find.byTooltip('刷新主机列表'), findsOneWidget, reason: 'refresh lives in the bar now');
+  });
+
+  testWidgets('an offline host is checked again when tapped, then used once it is online', (tester) async {
+    relay.hosts = [
+      const RelayHost(
+        id: 'nas',
+        name: '书房 NAS',
+        online: false,
+        fingerprint: 'A1B2 C3D4 E5F6',
+        trust: RelayTrust.unpinned,
+      ),
+    ];
+    await pump(tester, const RemoteScreen());
+    await frames(tester, 3);
+    await tester.tap(find.text('书房 NAS'));
+    await frames(tester);
+    expect(find.text(appL10n.remoteHostOfflineHint('书房 NAS')), findsOneWidget);
+    relay.hosts = [
+      const RelayHost(
+        id: 'nas',
+        name: '书房 NAS',
+        online: true,
+        fingerprint: 'A1B2 C3D4 E5F6',
+        trust: RelayTrust.unpinned,
+      ),
+    ];
+    await tester.tap(find.text('书房 NAS'));
+    await frames(tester);
+    expect(find.text('信任这台主机？'), findsOneWidget);
   });
 
   testWidgets('host switcher exposes the active row as selected', (tester) async {
@@ -232,6 +271,34 @@ void main() {
     await frames(tester);
     expect(find.textContaining('服务器地址无效'), findsOneWidget);
     expect(relay.passwordLogins, isEmpty);
+  });
+
+  group('where the password is kept', () {
+    final zh = lookupL10n(AppLocale.zhCN);
+    Future<void> form(WidgetTester tester, String os) async {
+      usePhoneSurface(tester);
+      tester.view.physicalSize = const Size(390 * 2, 2400 * 2);
+      await tester.pumpWidget(
+        goldenApp(
+          home: const SshHostFormPage(),
+          brightness: Brightness.light,
+          overrides: [...overrides(), operatingSystemProvider.overrideWithValue(os)],
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    testWidgets('on HarmonyOS names no Android', (tester) async {
+      await form(tester, 'ohos');
+      expect(find.text(zh.harmonyPasswordStorageHelp), findsOneWidget);
+      expect(find.textContaining('Android'), findsNothing);
+    });
+
+    testWidgets('on Android as ever', (tester) async {
+      await form(tester, 'android');
+      expect(find.text(zh.remotePasswordStorageHelp), findsOneWidget);
+    });
   });
 
   testWidgets('saving a new SSH host keeps the password out of preferences', (tester) async {

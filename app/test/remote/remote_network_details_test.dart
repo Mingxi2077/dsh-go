@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:dsh_app/state/android_features.dart';
 import 'package:dsh_app/l10n/l10n.dart';
 import 'package:dsh_app/remote/link_status.dart';
 import 'package:dsh_app/remote/secret_store.dart';
@@ -8,7 +9,7 @@ import 'package:dsh_app/state/connection_state.dart';
 import 'package:dsh_app/state/hosts_state.dart';
 import 'package:dsh_app/ui/remote/network_details_sheet.dart';
 import 'package:dsh_app/ui/remote/remote_screen.dart';
-import 'package:dsh_app/ui/settings/index/spots.dart';
+import 'package:dsh_app/ui/settings/settings_widgets.dart';
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -70,7 +71,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
   }
 
-  Future<void> pump(WidgetTester tester, _InspectableLink link, {bool page = false}) async {
+  Future<void> pump(WidgetTester tester, _InspectableLink link, {bool page = false, String? os}) async {
     usePhoneSurface(tester);
     addTearDown(link.changes.close);
     await tester.pumpWidget(
@@ -82,6 +83,8 @@ void main() {
           networkKicksProvider.overrideWithValue(const Stream.empty()),
           relayBackendProvider.overrideWithValue(FakeRelayBackend(user: sampleRelayUser)),
           hostLinkProvider.overrideWith((ref, host) => link),
+          hostNameProvider.overrideWith((ref, host) => 'Workstation'),
+          if (os != null) operatingSystemProvider.overrideWithValue(os),
           localRuntimeProvider.overrideWith(
             () => FakeRuntime(const LocalRuntimeState(loaded: true, status: runningStatus)),
           ),
@@ -96,7 +99,23 @@ void main() {
     expect(find.byKey(const ValueKey('remote-direct')), findsNothing);
     expect(SettingsIndex.spot('remote-direct'), isNull);
     expect(SettingsIndex.spot('remote-auto-connect'), isNotNull);
-    expect(find.byKey(const ValueKey('remote-auto-connect')), findsOneWidget);
+    final startup = find.byKey(const ValueKey('remote-auto-connect'));
+    await tester.scrollUntilVisible(startup, 300);
+    expect(startup, findsOneWidget);
+  });
+
+  testWidgets('compact history is an opt-in searchable preference with delayed application explained', (tester) async {
+    await pump(tester, _InspectableLink(HostLinkStatus.idle), page: true);
+    final compact = find.byKey(const ValueKey('remote-compact-history'));
+    await tester.scrollUntilVisible(compact, 300);
+    await tester.pump();
+    expect(SettingsIndex.spot('remote-compact-history'), isNotNull);
+    expect(tester.widget<SettingsSwitchTile>(compact).value, isFalse);
+    expect(find.textContaining('切换主机或重启 App 后生效'), findsOneWidget);
+    await tester.tap(compact);
+    await frames(tester);
+    expect(tester.widget<SettingsSwitchTile>(compact).value, isTrue);
+    expect((await SharedPreferences.getInstance()).getBool(RemoteCompactHistoryController.prefsKey), isTrue);
   });
 
   for (final path in [RelayPath.lan, RelayPath.p2p, RelayPath.turn, RelayPath.relay]) {
@@ -108,7 +127,10 @@ void main() {
       await tester.ensureVisible(entry);
       await tester.tap(entry);
       await frames(tester);
-      expect(find.byType(RemoteNetworkDetailsSheet), findsOneWidget);
+      final sheet = find.byType(RemoteNetworkDetailsSheet);
+      expect(sheet, findsOneWidget);
+      expect(find.descendant(of: sheet, matching: find.text('Workstation')), findsOneWidget);
+      expect(find.descendant(of: sheet, matching: find.text('DSH Remote')), findsOneWidget);
       expect(find.text(path.label), findsWidgets);
       expect(find.text('未测量'), findsNWidgets(2));
       expect(link.inspections, 0, reason: 'opening details does not continuously probe the connection');
@@ -145,6 +167,49 @@ void main() {
     expect(link.status.isConnected, isTrue);
   });
 
+  testWidgets('selected IPv6 and ICE protocol are visible without candidate addresses', (tester) async {
+    final link = _InspectableLink(
+      const HostLinkStatus(
+        HostLinkPhase.connected,
+        path: RelayPath.p2p,
+        network: RemoteNetworkStatus(
+          path: RelayPath.p2p,
+          localIpVersion: NetworkIpVersion.ipv6,
+          remoteIpVersion: NetworkIpVersion.ipv6,
+          iceProtocol: NetworkIceProtocol.udp,
+        ),
+      ),
+    );
+    await pump(tester, link);
+    expect(find.text('IPv6'), findsNWidgets(2));
+    expect(find.text('UDP'), findsOneWidget);
+    expect(find.text('手机 ICE IP 版本'), findsOneWidget);
+    expect(find.text('主机 ICE IP 版本'), findsOneWidget);
+    expect(link.inspections, 0);
+    link.emit(const HostLinkStatus(HostLinkPhase.reconnecting));
+    await frames(tester);
+    expect(find.text('IPv6'), findsNothing);
+    expect(find.text('UDP'), findsNothing);
+  });
+
+  testWidgets('Relay never borrows IP metadata from a previous ICE path', (tester) async {
+    final link = _InspectableLink(
+      const HostLinkStatus(
+        HostLinkPhase.connected,
+        path: RelayPath.relay,
+        network: RemoteNetworkStatus(
+          path: RelayPath.relay,
+          localIpVersion: NetworkIpVersion.ipv6,
+          iceProtocol: NetworkIceProtocol.udp,
+        ),
+      ),
+    );
+    await pump(tester, link);
+    expect(find.text('IPv6'), findsNothing);
+    expect(find.text('UDP'), findsNothing);
+    expect(find.text('手机 ICE IP 版本'), findsNothing);
+  });
+
   testWidgets('unknown fallback and measurement failure never expose technical data', (tester) async {
     final link = _InspectableLink(
       const HostLinkStatus(
@@ -165,6 +230,31 @@ void main() {
     expect(link.status.isConnected, isTrue);
   });
 
+  group('without a direct path to try (HarmonyOS)', () {
+    final zh = lookupL10n(AppLocale.zhCN);
+    _InspectableLink relayOnly() => _InspectableLink(
+      const HostLinkStatus(
+        HostLinkPhase.connected,
+        path: RelayPath.relay,
+        network: RemoteNetworkStatus(path: RelayPath.relay, fallbackReason: 'webrtcUnavailable'),
+      ),
+    );
+
+    testWidgets('on HarmonyOS: the relay is simply how this version connects', (tester) async {
+      await pump(tester, relayOnly(), os: 'ohos');
+      expect(find.textContaining(zh.harmonyNetworkRelayOnly), findsOneWidget);
+      expect(find.text(zh.harmonyNetworkFallbackRelayOnly), findsOneWidget);
+      expect(find.textContaining('LAN → P2P'), findsNothing);
+      expect(find.text(zh.remoteNetworkFallbackWebrtcUnavailable), findsNothing);
+    });
+
+    testWidgets('on Android: the order it tries, and the device at fault', (tester) async {
+      await pump(tester, relayOnly(), os: 'android');
+      expect(find.textContaining(zh.remoteNetworkAutomatic), findsOneWidget);
+      expect(find.text(zh.remoteNetworkFallbackWebrtcUnavailable), findsOneWidget);
+    });
+  });
+
   testWidgets('fallback codes are explained in the current language', (tester) async {
     final link = _InspectableLink(
       const HostLinkStatus(
@@ -183,7 +273,10 @@ void main() {
       goldenApp(
         home: const Scaffold(body: RemoteNetworkDetailsSheet(host: _host)),
         brightness: Brightness.light,
-        overrides: [hostLinkProvider.overrideWith((ref, host) => link)],
+        overrides: [
+          hostLinkProvider.overrideWith((ref, host) => link),
+          hostNameProvider.overrideWith((ref, host) => 'Workstation'),
+        ],
       ),
     );
     await frames(tester);

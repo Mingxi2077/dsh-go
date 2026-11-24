@@ -80,6 +80,7 @@ Map<String, Object?> privilegedStatus({
   bool adbConnected = false,
   bool androidOk = true,
   bool enabled = true,
+  Map<String, Object?>? keep,
 }) {
   final base = phoneStatus(
     enabled: enabled,
@@ -117,6 +118,7 @@ Map<String, Object?> privilegedStatus({
         'recommendedMode': recommended,
         'grantPath': grantPath,
         'rootSelected': rootSelected ?? mode == 'root',
+        'keep': ?keep,
       },
     },
   };
@@ -178,8 +180,15 @@ class FakePhoneNative {
   List<Map<String, Object?>> log;
   Map<String, Object?> screen = {'ok': true, 'text': sampleScreenText};
 
+  /// Optional barriers for settings writes and their subsequent real channel readback.
+  Future<Map<String, Object?>?> Function()? onStatus;
+  Future<Map<String, Object?>> Function(Map<String, Object?>)? onSetBackgroundParallelLimit;
+
   /// Reply of `setEnabled` / `setPolicies`.
   bool accept = true;
+
+  Future<Map<String, Object?>?> Function()? onGetPolicies;
+  Future<bool> Function(Map<String, Object?>)? onSetPolicies;
 
   /// Reply of `finishTask`; null: closed, and back in the app exactly when asked to reopen.
   Map<String, Object?>? finish;
@@ -190,11 +199,24 @@ class FakePhoneNative {
   /// Private engine-approval UI; production PhoneChannel still encodes/parses.
   Future<Map<String, Object?>> Function(Map<String, Object?>)? onPresentPrompt;
 
+  /// Gate cleanup's asynchronous native response, without rerunning a probe.
+  Future<bool> Function(String)? onAcknowledgeInterruption;
+  Future<bool> Function()? onRetryInterruption;
+
   /// The 悬浮条 settings as the native side keeps them.
   Map<String, Object?> overlay = {'idleOpacity': 0.7, 'autoCollapse': false};
 
+  /// Whether the phone has its own island (`systemIsland`): none by default.
+  Map<String, Object?> systemIsland = {'vendor': false, 'shows': false};
+
   /// Replies for `{ok, reason}` methods, by method name (default ok).
   final results = <String, Map<String, Object?>>{};
+
+  bool learn = true;
+  final skills = <String, Map<String, Object?>>{};
+  final drafts = <String, Map<String, Object?>>{};
+  final legacy = <String, Map<String, Object?>>{};
+  final archived = <String>{};
 
   final calls = <MethodCall>[];
   MockStreamHandlerEventSink? _sink;
@@ -224,7 +246,12 @@ class FakePhoneNative {
 
   void uninstall() {
     _messenger.setMockMethodCallHandler(phoneMethods, null);
-    _messenger.setMockStreamHandler(phoneEvents, null);
+    // A provider can outlive the fake by a frame at teardown and cancel its event stream
+    // then: leave a quiet handler rather than none (removePhoneNative removes it outright).
+    _messenger.setMockStreamHandler(
+      phoneEvents,
+      MockStreamHandler.inline(onListen: (_, _) {}, onCancel: (_) {}),
+    );
   }
 
   bool get listening => _sink != null;
@@ -235,21 +262,47 @@ class FakePhoneNative {
     _sink?.success(next);
   }
 
+  /// A domain event shares the native sink without replacing the latest status snapshot.
+  void pushSkill(Map<String, Object?> event) => _sink?.success(event);
+
   Map<String, Object?> get _background => (status['background'] as Map).cast<String, Object?>();
 
   Future<Object?> _handle(MethodCall call) async {
     calls.add(call);
     final args = call.arguments is Map ? (call.arguments as Map).cast<String, Object?>() : const <String, Object?>{};
+    if (call.method.startsWith('skills.')) return _skill(call.method, args);
     switch (call.method) {
       case 'status':
-        return status;
+        return onStatus?.call() ?? status;
       case 'setEnabled':
         if (accept) status = {...status, 'enabled': args['enabled']};
         return accept;
-      case 'openAccessibilitySettings' || 'openAppDetails' || 'stopTask':
+      case 'openAccessibilitySettings' || 'openAppDetails' || 'stopTask' || 'resumeTask' || 'retryTaskCleanup':
         return true;
+      case 'acknowledgeTaskInterruption':
+        return onAcknowledgeInterruption?.call(args['batchToken'] as String) ?? false;
+      case 'retryTaskInterruptionStorage':
+        return onRetryInterruption?.call() ?? false;
       case 'testScreen':
         return screen;
+      case 'setBackgroundViewport':
+        final viewportResult = results[call.method] ?? {'ok': true};
+        if (viewportResult['ok'] == true) {
+          status = {...status, 'background': {..._background, 'viewport': {'v': 1, 'preset': args['preset']}}};
+        }
+        return viewportResult;
+      case 'setBackgroundParallelLimit':
+        if (onSetBackgroundParallelLimit != null) return onSetBackgroundParallelLimit!(args);
+        final capacityResult = results[call.method] ?? {'ok': true};
+        if (capacityResult['ok'] == true) {
+          final old = (_background['parallelism'] as Map).cast<String, Object?>();
+          final limit = args['limit'] as int;
+          final current = old['effectiveLimit'] as int;
+          status = {...status, 'background': {..._background, 'parallelism': {
+            ...old, 'configuredLimit': limit, 'effectiveLimit': current > limit ? limit : current,
+          }}};
+        }
+        return capacityResult;
       case 'setBackgroundMode':
         final r = results[call.method] ?? {'ok': true};
         if (r['ok'] == true) {
@@ -279,8 +332,9 @@ class FakePhoneNative {
         }
         return result;
       case 'getPolicies':
-        return policies;
+        return onGetPolicies != null ? onGetPolicies!() : policies;
       case 'setPolicies':
+        if (onSetPolicies != null) return onSetPolicies!(args);
         // As natively: what isn't sent stays, inside `unlocks` too.
         if (accept) {
           final unlocks = args['unlocks'];
@@ -298,6 +352,10 @@ class FakePhoneNative {
       case 'setOverlayPrefs':
         overlay = {...overlay, ...args};
         return overlay;
+      case 'systemIsland':
+        return systemIsland;
+      case 'setPhoneThought':
+        return true;
       case 'finishTask':
         onFinish?.call();
         final reopen = args['reopen'] == true;
@@ -309,6 +367,42 @@ class FakePhoneNative {
     }
     throw MissingPluginException(call.method);
   }
+
+  Map<String, Object?> _skill(String method, Map<String, Object?> args) {
+    // Tests supply exact native mutation replies (including validated body, archive, and diff)
+    // without reproducing the native file format and state machine in the test double.
+    final result = results[method];
+    if (result?.containsKey('error') == true) return result!;
+    final name = args['name'] as String?;
+    final id = args['draftId'] as String?;
+    switch (method) {
+      case 'skills.list':
+        return result ?? {'learn': learn, 'skills': skills.values.toList(), 'drafts': drafts.values.toList(),
+          'legacy': legacy.values.toList(), 'archived': archived.toList()};
+      case 'skills.get':
+        return result ?? skills[name] ?? {'error': 'changed', 'detail': 'Unknown skill.'};
+      case 'skills.setLearn':
+        learn = (result?['learn'] ?? args['on']) as bool;
+        return {'learn': learn};
+      case 'skills.discard':
+        drafts.remove(id);
+        return {};
+      case 'skills.delete':
+        if (skills.remove(name) != null) archived.add(name!);
+        legacy.remove(name);
+        return {};
+      case 'skills.accept' || 'skills.save' || 'skills.setEnabled' || 'skills.restore':
+        if (result == null) return {'error': 'changed', 'detail': 'No skill result configured.'};
+        final savedName = result['name'] as String;
+        skills[savedName] = result;
+        if (method == 'skills.accept') drafts.remove(id);
+        if (method == 'skills.restore') archived.remove(savedName);
+        return result;
+      default:
+        throw MissingPluginException(method);
+    }
+  }
+
 }
 
 /// Acts as a build without the native module: every call fails with

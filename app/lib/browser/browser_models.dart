@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import '../remote/ssh/ssh_link.dart' show SshWebPreview;
+
 import 'browser_policy.dart';
 import 'browser_omnibox.dart';
 
@@ -25,6 +27,7 @@ class BrowserTab {
     required this.updatedAt,
     this.homeBack = false,
     this.forwardUrl,
+    this.webPreview,
   });
 
   final String id;
@@ -42,15 +45,22 @@ class BrowserTab {
   /// Home's forward destination; the actual history stays in native memory.
   final Uri? forwardUrl;
 
-  BrowserTab copyWith({Uri? url, String? title, bool? homeBack, bool clearForward = false}) => BrowserTab(
-    id: id,
-    scope: scope,
-    url: url ?? this.url,
-    title: title ?? this.title,
-    updatedAt: DateTime.now(),
-    homeBack: homeBack ?? this.homeBack,
-    forwardUrl: clearForward ? null : forwardUrl,
-  );
+  /// A loopback address owned by this tab for the life of its SSH link.
+  final SshWebPreview? webPreview;
+
+  bool allows(Uri url) => webPreview?.allows(url) ?? BrowserPolicy.allows(url);
+
+  BrowserTab copyWith({BrowserScope? scope, Uri? url, String? title, bool? homeBack, bool clearForward = false}) =>
+      BrowserTab(
+        id: id,
+        scope: scope ?? this.scope,
+        url: url ?? this.url,
+        title: title ?? this.title,
+        updatedAt: DateTime.now(),
+        homeBack: homeBack ?? this.homeBack,
+        forwardUrl: clearForward ? null : forwardUrl,
+        webPreview: webPreview,
+      );
 
   Map<String, Object?> toJson() => {
     'id': id,

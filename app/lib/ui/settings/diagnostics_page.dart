@@ -1,4 +1,6 @@
-// Idea after PiPilot (https://github.com/CikeSeven/pi_pilot), MIT, Copyright (c) 2026 CikeSeven. See THIRD_PARTY_NOTICES.md.
+// SPDX-FileCopyrightText: 2026 CikeSeven
+// SPDX-License-Identifier: MIT
+// See THIRD_PARTY_NOTICES.md.
 
 import 'dart:convert';
 
@@ -8,17 +10,24 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../l10n/l10n.dart';
 import '../../diagnostics/diagnostics_publish.dart';
+import '../../diagnostics/automatic_diagnostics.dart';
 import '../../diagnostics/redact.dart';
+import '../../diagnostics/system_ime_diagnostics.dart';
 import '../../runtime/runtime_state.dart';
 import '../../runtime/runtime_bridge.dart';
+import '../../state/android_features.dart';
 import '../../state/app_info.dart';
 import '../../state/connection_state.dart';
 import '../../state/settings_state.dart';
+import '../../state/hosts_state.dart';
+import '../../state/sessions_state.dart';
+import '../common/risk_notice.dart';
 import '../common/list_page_row.dart';
 import '../engine/diagnostics_export_card.dart';
 import '../engine/engine_screen.dart' show shortRuntimeVersion;
 import '../engine/engine_status.dart';
 import '../shell/page_frame.dart';
+import '../phone/phone_control_screen.dart';
 import '../theme/app_icons.dart';
 import 'settings_widgets.dart';
 import 'direct_engine_settings.dart';
@@ -33,6 +42,7 @@ class DiagnosticsPage extends ConsumerWidget {
     required LocalRuntimeState runtime,
     required AppSettings settings,
     required String connection,
+    required int logLines,
   }) {
     final s = runtime.status;
     return {
@@ -47,7 +57,7 @@ class DiagnosticsPage extends ConsumerWidget {
         'baseUrl': s.baseUrl,
         'token': s.token == null ? null : '<redacted>',
         'error': s.error,
-        'logLines': runtime.logs.length,
+        'logLines': logLines,
         ...s.launchDiagnostics,
       },
       'connection': connection,
@@ -73,8 +83,16 @@ class DiagnosticsPage extends ConsumerWidget {
       _ => l10n.pluginsConnecting,
     };
     Future<void> copyReport() async {
-      final json = const JsonEncoder.withIndent('  ')
-          .convert(redactJson(report(runtime: runtime, settings: settings, connection: connection)));
+      final json = const JsonEncoder.withIndent('  ').convert(
+        redactJson(
+          report(
+            runtime: runtime,
+            settings: settings,
+            connection: connection,
+            logLines: ref.read(localRuntimeLogsProvider).length,
+          ),
+        ),
+      );
       await Clipboard.setData(ClipboardData(text: json));
       if (context.mounted) {
         showBriefNotice(context, l10n.pluginsDiagnosticsCopied);
@@ -82,12 +100,9 @@ class DiagnosticsPage extends ConsumerWidget {
     }
 
     Future<void> publishForAi() async {
-      final published = await ref.read(diagnosticsPublisherProvider).publish();
+      final published = await ref.read(diagnosticsPublisherProvider).publish(includeSystemIme: true);
       if (!context.mounted) return;
-      showBriefNotice(
-        context,
-        published == null ? l10n.diagnosticsForAiFailed : l10n.diagnosticsForAiDone,
-      );
+      showBriefNotice(context, published == null ? l10n.diagnosticsForAiFailed : l10n.diagnosticsForAiDone);
     }
 
     return AppPage.list(
@@ -119,6 +134,10 @@ class DiagnosticsPage extends ConsumerWidget {
             InfoRow(label: 'API Key', value: settings.hasApiKey ? l10n.pluginsConfigured : l10n.commonNotSet),
           ],
         ),
+        // Its failure evidence is recorded natively: Android's own, HarmonyOS's from HiAppEvent.
+        const AutomaticDiagnosticsSection(),
+        // Android reads the system log through a privileged channel; HarmonyOS, this app's own window.
+        const SystemImeDiagnosticsSection(),
         DiagnosticsExportCard(
           title: l10n.pluginsExport,
           extra: [
@@ -139,11 +158,264 @@ class DiagnosticsPage extends ConsumerWidget {
         // The note belongs to the export card; the next group starts 24 below
         // it, as groups do.
         const DiagnosticsBundleNote(),
-        const SizedBox(height: 24),
-        const DirectEngineSettings(),
+        if (ref.watch(androidSystemFeaturesProvider)) ...[const SizedBox(height: 24), const DirectEngineSettings()],
       ],
     );
   }
+}
+
+/// One opt-in, one status, one ordinary report-session entry.
+class AutomaticDiagnosticsSection extends ConsumerStatefulWidget {
+  const AutomaticDiagnosticsSection({super.key});
+
+  @override
+  ConsumerState<AutomaticDiagnosticsSection> createState() => _AutomaticDiagnosticsSectionState();
+}
+
+class _AutomaticDiagnosticsSectionState extends ConsumerState<AutomaticDiagnosticsSection> with WidgetsBindingObserver {
+  bool _changing = false;
+  int _recoveryEpoch = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (ModalRoute.isCurrentOf(context) == false) _recoveryEpoch++;
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) _recoveryEpoch++;
+  }
+
+  @override
+  void dispose() {
+    _recoveryEpoch++;
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  Future<void> _recover() async {
+    final automatic = ref.read(automaticDiagnosticsProvider);
+    if (_changing || automatic.busy || !ref.read(activeHostProvider).isLocal) return;
+    final epoch = _recoveryEpoch;
+    setState(() => _changing = true);
+    try {
+      await automatic.recoverStorage(
+        isCurrent: () =>
+            mounted &&
+            epoch == _recoveryEpoch &&
+            ModalRoute.of(context)?.isCurrent != false &&
+            ref.read(activeHostProvider).isLocal,
+      );
+    } finally {
+      if (mounted) setState(() => _changing = false);
+    }
+  }
+
+  Future<void> _change(bool enabled) async {
+    if (_changing) return;
+    setState(() => _changing = true);
+    try {
+      final l10n = context.l10n;
+      if (enabled) {
+        final accepted = await confirmRisk(
+          context,
+          RiskNotice(
+            id: 'diagnostics.automatic',
+            level: RiskLevel.high,
+            title: l10n.automaticDiagnosticsConsentTitle,
+            body: l10n.automaticDiagnosticsConsent,
+            action: l10n.automaticDiagnosticsEnable,
+          ),
+        );
+        if (!mounted || !accepted || !ref.read(activeHostProvider).isLocal) return;
+      }
+      await ref.read(settingsProvider.notifier).setAutomaticDiagnostics(enabled);
+    } catch (_) {
+      if (mounted) showBriefNotice(context, context.l10n.automaticDiagnosticsStoreFailed);
+    } finally {
+      if (mounted) setState(() => _changing = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.l10n;
+    final settings = ref.watch(settingsProvider);
+    final local = ref.watch(activeHostProvider).isLocal;
+    final automatic = ref.watch(automaticDiagnosticsProvider);
+    ref.listen(activeHostProvider, (previous, next) {
+      if (previous != next) _recoveryEpoch++;
+    });
+    ref.listen(settingsProvider.select((s) => s.automaticDiagnostics), (previous, next) {
+      if (previous != next) _recoveryEpoch++;
+    });
+    return ListenableBuilder(
+      listenable: automatic,
+      builder: (context, _) {
+        final status = switch (automatic.phase) {
+          AutomaticDiagnosticsPhase.failed =>
+            automatic.failureCode == 'store_failed'
+                ? l10n.automaticDiagnosticsStoreFailed
+                : automatic.failureCode == 'cancel_failed'
+                ? l10n.automaticDiagnosticsCancelFailed
+                : l10n.automaticDiagnosticsFailed,
+          _ when !settings.automaticDiagnostics => l10n.automaticDiagnosticsOff,
+          _ when !automatic.eligible => l10n.automaticDiagnosticsWaiting,
+          AutomaticDiagnosticsPhase.collecting => l10n.automaticDiagnosticsCollecting,
+          AutomaticDiagnosticsPhase.analyzing => l10n.automaticDiagnosticsAnalyzing,
+          AutomaticDiagnosticsPhase.complete => l10n.automaticDiagnosticsComplete,
+          AutomaticDiagnosticsPhase.cancelled => l10n.automaticDiagnosticsCancelled,
+          _ => l10n.automaticDiagnosticsReady,
+        };
+        return SettingsSection(
+          title: l10n.automaticDiagnosticsTitle,
+          children: [
+            SettingsSwitchTile(
+              title: l10n.automaticDiagnosticsTitle,
+              subtitle: l10n.automaticDiagnosticsHint,
+              value: settings.automaticDiagnostics,
+              onChanged: _changing || !settings.loaded || (!local && !settings.automaticDiagnostics) ? null : _change,
+            ),
+            InfoRow(label: l10n.commonStatus, value: status),
+            if (automatic.failureCode == 'store_failed')
+              SettingsTile(
+                title: l10n.automaticDiagnosticsRecover,
+                subtitle: l10n.automaticDiagnosticsRecoverHint,
+                onTap: local && !_changing && !automatic.busy ? _recover : null,
+              ),
+            if (automatic.reportSessionId case final id?)
+              SettingsTile(
+                title: l10n.automaticDiagnosticsViewReport,
+                subtitle: l10n.automaticDiagnosticsReportHint,
+                onTap: !local
+                    ? null
+                    : () {
+                        // Only a deliberate tap selects this ordinary conversation.
+                        if (!ref.read(activeHostProvider).isLocal) return;
+                        ref.read(currentSessionProvider.notifier).select(id);
+                        Navigator.of(context).popUntil((route) => route.isFirst);
+                      },
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// Only this visible, user-owned section can start a native consent request.
+class SystemImeDiagnosticsSection extends ConsumerStatefulWidget {
+  const SystemImeDiagnosticsSection({super.key});
+
+  @override
+  ConsumerState<SystemImeDiagnosticsSection> createState() => _SystemImeDiagnosticsSectionState();
+}
+
+class _SystemImeDiagnosticsSectionState extends ConsumerState<SystemImeDiagnosticsSection> with WidgetsBindingObserver {
+  late final SystemImeDiagnostics _diagnostics;
+  ModalRoute<dynamic>? _route;
+
+  @override
+  void initState() {
+    super.initState();
+    _diagnostics = ref.read(systemImeDiagnosticsProvider);
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _route = ModalRoute.of(context);
+    if (_route?.isCurrent == false) _diagnostics.cancelPending(notify: false);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // A native consent dialog makes Flutter inactive without leaving the Activity.
+    // Native onActivityPaused also revokes consent when the user actually leaves.
+    if (state == AppLifecycleState.hidden || state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
+      _diagnostics.cancelPending();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _diagnostics.cancelPending(notify: false);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: _diagnostics,
+    builder: (context, _) {
+      final l10n = context.l10n;
+      final evidence = _diagnostics.evidence;
+      // HarmonyOS records this app's own window geometry: no privileged log, nothing to grant.
+      final ohos = ref.watch(operatingSystemProvider) == 'ohos';
+      final status = _diagnostics.collecting
+          ? l10n.systemImeCollecting
+          : switch (evidence?.code) {
+              null => l10n.systemImeNotCollected,
+              'ok' => l10n.systemImeRetained,
+              'noEvents' => l10n.systemImeNoEvents,
+              'unavailable' => ohos ? l10n.systemImeOhosUnavailable : l10n.systemImeUnavailable,
+              'unsupported' => l10n.systemImeUnsupported,
+              'denied' => l10n.systemImeDenied,
+              'cancelled' => l10n.systemImeCancelled,
+              'busy' => l10n.systemImeBusy,
+              'timeout' => l10n.systemImeTimeout,
+              'limitExceeded' => l10n.systemImeLimitExceeded,
+              _ => l10n.systemImeFailed,
+            };
+      return SettingsSection(
+        title: ohos ? l10n.systemImeOhosTitle : l10n.systemImeTitle,
+        children: [
+          SettingsTile(
+            icon: AppIcons.exportLog,
+            title: ohos ? l10n.systemImeOhosCollect : l10n.systemImeCollect,
+            subtitle: ohos ? l10n.systemImeOhosPrivacy : l10n.systemImePrivacy,
+            onTap: _diagnostics.collecting
+                ? null
+                : () => _diagnostics.collect(isCurrent: () => mounted && (_route?.isCurrent ?? true)),
+            tinted: false,
+          ),
+          SettingsTile(title: status, subtitle: l10n.systemImeEvidenceLimits),
+          InfoRow(label: l10n.systemImeEventCount, value: '${evidence?.events.length ?? 0} / 64'),
+          if (evidence != null)
+            InfoRow(
+              label: l10n.systemImeCapturedAt,
+              value: DateTime.fromMillisecondsSinceEpoch(evidence.capturedAt).toString().split('.').first,
+            ),
+          if (evidence?.code == 'unavailable' && !ohos)
+            SettingsTile(
+              icon: AppIcons.permissions,
+              title: l10n.systemImePermissions,
+              subtitle: l10n.systemImePermissionsHint,
+              onTap: () {
+                _diagnostics.cancelPending();
+                Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const PhoneControlScreen()));
+              },
+              tinted: false,
+            ),
+          SettingsTile(
+            icon: AppIcons.clearAll,
+            title: l10n.systemImeClear,
+            subtitle: l10n.systemImeMemory,
+            onTap: evidence != null || _diagnostics.collecting ? _diagnostics.clear : null,
+            tinted: false,
+          ),
+        ],
+      );
+    },
+  );
 }
 
 /// The engine process as the native side observes it (never the saved
@@ -158,6 +430,8 @@ class RuntimeLaunchFacts extends StatelessWidget {
     String method(String mode) => switch (mode) {
       'direct' => l10n.phoneLaunchDirect,
       'proot' => l10n.phoneLaunchCompatible,
+      'tawcroot' => l10n.phoneLaunchTawcroot,
+      'ohos-embedded' => l10n.harmonyLaunchEmbedded,
       _ => mode,
     };
     // One child of the card: keep SheetGroup's 2dp between its rows.
@@ -183,6 +457,9 @@ class RuntimeLaunchFacts extends StatelessWidget {
               'notEnoughSpace' => l10n.phoneDirectNotEnoughSpace,
               'migrationFailed' => l10n.phoneDirectMigrationFailed,
               'directFailed' => l10n.phoneDirectLaunchFailed,
+              'tawcrootFailed' => l10n.phoneTawcLaunchFailed,
+              'tawcrootUnsupported' => l10n.phoneTawcUnsupported,
+              'tawcrootNotBundled' || 'tawcrootApiTooOld' => l10n.phoneTawcUnavailable,
               'safeRecovery' => l10n.phoneSafeMode,
               _ => reason,
             },
@@ -192,6 +469,8 @@ class RuntimeLaunchFacts extends StatelessWidget {
             label: l10n.phoneLaunchFailureReason,
             value: reason == 'startFailed'
                 ? l10n.phoneLaunchStartFailed
+                : reason == 'ohos_node_exited'
+                ? l10n.harmonyLaunchNodeExited
                 : reason.startsWith('exit:') && int.tryParse(reason.substring(5)) != null
                 ? l10n.phoneLaunchExited(reason.substring(5))
                 : reason,

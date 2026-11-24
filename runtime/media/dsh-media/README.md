@@ -2,7 +2,7 @@
 
 DSH Go 的主机侧媒体插件，版本 `0.3.0`。提供生成图片、用一句话编辑图片、后台生成视频；服务密钥留在 Host credentials，原件保存到当前工作区。设置命名空间保持 `dsh-media`，媒体结果使用冻结的 `meta["dsh-go/media"]` v1。
 
-0.2.0 已通过本地 HTTP mock 和真实 DSH `0.2.1-rc.4` headless 会话；0.3.0 通过完整 Node 测试，未重跑 headless。尚未调用付费服务或在 Android / PRoot 上验证。模型可用性、审核、配额和最终费用由供应商决定。此仓库准备了发布包，未发布到 npm，也未预装进 App 运行时；发布后由插件市场安装。
+0.3.0 声明兼容 DSH `0.2.1-rc.4` 与 `0.2.2-rc.1`，验证使用各版已有 runtime 锁，不重新解析生产依赖。实际验证范围与未验证项见 `VERIFICATION.md`。模型可用性、审核、配额和最终费用由供应商决定。App 内置的是设置与媒体展示入口，主机插件仍单独安装；本次不发布 npm、不预装或自动启用插件，也不调用真实付费服务。
 
 ## 支持范围
 
@@ -78,14 +78,18 @@ Host 重启后，原会话可调用 `resume_media(rid)` 继续查询已保存的
 
 预留是本地记账护栏，**不是供应商实际金额的硬上限**。实际账单可能高于预留。调低未知价预留会放行更多请求，不会降低供应商价格。账本在提交前持久化不确定状态，接受后的失败、超时、取消或断网均保留预留；本插件不声称退款。明确尚未提交的请求才释放预留。账本的内部 `basis: estimate` 记录本地预留结算，不是经过核实的供应商报价。
 
+媒体插件启动时，在注册工具前释放账本中全部尚未进入 `begin` 的 `reserved`，让进程中断后的用户能在同一上海日重新审批生成；`submission_unknown`、`submitted`、`settled` 保持原样。此恢复采用 Android 同一个 `DSH_HOME` 只有一个 Host 的部署合同。非常规地让两个 Host 共用同一个 `DSH_HOME` 时，后启动的一方也会释放另一方尚未 `begin` 的预留；一次清理最多重新放行一份当日日额的本地预留容量，实际供应商费用仍不受该金额封顶。普通配置或凭据刷新不会执行此清理。详见[启动恢复合同](../../../docs/maintenance/media-reserved-startup-contract.md)。
+
 方舟和百炼仅排队时可能取消。取消请求与状态变化可能竞争，只有后续查询明确 cancelled / CANCELED 才显示已取消；运行中、查询失败、供应商不支持时都提示服务端可能继续生成并收费。付费 POST 不自动重试。
 
 ## English
 
-`@ccch1mneyyy/dsh-media` is a Host-side DeepSeek Harness plugin. It keeps credentials on the Host, saves original media in the current workspace and emits DSH Go media metadata v1. The settings namespace remains `dsh-media`. Node `^22.19.0 || >=24.0.0` and the pinned DSH `0.2.1-rc.4` peers are required; the DSH Go manifest declares app `1.0.2` or later.
+`@ccch1mneyyy/dsh-media` is a Host-side DeepSeek Harness plugin. It keeps credentials on the Host, saves original media in the current workspace and emits DSH Go media metadata v1. The settings namespace remains `dsh-media`. Node `^22.19.0 || >=24.0.0` and DSH `0.2.1-rc.4` or `0.2.2-rc.1` peers are required; the DSH Go manifest declares app `1.0.2` or later.
 
 It supports OpenAI / Gemini-compatible images, Ark Seedream / Seedance, Alibaba Wan and SiliconFlow Qwen / Wan. Editing uses one workspace image. Video generation runs as a real background job; `get_media_result` retrieves its media result after the completion notice. `resume_media(rid)` explicitly resumes a saved provider task in its original session without submitting again. Provider cancellation is confirmed only when the API reports it; SiliconFlow cancellation is unavailable.
 
-All currently bundled prices are unknown. Every generation requires explicit one-time approval. The default CNY 20 daily ledger and CNY 20 per-request hold limit local reservations, **not actual provider bills**. Accepted or uncertain submissions retain their hold. No paid-provider, Android or PRoot validation is claimed. The package is prepared for publication but this change does not publish or preinstall it.
+All currently bundled prices are unknown. Every generation requires explicit one-time approval. The default CNY 20 daily ledger and CNY 20 per-request hold limit local reservations, **not actual provider bills**. Accepted or uncertain submissions retain their hold. Validation uses each supported runtime version’s existing pinned dependency graph; see `VERIFICATION.md` for current evidence. No paid-provider or Android App installation/media-viewer validation is claimed. The package is prepared for publication but this change does not publish or preinstall it.
+
+Before registering tools at startup, the plugin releases every `reserved` entry that has not entered `begin`, allowing a new approved request on the same Shanghai budget day after process loss. It preserves `submission_unknown`, `submitted` and `settled`. This uses the Android deployment contract of one Host per `DSH_HOME`. If two Hosts share a home, the later startup also releases the other Host's pre-begin holds; one cleanup can reopen at most one daily limit of local reservation capacity, without capping actual provider charges. Configuration and credential refreshes do not perform this cleanup. See the [startup recovery contract](../../../docs/maintenance/media-reserved-startup-contract.md).
 
 Version 0.3.0 also publishes provider presets in the plugin catalogue. The App builds a service from a preset, writes any env-style credential name such as `DSH_MEDIA_ARK_API_KEY`, reuses one key for the image and video services of the same provider, and keeps separate image/video defaults. The four fixed slots remain for compatibility only, and a legacy `serviceId`/`modelId` default keeps its exact previous behavior.

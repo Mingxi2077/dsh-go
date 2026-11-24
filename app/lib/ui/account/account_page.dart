@@ -3,15 +3,15 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../browser/browser_links.dart';
-import '../../browser/browser_policy.dart';
 import '../../l10n/l10n.dart';
 import '../../state/account_state.dart';
 import '../../state/settings_state.dart';
 import '../chat/balance_widgets.dart' show BalanceSettingsLine;
+import '../common/app_dialog.dart';
 import '../common/app_sheet.dart';
 import '../common/overview_card.dart';
 import '../onboarding/api_key_page.dart';
+import '../settings/credential_recovery_dialog.dart';
 import '../settings/settings_widgets.dart';
 import '../shell/page_frame.dart';
 import '../theme/app_icons.dart';
@@ -30,18 +30,14 @@ class AccountPage extends ConsumerStatefulWidget {
 
 class _AccountPageState extends ConsumerState<AccountPage> {
   late final AppLifecycleListener _lifecycle;
-  late final StreamSubscription<Uri> _pageReturns;
 
   /// A Platform page (top-up, usage) was opened: re-read wallets on return.
-  Uri? _awaitingReturn;
+  bool _awaitingReturn = false;
 
   @override
   void initState() {
     super.initState();
     _lifecycle = AppLifecycleListener(onResume: _onResume);
-    _pageReturns = BrowserLinks.pageReturns.listen((url) {
-      if (mounted && url == _awaitingReturn) _onResume();
-    });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final account = ref.read(accountProvider);
@@ -54,14 +50,13 @@ class _AccountPageState extends ConsumerState<AccountPage> {
   @override
   void dispose() {
     _lifecycle.dispose();
-    unawaited(_pageReturns.cancel());
     super.dispose();
   }
 
   void _onResume() {
     ref.read(accountProvider.notifier).noteAppResumed();
-    if (_awaitingReturn != null) {
-      _awaitingReturn = null;
+    if (_awaitingReturn) {
+      _awaitingReturn = false;
       _refresh();
     }
   }
@@ -73,8 +68,7 @@ class _AccountPageState extends ConsumerState<AccountPage> {
 
   Future<void> _openPlatform(String? url) async {
     if (url == null) return;
-    final uri = Uri.tryParse(url);
-    _awaitingReturn = uri == null ? null : BrowserPolicy.savedUrl(uri);
+    _awaitingReturn = true;
     await openAccountLink(context, ref, url);
   }
 
@@ -89,7 +83,7 @@ class _AccountPageState extends ConsumerState<AccountPage> {
     final running = await account.hasRunningAccountTasks();
     if (!mounted) return;
     final colors = DshColors.of(context);
-    final ok = await showDialog<bool>(
+    final ok = await showAppDialog<bool>(
       context: context,
       builder: (dialog) => AlertDialog(
         title: Text(context.l10n.engineAccountSignOutTitle),
@@ -501,7 +495,7 @@ Future<void> manageApiKey(BuildContext context, WidgetRef ref) async {
     case 'replace':
       push(const ApiKeyPage(onboarding: false));
     case 'clear':
-      final ok = await showDialog<bool>(
+      final ok = await showAppDialog<bool>(
         context: context,
         builder: (dialog) => AlertDialog(
           title: Text(l10n.engineAccountClearKeyTitle),
@@ -519,6 +513,11 @@ Future<void> manageApiKey(BuildContext context, WidgetRef ref) async {
           ],
         ),
       );
-      if (ok == true) await ref.read(settingsProvider.notifier).setApiKey('');
+      if (ok != true) return;
+      try {
+        await ref.read(settingsProvider.notifier).setApiKey('');
+      } catch (e) {
+        if (!context.mounted || !await offerCredentialRecovery(context, ref, e)) rethrow;
+      }
   }
 }

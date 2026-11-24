@@ -94,6 +94,20 @@ const longNameCatalog = ModelCatalog(
   failures: [],
 );
 
+/// #1627: a gateway's display names carry the price ("GLM-5.3 · x0.79"), a
+/// custom channel's may be the full model id.
+const priceTagCatalog = ModelCatalog(
+  defaultSelection: ModelSelection(provider: 'gw', model: 'glm-5.3'),
+  routableProviders: ['gw'],
+  groups: [
+    ProviderGroup('gw', 'Gateway', [
+      ModelInfo(provider: 'gw', id: 'glm-5.3', name: 'GLM-5.3 · x0.79'),
+      ModelInfo(provider: 'gw', id: 'qwen3-coder-480b', name: 'Qwen3-Coder-480B-A35B-Instruct · x1.20'),
+    ]),
+  ],
+  failures: [],
+);
+
 ChatHarness _harness(ModelCatalog catalog, {ModelSelection? model}) => ChatHarness(
   session: model == null ? null : 's1',
   states: {if (model != null) 's1': ChatState(loading: false, model: model)},
@@ -109,7 +123,10 @@ Future<ChatHarness> _openSheet(
   mockClipboard(tester);
   await tester.pumpWidget(testApp(const ChatScreen(), brightness: brightness, overrides: harness.overrides));
   await pumpFrames(tester, 6);
-  await tester.tap(find.byType(ModelChip));
+  await tester.tap(find.byType(TextField));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 500));
+  await tester.tap(find.byKey(const ValueKey('composer-model')));
   await pumpFrames(tester, 8);
   return harness;
 }
@@ -155,20 +172,20 @@ void main() {
     chatClock = () => DateTime(2026, 10, 23, 15, 20);
   });
 
-  testWidgets('narrow model chip keeps complete actionable speech', (tester) async {
+  testWidgets('a phone\'s model row keeps complete actionable speech', (tester) async {
     tester.view.devicePixelRatio = 1;
     tester.view.physicalSize = const Size(360, 800);
     addTearDown(tester.view.reset);
     final semantics = tester.ensureSemantics();
-    // A long title: the chip gives up its depth before the title is cut.
     final harness = ChatHarness(
       session: 's1',
       states: {'s1': const ChatState(loading: false, title: '修复登录页重复提交并补上连点测试')},
     );
     await tester.pumpWidget(testApp(const ChatScreen(), overrides: harness.overrides));
     await pumpFrames(tester);
-    expect(find.text('V4 Pro'), findsOneWidget);
-    expect(find.text('V4 Pro · 高'), findsNothing);
+    await tester.tap(find.byType(TextField));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
     expect(
       tester.getSemantics(find.bySemanticsLabel('模型：V4 Pro，思考深度高')),
       isSemantics(isButton: true, hasTapAction: true),
@@ -289,7 +306,7 @@ void main() {
       expect(find.text('思考深度'), findsOneWidget, reason: 'thumb first');
       await pumpFrames(tester, 8);
       expect(find.text('思考深度'), findsNothing);
-      expect(find.text('V4 Pro · 最高'), findsOneWidget);
+      expect(find.text('V4 Pro 最高'), findsOneWidget);
     });
 
     testWidgets('cards read as selectable buttons to a screen reader', (tester) async {
@@ -381,15 +398,34 @@ void main() {
       });
     }
 
-    testWidgets('long names keep their two lines at 2× text, nothing overflows', (tester) async {
+    testWidgets('at 2× text names too long for half a row get the whole row, nothing overflows', (tester) async {
       await _openSheetAlone(tester, longNameCatalog, textScale: 2);
-      expect(find.text('GPT 5.6 Terra'), findsOneWidget);
-      expect(find.text('GPT 6 Astra'), findsOneWidget);
+      for (final name in const ['GPT 5.6 Terra', 'GPT 6 Astra']) {
+        expect(
+          tester.renderObject<RenderParagraph>(find.text(name)).didExceedMaxLines,
+          isFalse,
+          reason: '$name fits whole',
+        );
+      }
       final terra = tester.getRect(_card('GPT 5.6 Terra'));
       final astra = tester.getRect(_card('GPT 6 Astra'));
+      expect(terra.left, moreOrLessEquals(astra.left, epsilon: 0.5), reason: 'one column');
       expect(terra.width, moreOrLessEquals(astra.width, epsilon: 0.5));
-      expect(terra.height, moreOrLessEquals(astra.height, epsilon: 0.5));
-      expect(terra.top, moreOrLessEquals(astra.top, epsilon: 0.5));
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('a name with its price after it gets the whole row (#1627)', (tester) async {
+      await _openSheetAlone(tester, priceTagCatalog, textScale: 1.3);
+      for (final name in const ['GLM 5.3 · X0.79', 'Qwen3 Coder 480B A35B Instruct · X1.20']) {
+        expect(
+          tester.renderObject<RenderParagraph>(find.text(name)).didExceedMaxLines,
+          isFalse,
+          reason: '$name fits whole',
+        );
+      }
+      final glm = tester.getRect(_card('GLM 5.3 · X0.79'));
+      final qwen = tester.getRect(_card('Qwen3 Coder 480B A35B Instruct · X1.20'));
+      expect(glm.left, moreOrLessEquals(qwen.left, epsilon: 0.5), reason: 'one column');
       expect(tester.takeException(), isNull);
     });
   });

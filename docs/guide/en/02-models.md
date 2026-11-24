@@ -13,6 +13,19 @@ Tap the model capsule at the top right of a chat to open **Choose model**:
 
 Typing `/model` in the composer opens it too.
 
+## New chat defaults
+
+<!-- nav: commonSettings,hubSettingsProviders -->
+The top of `Settings › Models` shows **New chat defaults (last choice)**. The model and thinking effort are stored on the current host, not in a second global preference on the phone.
+
+- **Last choice** is the default mode. Changing a chat's model or thinking effort makes the host remember that choice for newly created chats.
+- **Fixed default** appears only on engines that support it. Temporary model changes in a chat no longer overwrite these defaults.
+- Tap the model row, edit the model and thinking effort in the same model picker, then tap **Save**. Editing defaults here does not switch the current chat's model.
+
+Saving confirms the host's complete resolved defaults. Editing is disabled when disconnected, read-only, settings cannot be read, or the settings schema is missing. If host base settings or another client make the read-back differ, the app says it could not confirm rather than claiming everything was saved. Older engines only offer the last-choice behavior, without fixed defaults or confirmation of persistence when switching a chat's model. On newer engines, a persistence failure says that the current chat's model changed but new chat defaults were not saved; the current chat keeps the new model.
+
+Switching hosts or reconnecting reads that host's defaults again; unsubmitted choices do not carry over. A deleted model or unavailable provider may require another choice. Permissions keep their separate permission defaults and never inherit temporary session grants.
+
 ## Providers
 
 <!-- nav: commonSettings,hubSettingsProviders -->
@@ -21,6 +34,7 @@ Typing `/model` in the composer opens it too.
 Providers come in three groups:
 
 - **Official**: DeepSeek. Tap it to open your account, where you sign in or enter an API key. On a remote host, this only shows whether that host is set up; configure it on that host.
+- OpenAI under **Official**: shown only on a supported local Android engine. Sign in with ChatGPT in your browser and allow subscription usage, then choose a model available to that account. This is separate from ChatGPT (Codex) under Subscriptions; existing sign-ins and chats are not migrated. Manage usage and app access in [ChatGPT usage settings](https://chatgpt.com/settings/usage). After signing out, reconnect the same account to keep its app limits, or choose another account. Resetting the local engine does not sign you out of OpenAI; use this provider’s sign-out control to disconnect.
 - **Subscriptions**: shown when the engine supports them and is connected. Tap **Sign in** and follow the steps in your browser. Open a signed-in subscription to see its models or **Sign out**, which removes its models from the model list.
 - **Custom**: providers you add, plus ones configured in DSH Web or the engine's config file. Connect to the engine to add one.
 

@@ -1,5 +1,5 @@
 // 自定义壁纸的导入（启动画面那条链路，换成壁纸的预算）和持久化：只要照片、15 MB 以内、
-// PNG / JPEG / WebP（动图取首帧）、坏文件和视频拒收、换图删旧文件、取景和观感的读写与回退。
+// PNG / JPEG / WebP（动图记成动图）、坏文件和视频拒收、换图删旧文件、取景和观感的读写与回退。
 
 import 'dart:convert';
 import 'dart:io';
@@ -89,10 +89,15 @@ void main() {
       }
     });
 
-    test('an animation is taken as a still (its first frame is what bakes)', () async {
+    test('an animation is known as one (its first frame is what bakes); a still is not', () async {
       final (wallpaper, problem) = await importer(_Platform([])).keep(Stream.value(_bytes(gifFixture)));
       expect(problem, isNull);
       expect((wallpaper!.width, wallpaper.height), (120, 200));
+      expect((wallpaper.animated, wallpaper.play), (true, true));
+      // Replaced by a still: the choices stay, the animation doesn't.
+      final tuned = wallpaper.copyWith(guard: false, play: false);
+      final (still, _) = await importer(_Platform([])).keep(Stream.value(_bytes(pngFixture)), previous: tuned);
+      expect((still!.animated, still.play, still.guard), (false, false, false));
     });
 
     test('over 15 MB: refused before and while copying, nothing left behind', () async {
@@ -133,13 +138,13 @@ void main() {
       expect(problem, LaunchImportProblem.unavailable);
     });
 
-    test('a new picture replaces the old file, keeps the look, starts the framing over', () async {
+    test('a new picture keeps the look, starts the framing over, and leaves the old file to the save', () async {
       final (first, _) = await importer(_Platform([])).keep(Stream.value(_bytes(brightFixture)));
       final tuned = first!.copyWith(zoom: 2, alignX: 0.5, blur: 0.7, lighten: 0.1, dim: 0.6);
       await Future<void>.delayed(const Duration(milliseconds: 2));
       final (second, problem) = await importer(_Platform([])).keep(Stream.value(_bytes(darkFixture)), previous: tuned);
       expect(problem, isNull);
-      expect(File(first.path).existsSync(), isFalse);
+      expect(File(first.path).existsSync(), isTrue, reason: 'the controller removes it once the new one is saved');
       expect(File(second!.path).existsSync(), isTrue);
       expect((second.blur, second.lighten, second.dim), (0.7, 0.1, 0.6));
       expect((second.zoom, second.alignX), (1.0, 0.0));
@@ -165,10 +170,18 @@ void main() {
         blur: 0.6,
         lighten: 0.15,
         dim: 0.45,
+        guard: false,
+        animated: true,
+        play: false,
         on: false,
       );
       await CustomWallpaper.save(w);
       expect(await CustomWallpaper.load(), w);
+      // Stored before these existed: guarded, a still, and it would play.
+      final old = CustomWallpaper.fromJson(
+        w.toJson()..removeWhere((k, _) => const {'guard', 'animated', 'play'}.contains(k)),
+      )!;
+      expect((old.guard, old.animated, old.play), (true, false, true));
       SharedPreferences.setMockInitialValues({
         CustomWallpaper.prefsKey: jsonEncode({
           ...w.toJson(),
@@ -222,7 +235,10 @@ void main() {
       await notifier.setBlur(0.55);
       await notifier.setTone(Brightness.light, 0.3);
       await notifier.setTone(Brightness.dark, 0.65);
+      await notifier.setGuard(false);
+      await notifier.setPlay(false);
       final now = container.read(customWallpaperProvider).value!;
+      expect((now.guard, now.play), (false, false));
       expect((now.zoom, now.alignX, now.alignY), (CustomWallpaper.maxZoom, 0.25, -1.0));
       expect((now.blur, now.lighten, now.dim), (0.55, 0.3, 0.65));
       expect(now.toneFor(Brightness.light), 0.3);

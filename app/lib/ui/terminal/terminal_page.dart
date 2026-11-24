@@ -4,13 +4,16 @@
 
 import 'dart:async';
 
-import 'package:dsh_client/dsh_client.dart' show TerminalShell;
+import 'package:dsh_client/dsh_client.dart' show RuntimeSupport, TerminalShell;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../l10n/l10n.dart';
+import '../../state/android_features.dart';
+import '../../state/runtime_capabilities_state.dart';
 import '../../state/terminal_state.dart';
+import '../common/app_dialog.dart';
 import '../common/app_sheet.dart';
 import '../common/empty_view.dart';
 import '../common/feature_tile.dart';
@@ -22,6 +25,7 @@ import '../common/side_insets.dart';
 import '../shell/page_frame.dart';
 import '../theme/app_icons.dart';
 import '../theme/theme.dart';
+import '../workspace/text_prompt.dart';
 import 'terminal_keys.dart';
 import 'terminal_screen.dart';
 
@@ -52,6 +56,7 @@ class TerminalPage extends ConsumerStatefulWidget {
 class _TerminalPageState extends ConsumerState<TerminalPage> {
   final _focus = FocusNode(debugLabel: 'terminal');
   final _modifiers = TerminalModifiers();
+  final _screen = GlobalKey<TerminalScreenState>();
   late final AppLifecycleListener _lifecycle;
 
   NotifierProvider<TerminalWorkspace, TerminalWorkspaceState> get _provider =>
@@ -73,14 +78,19 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
 
   // ── Actions ──
 
-  Future<void> _showActions(TerminalTab tab) {
+  Future<void> _showActions(TerminalTab tab) async {
     final workspace = ref.read(_provider.notifier);
-    return showAppSheet<void>(
+    final canInput = ref.read(_provider).selected?.id == tab.id && tab.phase == TerminalPhase.live && tab.writable;
+    late Future<Object?> sheetClosed;
+    final input = await showAppSheet<_TerminalInputAction>(
       context,
       isScrollControlled: true,
+      onRouteChanged: (route, _) => sheetClosed = route.completed,
       builder: (sheet) => SheetNavigator(
         root: (_) => _TabActions(
           title: tab.title.isEmpty ? appL10n.botsTerminal : tab.title,
+          onKeyboard: canInput ? () => Navigator.of(sheet).pop(_TerminalInputAction.keyboard) : null,
+          onPaste: canInput ? () => Navigator.of(sheet).pop(_TerminalInputAction.paste) : null,
           onRename: () {
             Navigator.of(sheet).pop();
             unawaited(_rename(tab));
@@ -97,27 +107,25 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
         ),
       ),
     );
+    if (input == null) return;
+    await sheetClosed;
+    if (!mounted || !identical(ref.read(_provider).selected?.terminal, tab.terminal)) return;
+    switch (input) {
+      case _TerminalInputAction.keyboard:
+        _screen.currentState?.showKeyboard();
+      case _TerminalInputAction.paste:
+        await _screen.currentState?.pasteClipboard();
+    }
   }
 
   Future<void> _rename(TerminalTab tab) async {
-    final controller = TextEditingController(text: tab.title);
-    final next = await showDialog<String>(
-      context: context,
-      builder: (dialog) => AlertDialog(
-        title: Text(appL10n.botsTerminalRename),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLength: 120,
-          decoration: InputDecoration(hintText: appL10n.botsTerminalName, counterText: ''),
-          onSubmitted: (v) => Navigator.pop(dialog, v.trim()),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(dialog), child: Text(appL10n.commonCancel)),
-          FilledButton(onPressed: () => Navigator.pop(dialog, controller.text.trim()), child: Text(appL10n.commonSave)),
-        ],
-      ),
-    ).whenComplete(controller.dispose);
+    final next = await showTextPrompt(
+      context,
+      title: appL10n.botsTerminalRename,
+      initial: tab.title,
+      hint: appL10n.botsTerminalName,
+      maxLength: 120,
+    );
     if (next == null || next.isEmpty || next == tab.title || !mounted) return;
     final messenger = ScaffoldMessenger.maybeOf(context);
     final ok = await ref.read(_provider.notifier).rename(tab.id, next);
@@ -126,7 +134,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
 
   Future<void> _close(TerminalTab tab) async {
     if (tab.phase == TerminalPhase.live && (tab.info?.running ?? false)) {
-      final ok = await showDialog<bool>(
+      final ok = await showAppDialog<bool>(
         context: context,
         builder: (dialog) => AlertDialog(
           title: Text(appL10n.botsTerminalCloseNamed(tab.title.isEmpty ? appL10n.botsTerminal : tab.title)),
@@ -160,20 +168,28 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
     final selected = state.selected;
     final padding = MediaQuery.paddingOf(context);
     final cwd = selected?.info?.cwd ?? state.environment?.cwd ?? '';
+    // HarmonyOS's own engine has no PTY and says so; asked before the first attach fails.
+    final ohos = ref.watch(operatingSystemProvider) == 'ohos';
+    final capabilities = ohos ? ref.watch(runtimeCapabilitiesProvider) : null;
+    final noPty = capabilities?.value?.shell.pty == RuntimeSupport.unsupported;
 
     final Widget body;
     if (state.offline) {
       body = Center(
         child: EmptyView(icon: AppIcons.offline, title: TerminalCopy.offline),
       );
-    } else if (!state.supported) {
+    } else if (!state.supported || noPty) {
       body = Center(
         child: EmptyView(
           art: FeatureTile(FeatureKind.terminal, size: FeatureTile.empty),
           title: l10n.botsTerminalUnsupported,
-          message: l10n.botsTerminalSupportedHosts,
+          message: noPty
+              ? l10n.harmonyTerminalNoPty
+              : (ohos ? l10n.harmonyTerminalSupportedHosts : l10n.botsTerminalSupportedHosts),
         ),
       );
+    } else if (capabilities?.isLoading ?? false) {
+      body = TerminalCardPlaceholder(label: l10n.botsTerminalOpening);
     } else if (state.error case final error?) {
       body = Center(
         child: EmptyView(
@@ -196,7 +212,13 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
       );
     } else {
       body = TerminalCardFrame(
-        child: TerminalScreen(sessionId: widget.sessionId, tab: selected, focusNode: _focus, modifiers: _modifiers),
+        child: TerminalScreen(
+          key: _screen,
+          sessionId: widget.sessionId,
+          tab: selected,
+          focusNode: _focus,
+          modifiers: _modifiers,
+        ),
       );
     }
 
@@ -401,10 +423,14 @@ class _TabsRow extends StatelessWidget {
   }
 }
 
-/// 重命名 · 新建终端(选 Shell) · 关闭终端.
+enum _TerminalInputAction { keyboard, paste }
+
+/// 输入 · 重命名 · 新建终端(选 Shell) · 关闭终端.
 class _TabActions extends StatelessWidget {
   const _TabActions({
     required this.title,
+    required this.onKeyboard,
+    required this.onPaste,
     required this.onRename,
     required this.loadShells,
     required this.onNew,
@@ -412,6 +438,8 @@ class _TabActions extends StatelessWidget {
   });
 
   final String title;
+  final VoidCallback? onKeyboard;
+  final VoidCallback? onPaste;
   final VoidCallback onRename;
   final Future<List<TerminalShell>> Function() loadShells;
   final ValueChanged<TerminalShell?> onNew;
@@ -430,6 +458,19 @@ class _TabActions extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             SheetTitleBar(title),
+            if (onKeyboard != null)
+              SheetGroup(
+                margin: _margin,
+                children: [
+                  ListPageRow(
+                    icon: AppIcons.terminal,
+                    title: l10n.botsTerminalShowKeyboard,
+                    chevron: false,
+                    onTap: onKeyboard,
+                  ),
+                  ListPageRow(icon: AppIcons.paste, title: l10n.commonPaste, chevron: false, onTap: onPaste),
+                ],
+              ),
             SheetGroup(
               margin: _margin,
               children: [

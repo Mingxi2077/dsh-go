@@ -49,6 +49,36 @@ void main() {
     });
   });
 
+  group('header validation', () {
+    test('accepts HTTP tokens, empty values, tabs and Latin-1 bytes', () {
+      expect(
+        providerHeadersError(const [
+          MapEntry('', ''),
+          MapEntry(' x-opencode-session ', 'session-1'),
+          MapEntry('X-Empty', ''),
+          MapEntry('X-Latin', 'café\tvalue'),
+          MapEntry('Authorization', 'token'),
+          MapEntry('anthropic-version', '2023-06-01'),
+        ]),
+        isNull,
+      );
+    });
+
+    test('rejects invalid, duplicate and engine-owned names', () {
+      for (final name in ['', 'bad name', 'name:', '名字']) {
+        expect(providerHeadersError([MapEntry(name, 'value')]), isNotNull, reason: name);
+      }
+      expect(providerHeadersError(const [MapEntry('X-Team', 'one'), MapEntry('x-team', 'two')]), '请求头名称重复（不区分大小写）');
+      expect(providerHeadersError(const [MapEntry('UsEr-AgEnT', 'override')]), 'User-Agent 由引擎设置，请移除此请求头');
+    });
+
+    test('rejects values that the Fetch client cannot send', () {
+      for (final value in ['line\nbreak', 'line\rbreak', 'nul\x00', 'control\x01', 'delete\x7f', '汉']) {
+        expect(providerHeadersError([MapEntry('X-Test', value)]), isNotNull);
+      }
+    });
+  });
+
   group('validation', () {
     test('Base URL: trimmed, no trailing slash; Anthropic drops a trailing /v1', () {
       expect(
@@ -60,6 +90,55 @@ void main() {
         normalizeBaseUrl('https://gw.example.com/api/v1', ProviderApi.openaiResponses),
         'https://gw.example.com/api/v1',
       );
+    });
+
+    for (final (api, input, expected) in [
+      (ProviderApi.openaiCompletions, 'https://gw.example.com/v1/chat/completions', 'https://gw.example.com/v1'),
+      (ProviderApi.openaiResponses, 'https://gw.example.com/api/v3/responses', 'https://gw.example.com/api/v3'),
+      (ProviderApi.anthropicMessages, 'https://gw.example.com/api/v1/messages', 'https://gw.example.com/api'),
+      (ProviderApi.anthropicMessages, 'https://gw.example.com/proxy/messages', 'https://gw.example.com/proxy'),
+      (
+        ProviderApi.openaiCompletions,
+        ' https://GW.example.com:8443/TeNaNt/a%2Fb/V1/ChAt/CoMpLeTiOnS/// ',
+        'https://GW.example.com:8443/TeNaNt/a%2Fb/V1',
+      ),
+      (ProviderApi.openaiResponses, 'http://[::1]:8000/Proxy/ReSpOnSeS/', 'http://[::1]:8000/Proxy'),
+      (ProviderApi.anthropicMessages, 'https://gw.example.com/Proxy/V1/MeSsAgEs///', 'https://gw.example.com/Proxy'),
+      (
+        ProviderApi.openaiCompletions,
+        'https://gw.example.com/chat/completions/chat/completions',
+        'https://gw.example.com/chat/completions',
+      ),
+      (ProviderApi.openaiResponses, 'https://gw.example.com/responses/responses', 'https://gw.example.com/responses'),
+      (
+        ProviderApi.anthropicMessages,
+        'https://gw.example.com/tenant/v1/v1/messages',
+        'https://gw.example.com/tenant/v1',
+      ),
+      (ProviderApi.anthropicMessages, 'https://gw.example.com/messages/messages', 'https://gw.example.com/messages'),
+    ]) {
+      test('Base URL endpoint: ${api.name} $input', () {
+        expect(normalizeBaseUrl(input, api), expected);
+      });
+    }
+
+    test('Base URL endpoints do not consume authority or another protocol path', () {
+      for (final api in ProviderApi.values) {
+        for (final url in ['https://messages', 'https://v1', 'https://responses', 'https://chat/completions']) {
+          expect(normalizeBaseUrl(url, api), url, reason: '$api $url');
+        }
+      }
+      for (final (api, path) in [
+        (ProviderApi.openaiCompletions, '/v1/messages'),
+        (ProviderApi.openaiResponses, '/v1/chat/completions'),
+        (ProviderApi.anthropicMessages, '/v1/responses'),
+        (ProviderApi.openaiCompletions, '/v1/chat/completions-extra'),
+        (ProviderApi.openaiResponses, '/api/v3'),
+        (ProviderApi.anthropicMessages, '/api/V1'),
+      ]) {
+        final url = 'https://gw.example.com$path';
+        expect(normalizeBaseUrl(url, api), url);
+      }
     });
 
     test('Base URL errors', () {
@@ -97,6 +176,7 @@ void main() {
       expect(formatTokens(1048576), '1M');
       expect(formatTokens(1000000), '1M');
       expect(formatTokens(32000), '32K');
+      expect(formatTokens(128000), '128K', reason: 'also 125 × 1024; the decimal reading wins');
       expect(formatTokens(4097), '4097');
     });
 
@@ -112,7 +192,7 @@ void main() {
 
     test('discovery failures name what to fix, in Chinese', () {
       expect(copy('https://gw.example.com/v1/models answered 401; check the API key'), 'API Key 无效或没有权限');
-      expect(copy('https://gw.example.com/models answered 404'), '找不到模型列表，检查 Base URL');
+      expect(copy('https://gw.example.com/models answered 404'), '找不到模型列表。检查 Base URL；有的服务不提供模型列表，可以手动添加模型');
       expect(copy('https://gw.example.com/v1/models answered 429'), '请求太频繁，稍后再试');
       expect(copy('https://gw.example.com/v1/models answered 502'), '服务暂时不可用（502）');
       expect(copy('https://gw.example.com/v1/models answered 418'), '服务返回了 418');
@@ -374,9 +454,18 @@ void main() {
       );
       final result = await container
           .read(providerActionsProvider)
-          .discover(api: ProviderApi.openaiCompletions, baseUrl: 'https://gw.example.com', apiKey: 'sk');
+          .discover(
+            api: ProviderApi.openaiCompletions,
+            baseUrl: 'https://gw.example.com',
+            apiKey: 'sk',
+            headers: const {'x-opencode-session': 'session-1'},
+          );
       expect(result.baseUrl, 'https://gw.example.com/v1');
       expect(result.models, hasLength(3));
+      expect(backend.calls.where((c) => c.$1 == 'discover').map((c) => c.$2['headers']), [
+        {'x-opencode-session': 'session-1'},
+        {'x-opencode-session': 'session-1'},
+      ]);
       expect(backend.calls.where((c) => c.$1 == 'discover').map((c) => c.$2['baseURL']), [
         'https://gw.example.com',
         'https://gw.example.com/v1',

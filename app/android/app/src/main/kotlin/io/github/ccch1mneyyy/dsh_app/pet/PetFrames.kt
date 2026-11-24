@@ -38,8 +38,10 @@ data class FramePx(val left: Int, val top: Int, val right: Int, val bottom: Int)
  * clear of the bars, so a grown frame never has to move the pet. [hit] is where a touch is the
  * pet's: the body, not the air a grown frame adds.
  *
- * Cells are placed as [PetView] draws them: the box offset rounded to whole physical pixels, the
- * size rounded on its own. Pure, for the JVM tests.
+ * Cells are placed as [PetView] draws them: each edge rounded to whole physical pixels, so a box
+ * inside another stays inside it at any scale (pixel art's whole k rounds nothing; smooth art's
+ * fractional k would otherwise push a cell flush with the rest frame one pixel past it). Pure,
+ * for the JVM tests.
  */
 class PetFrames(
     val restBox: PetBox,
@@ -49,14 +51,19 @@ class PetFrames(
     bodyBox: PetBox = restBox,
     /** By animation name: its body hit box ([PetPack.hitBoxFor]). */
     hitBoxes: Map<String, PetBox> = emptyMap(),
+    /** A float's fixed viewport around its alpha box; docking reserves it, touch does not. */
+    fullReach: FramePx? = null,
 ) {
     val rest = FramePx(0, 0, (restBox.w * k).roundToInt(), (restBox.h * k).roundToInt())
 
     /** [box] (canvas px) in physical px around the rest origin, placed as cells are. */
     fun place(box: PetBox): FramePx {
-        val l = ((box.x - restBox.x) * k).roundToInt()
-        val t = ((box.y - restBox.y) * k).roundToInt()
-        return FramePx(l, t, l + (box.w * k).roundToInt(), t + (box.h * k).roundToInt())
+        val x = box.x - restBox.x
+        val y = box.y - restBox.y
+        return FramePx(
+            (x * k).roundToInt(), (y * k).roundToInt(),
+            ((x + box.w) * k).roundToInt(), ((y + box.h) * k).roundToInt(),
+        )
     }
 
     /** Where [anim]'s cell is drawn, relative to the rest frame's origin. */
@@ -77,7 +84,7 @@ class PetFrames(
         .filterValues { it != rest }
 
     /** Rest and every grown frame: what a docked pet may need on screen. */
-    val reach: FramePx = grown.values.fold(rest, FramePx::union)
+    val reach: FramePx = fullReach ?: grown.values.fold(rest, FramePx::union)
 
     private val hits: Map<String, FramePx> = hitBoxes.mapValues { (_, box) -> rest.union(place(box)) }
 
@@ -92,12 +99,16 @@ class PetFrames(
 
     /**
      * The frame for [shown]: held while [holding] or while the held picture is still up (its
-     * successor's sheet may lag), a grown one while its animation shows, else rest.
+     * successor's sheet may lag), a grown one while its animation shows, else rest. During a
+     * crossfade the outgoing cell stays inside the window too, until [fadingFrom] is cleared.
      */
-    fun frameFor(shown: PetAnimation?, holding: Boolean): FramePx = when {
-        holding || (heldAnim != null && shown?.name == heldAnim.name) -> held
-        shown != null -> grown[shown.name] ?: rest
-        else -> rest
+    fun frameFor(shown: PetAnimation?, holding: Boolean, fadingFrom: PetAnimation? = null): FramePx {
+        val next = when {
+            holding || (heldAnim != null && shown?.name == heldAnim.name) -> held
+            shown != null -> grown[shown.name] ?: rest
+            else -> rest
+        }
+        return fadingFrom?.let { next.union(cell(it)) } ?: next
     }
 
     companion object {

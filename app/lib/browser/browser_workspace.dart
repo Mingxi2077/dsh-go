@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../remote/ssh/ssh_link.dart' show SshWebPreview;
 import '../state/draft_store.dart';
 import '../state/web_quote.dart';
 
@@ -38,13 +40,19 @@ class BrowserWorkspaceController extends Notifier<BrowserWorkspaceState> {
   late Future<void> _ready;
   Future<void> _writes = Future.value();
   final _deletedScopes = <BrowserScope>{};
+  final _webPreviews = <String, SshWebPreview>{};
   late BrowserNavigation _navigation;
   Future<void> get ready => _ready;
 
   @override
   BrowserWorkspaceState build() {
     final navigation = _navigation = BrowserNavigation.instance;
-    ref.onDispose(() => navigation.release(this));
+    ref.onDispose(() {
+      navigation.release(this);
+      for (final preview in _webPreviews.values) {
+        unawaited(preview.close());
+      }
+    });
     final storage = ref.read(browserStorageProvider);
     _ready = Future<void>.microtask(() => _restore(storage));
     return const BrowserWorkspaceState();
@@ -100,6 +108,9 @@ class BrowserWorkspaceController extends Notifier<BrowserWorkspaceState> {
 
   Future<BrowserTab> openHome(BrowserScope scope) => _open(scope, null);
 
+  Future<BrowserTab> openWebPreview(BrowserScope scope, SshWebPreview preview) =>
+      _open(scope, preview.uri, webPreview: preview);
+
   Future<BrowserTab> showHome(BrowserScope scope) async {
     await ready;
     if (!ref.mounted) throw StateError('disposed');
@@ -110,15 +121,30 @@ class BrowserWorkspaceController extends Notifier<BrowserWorkspaceState> {
     return home;
   }
 
-  Future<BrowserTab> _open(BrowserScope scope, Uri? url) async {
+  Future<BrowserTab> _open(BrowserScope scope, Uri? url, {SshWebPreview? webPreview}) async {
     await ready;
     if (!ref.mounted) throw StateError('disposed');
     if (_deletedScopes.contains(scope)) throw StateError('scope_deleted');
     if (state.tabs.length >= maxTabs || state.tabsFor(scope).length >= maxTabsPerScope) throw StateError('tab_limit');
     final id = List.generate(16, (_) => Random.secure().nextInt(256).toRadixString(16).padLeft(2, '0')).join();
-    final tab = BrowserTab(id: id, scope: scope, url: url, title: '', updatedAt: DateTime.now());
+    final tab = BrowserTab(
+      id: id,
+      scope: scope,
+      url: url,
+      title: '',
+      updatedAt: DateTime.now(),
+      webPreview: webPreview,
+    );
+    if (webPreview != null) {
+      _webPreviews[id] = webPreview;
+      unawaited(
+        webPreview.done.then((_) async {
+          if (ref.mounted && _webPreviews.containsKey(id)) await close(id);
+        }),
+      );
+    }
     _set([...state.tabs, tab], {...state.activeIds, scope.key: id});
-    await flush();
+    if (webPreview == null) await flush();
     return tab;
   }
 
@@ -132,9 +158,10 @@ class BrowserWorkspaceController extends Notifier<BrowserWorkspaceState> {
   }
 
   Future<void> updatePage(String id, {Uri? url, String? title}) async {
-    if (url != null && !BrowserPolicy.allows(url)) return;
     await ready;
-    if (!ref.mounted || !state.tabs.any((t) => t.id == id)) return;
+    if (!ref.mounted) return;
+    final current = state.tabs.where((tab) => tab.id == id).firstOrNull;
+    if (current == null || (url != null && !current.allows(url))) return;
     _set([
       for (final tab in state.tabs)
         // A late WebView callback must never turn Home back into a page.
@@ -143,7 +170,7 @@ class BrowserWorkspaceController extends Notifier<BrowserWorkspaceState> {
         else
           tab,
     ], state.activeIds);
-    await flush();
+    if (current.webPreview == null) await flush();
   }
 
   /// Navigating a native start page uses its existing tab, not another slot.
@@ -151,8 +178,9 @@ class BrowserWorkspaceController extends Notifier<BrowserWorkspaceState> {
     if (!BrowserPolicy.allows(url)) throw const FormatException('blocked_url');
     await ready;
     if (!ref.mounted) return;
-    if (!state.tabs.any((tab) => tab.id == id)) return;
-    if (state.tabs.any((tab) => tab.id == id && tab.isHome)) _navigation.reset(id);
+    final current = state.tabs.where((tab) => tab.id == id).firstOrNull;
+    if (current == null || current.webPreview != null) return;
+    if (current.isHome) _navigation.reset(id);
     _set([
       for (final tab in state.tabs)
         if (tab.id == id)
@@ -218,7 +246,7 @@ class BrowserWorkspaceController extends Notifier<BrowserWorkspaceState> {
     }
     _set(remaining, active);
     await flush();
-    return tab;
+    return tab.webPreview == null ? tab : null;
   }
 
   Future<void> restoreTab(BrowserTab tab) async {
@@ -231,6 +259,22 @@ class BrowserWorkspaceController extends Notifier<BrowserWorkspaceState> {
       throw StateError('tab_limit');
     }
     _set([...state.tabs, tab], {...state.activeIds, tab.scope.key: tab.id});
+    await flush();
+  }
+
+  /// After [ready], give the new chat's tabs to the session just created for it.
+  Future<void> assignNewChatTabs(String hostKey, String sessionId) async {
+    final source = BrowserScope(hostKey: hostKey);
+    final target = BrowserScope(hostKey: hostKey, sessionId: sessionId);
+    if (_deletedScopes.contains(target) || state.tabs.any((tab) => tab.scope == target)) return;
+    if (!state.tabs.any((tab) => tab.scope == source)) return;
+    final active = {...state.activeIds};
+    final selected = active.remove(source.key);
+    if (selected != null) active[target.key] = selected;
+    _set([
+      for (final tab in state.tabs)
+        if (tab.scope == source) tab.copyWith(scope: target) else tab,
+    ], active);
     await flush();
   }
 
@@ -248,7 +292,11 @@ class BrowserWorkspaceController extends Notifier<BrowserWorkspaceState> {
   }
 
   void _set(List<BrowserTab> tabs, Map<String, String> active) {
-    _navigation.synchronize(this, tabs);
+    final ids = tabs.map((tab) => tab.id).toSet();
+    for (final id in _webPreviews.keys.toList()) {
+      if (!ids.contains(id)) unawaited(_webPreviews.remove(id)!.close());
+    }
+    _navigation.synchronize(this, tabs.where((tab) => tab.webPreview == null));
     state = BrowserWorkspaceState(
       loaded: true,
       persistenceFailed: state.persistenceFailed,
@@ -261,7 +309,11 @@ class BrowserWorkspaceController extends Notifier<BrowserWorkspaceState> {
     await ready;
     if (!ref.mounted) return;
     final storage = ref.read(browserStorageProvider);
-    final value = jsonEncode({'v': 2, 'tabs': state.tabs.map((t) => t.toJson()).toList(), 'active': state.activeIds});
+    final value = jsonEncode({
+      'v': 2,
+      'tabs': state.tabs.where((tab) => tab.webPreview == null).map((tab) => tab.toJson()).toList(),
+      'active': Map.of(state.activeIds)..removeWhere((_, id) => _webPreviews.containsKey(id)),
+    });
     // Serialize writes so an older completion cannot overwrite a closed tab.
     _writes = _writes.then((_) async {
       var failed = false;

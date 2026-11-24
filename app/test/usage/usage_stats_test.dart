@@ -1,12 +1,15 @@
 // Anonymous usage statistics end to end on the phone's side, the network
-// faked: nothing before the person was told; each past day once, the day
-// after; back 7 days at most; off means no request and nothing kept; a new
-// install id every 90 days; 3 quiet tries a day; a body with exactly the
-// contract's fields; and the counts coming from where they happen.
+// faked: on by default; each past day once, the day after; back 7 days at
+// most; off leaves only Android's daily-activity base row, with its other
+// counts and their local data gone; a new install id every 90 days; 3 quiet
+// tries a day; a body with exactly the contract's fields; and the counts
+// coming from where they happen.
 
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:dsh_app/phone/phone_channel.dart';
+import 'package:dsh_app/state/android_features.dart';
 import 'package:dsh_app/usage/usage_ledger.dart';
 import 'package:dsh_app/usage/usage_net.dart';
 import 'package:dsh_app/usage/usage_stats.dart';
@@ -34,17 +37,21 @@ Future<ProviderContainer> start({
   String? engine,
   PhoneChannel? phone,
   UsageDevice phoneFacts = testDevice,
+  String? platform,
 }) async {
   SharedPreferences.setMockInitialValues(prefs);
   final container = ProviderContainer(
-    overrides: usageOverrides(
-      clock: () => now,
-      http: http,
-      onResumes: (onResume) => resume = onResume,
-      engine: engine,
-      phone: phone,
-      device: phoneFacts,
-    ),
+    overrides: [
+      ...usageOverrides(
+        clock: () => now,
+        http: http,
+        onResumes: (onResume) => resume = onResume,
+        engine: engine,
+        phone: phone,
+        device: phoneFacts,
+      ),
+      if (platform != null) operatingSystemProvider.overrideWithValue(platform),
+    ],
   );
   addTearDown(container.dispose);
   container.read(usageStatsProvider);
@@ -69,12 +76,35 @@ extension on ProviderContainer {
   }
 }
 
+/// Answers the first request, then the network is gone.
+class _RefusedThenOffline extends FakeUsageHttp {
+  @override
+  Future<int> post(Uri url, String json, {Duration timeout = const Duration(seconds: 10)}) {
+    offline = requests.isNotEmpty;
+    return super.post(url, json, timeout: timeout);
+  }
+}
+
+/// Keeps the first answer until the test gives it.
+class _FirstHeld extends FakeUsageHttp {
+  final first = Completer<int>();
+
+  @override
+  Future<int> post(Uri url, String json, {Duration timeout = const Duration(seconds: 10)}) {
+    if (requests.isNotEmpty) return super.post(url, json, timeout: timeout);
+    urls.add(url);
+    requests.add(jsonDecode(json) as Map<String, Object?>);
+    return first.future;
+  }
+}
+
 Future<Map<String, Object?>> stored() async {
   final prefs = await SharedPreferences.getInstance();
   return {for (final k in prefs.getKeys()) k: prefs.get(k)};
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
   final wasActive = UsageBuild.active;
   setUp(() {
     UsageBuild.active = true;
@@ -84,22 +114,49 @@ void main() {
   });
   tearDown(() => UsageBuild.active = wasActive);
 
-  test('nothing is counted or sent before the person has seen the switch', () async {
+  test('Android daily activity is on by default; off leaves only that, on the same install id', () async {
+    now = DateTime.utc(2026, 10, 28, 9);
+    final c = await start(platform: 'android');
+    await c.count(UsageCount.turns, 2);
+    c.usage.chatLogUsage({'inputTokens': 123}, local: false);
+    now = now.add(const Duration(days: 1));
+    await c.comeBack();
+    // The full statistics, without the switch ever having been shown.
+    expect(http.urls.any((url) => url.path.endsWith('/v1')), isTrue);
+    final v4 = http.requests.indexWhere((body) => body['v'] == 4);
+    expect(v4, isNonNegative);
+    expect(http.requests[v4]['base'], [1, 1]);
+    expect(http.requests[v4]['chat_log'], isNotNull);
+    final iid =
+        (jsonDecode((await stored())[UsageStatsController.v4LedgerKey] as String) as Map<String, dynamic>)['iid'];
+
+    await c.usage.setEnabled(false);
+    await settle();
+    final sent = http.requests.length;
+    now = now.add(const Duration(days: 1));
+    await c.comeBack();
+    // The daily-activity package alone: no v1, no tokens, no device model.
+    expect(http.requests, hasLength(sent + 1));
+    final daily = http.requests.last;
+    expect(daily['v'], 4);
+    expect(daily['base'], [1, 0]);
+    expect(daily.keys, isNot(contains('chat_log')));
+    expect(daily.keys, isNot(contains('extra')));
+    expect([daily['maker'], daily['model'], daily['rom']], ['', '', '']);
+    expect(
+      (jsonDecode((await stored())[UsageStatsController.v4LedgerKey] as String) as Map<String, dynamic>)['iid'],
+      iid,
+    );
+  });
+
+  test('on by default: counted and sent even before the switch was ever shown', () async {
     final c = await start();
     expect(c.read(usageStatsProvider).enabled, isTrue, reason: 'on by default');
     await c.count(UsageCount.turns, 3);
     now = DateTime(2026, 10, 29, 9);
     await c.comeBack();
-    expect(http.requests, isEmpty);
-    expect((await stored()).keys.where((k) => k.startsWith('usage_stats_days')), isEmpty);
-
-    // Shown at first run (or in settings): from then on, it counts.
-    await c.usage.markNoticed();
-    await c.count(UsageCount.turns);
-    now = DateTime(2026, 10, 30, 9);
-    await c.comeBack();
-    expect(http.days, ['2026-10-29']);
-    expect((http.requests.single['counts']! as Map)['turns'], 1);
+    expect(http.days, ['2026-10-28']);
+    expect((http.requests.single['counts']! as Map)['turns'], 3);
   });
 
   test('a past day goes out once, the day after; today waits for tomorrow', () async {
@@ -283,7 +340,10 @@ void main() {
 
   test('a body the host would refuse is never sent', () async {
     // No native side: no build number, no ABI.
-    final c = await start(prefs: noticed, phoneFacts: const UsageDevice(app: '0.9.9', sdk: 34, maker: 'vivo'));
+    final c = await start(
+      prefs: noticed,
+      phoneFacts: const UsageDevice(app: '0.9.9', sdk: 34, maker: 'vivo'),
+    );
     await c.count(UsageCount.turns);
     now = DateTime(2026, 10, 29, 9);
     await c.comeBack();
@@ -306,6 +366,94 @@ void main() {
       expect(usageProblem(body, now), isNull, reason: '$body');
       expect(body['iid'], matches(RegExp(r'^[A-Za-z0-9_-]{21}[AQgw]$')));
     }
+  });
+
+  const phone = UsageDevice(
+    app: '0.9.9',
+    build: 10301000,
+    sdk: 34,
+    abi: 'arm64-v8a',
+    maker: 'vivo',
+    model: 'v2405a',
+    rom: 'originos 5.0',
+  );
+
+  test(
+    'v3 with the model, system and its counts; a host that refuses it gets v2, then v1, for the rest of the run',
+    () async {
+      http = FakeUsageHttp()..replies.addAll([400, 400]);
+      final ledger = UsageLedger()
+        ..touch(DateTime(2026, 10, 26, 9))
+        ..touch(DateTime(2026, 10, 27, 9));
+      await start(prefs: {...noticed, UsageStatsController.daysKey: ledger.encode()}, phoneFacts: phone);
+      expect(
+        [for (final r in http.requests) '${r['day']} v${r['v']}'],
+        ['2026-10-26 v3', '2026-10-26 v2', '2026-10-26 v1', '2026-10-27 v1'],
+      );
+      expect(http.requests.first.keys.toSet(), usagePayloadKeysV2);
+      expect((http.requests.first['counts']! as Map).keys.toSet(), usageCountKeysV3);
+      expect([http.requests.first['model'], http.requests.first['rom']], ['v2405a', 'originos 5.0']);
+      expect((http.requests[1]['counts']! as Map).keys.toSet(), usageCountKeys);
+      expect(http.requests[2].keys.toSet(), usagePayloadKeys);
+      final left = UsageLedger.decode((await stored())[UsageStatsController.daysKey] as String?);
+      expect(left.days.keys, ['2026-10-28'], reason: 'both days went out');
+    },
+  );
+
+  test('a host from before v3 takes v2 for the rest of the run', () async {
+    http = FakeUsageHttp()..replies.add(400);
+    final ledger = UsageLedger()
+      ..touch(DateTime(2026, 10, 26, 9))
+      ..touch(DateTime(2026, 10, 27, 9));
+    await start(prefs: {...noticed, UsageStatsController.daysKey: ledger.encode()}, phoneFacts: phone);
+    expect(
+      [for (final r in http.requests) '${r['day']} v${r['v']}'],
+      ['2026-10-26 v3', '2026-10-26 v2', '2026-10-27 v2'],
+    );
+  });
+
+  test('off and on again while a v3 send waits: its 400 sends nothing from before again', () async {
+    final held = _FirstHeld();
+    http = held;
+    final ledger = UsageLedger()..touch(DateTime(2026, 10, 26, 9));
+    final c = await start(prefs: {...noticed, UsageStatsController.daysKey: ledger.encode()}, phoneFacts: phone);
+    expect(held.requests, hasLength(1));
+    await c.usage.setEnabled(false);
+    await c.usage.setEnabled(true);
+    await settle();
+    held.first.complete(400);
+    await settle();
+    expect(held.requests, hasLength(1), reason: 'the old id and day are gone');
+  });
+
+  test('no answer to the lower contract is a failed send, not a refusal', () async {
+    http = _RefusedThenOffline()..replies.add(400);
+    final ledger = UsageLedger()..touch(DateTime(2026, 10, 26, 9));
+    await start(prefs: {...noticed, UsageStatsController.daysKey: ledger.encode()}, phoneFacts: phone);
+    expect([for (final r in http.requests) '${r['day']} v${r['v']}'], ['2026-10-26 v3', '2026-10-26 v2']);
+    final left = UsageLedger.decode((await stored())[UsageStatsController.daysKey] as String?);
+    expect(left.days['2026-10-26']?.tries, 1, reason: 'kept for another try');
+  });
+
+  test('the tavern, the room, calls and tokens go out in v3', () async {
+    final c = await start(prefs: noticed, phoneFacts: phone);
+    await c.count(UsageCount.tavern, 3);
+    await c.count(UsageCount.room);
+    await c.count(UsageCount.call, 2);
+    c.usage
+      ..tokens(1500, 200)
+      ..tokens(500, 50);
+    await settle();
+    now = DateTime(2026, 10, 29, 9);
+    await c.comeBack();
+    final counts = http.requests.single['counts']! as Map<String, Object?>;
+    expect(http.requests.single['v'], 3);
+    expect(
+      {
+        for (final key in ['tavern', 'room', 'call', 'tok_in', 'tok_out']) key: counts[key],
+      },
+      {'tavern': 3, 'room': 1, 'call': 2, 'tok_in': 2000, 'tok_out': 250},
+    );
   });
 
   test('the request: the endpoint, and nothing but the contract\'s fields', () async {
@@ -354,7 +502,9 @@ void main() {
   test('phone control: each task counts once, when it starts', () async {
     final phone = FakePhone();
     final c = await start(prefs: noticed, phone: phone);
-    PhoneStatus task(bool active, int id) => PhoneStatus(task: PhoneTaskStatus(id: id, active: active));
+    PhoneStatus task(bool active, int id) => PhoneStatus(
+      task: PhoneTaskStatus(id: id, active: active),
+    );
     for (final s in [task(true, 1), task(true, 1), task(false, 1), task(true, 2), task(true, 3), task(false, 3)]) {
       phone.pushes.add(s);
       await settle();

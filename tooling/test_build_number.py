@@ -4,6 +4,7 @@
 """
 
 import datetime
+import os
 import pathlib
 import re
 import subprocess
@@ -20,6 +21,15 @@ def at(text: str) -> datetime.datetime:
 
 
 class BuildNumberTest(unittest.TestCase):
+    def test_app_version_fallback_matches_pubspec(self):
+        pubspec = (ROOT / "app" / "pubspec.yaml").read_text(encoding="utf-8")
+        app_info = (ROOT / "app" / "lib" / "state" / "app_info.dart").read_text(encoding="utf-8")
+        version = re.search(r"^version:\s*(\S+)", pubspec, re.MULTILINE)
+        fallback = re.search(r"String\.fromEnvironment\('DSH_APP_VERSION', defaultValue: '([^']+)'\)", app_info)
+        self.assertIsNotNone(version)
+        self.assertIsNotNone(fallback)
+        self.assertEqual(fallback.group(1), version.group(1))
+
     def test_reads_as_the_build_minute(self):
         self.assertEqual(build_number(at("2026-10-25T12:34+08:00")), 10251234)
         self.assertEqual(build_number(at("2026-01-01T00:00+08:00")), 1010000)
@@ -90,6 +100,16 @@ class BuildNumberTest(unittest.TestCase):
 class BuildApkDryRunTest(unittest.TestCase):
     def run_script(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", str(SCRIPT), "--dry-run", *args], capture_output=True, text=True)
+
+    def test_relative_script_ignores_exported_cdpath(self):
+        expected = self.run_script("-n", "10251234")
+        self.assertEqual(expected.returncode, 0, expected.stderr)
+        result = subprocess.run(
+            ["bash", "tooling/build-apk.sh", "--dry-run", "-n", "10251234"],
+            cwd=ROOT, env=dict(os.environ, CDPATH="."), capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, expected.stdout)
 
     def test_both_flavors_share_one_build_number(self):
         out = self.run_script("-f", "all").stdout

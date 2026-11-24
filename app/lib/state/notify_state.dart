@@ -11,8 +11,10 @@ import '../notify/answer_native_request.dart';
 import '../notify/notify_channel.dart';
 import '../phone/phone_channel.dart';
 import '../phone/phone_approval.dart';
-import '../pets/pet_signals.dart' show petHearAlert, petOnScreenProvider;
+import '../companion/companion_state.dart';
+import '../pets/pet_signals.dart' show petHearAlert, petOnScreenProvider, petEventBusProvider;
 import 'app_info.dart';
+import 'android_features.dart';
 import 'bots_state.dart';
 import 'chat_state.dart';
 import 'connection_state.dart';
@@ -181,9 +183,22 @@ final launchNoticeShownProvider = NotifierProvider<FlagController, bool>(() => F
 /// A conversation on a host.
 typedef ChatTarget = ({HostRef host, String sessionId});
 
-/// The conversation the person is looking at right now, or null.
+/// The conversation a voice call is having, while the call is up.
+final callChatProvider = NotifierProvider<CallChat, ChatTarget?>(CallChat.new);
+
+class CallChat extends Notifier<ChatTarget?> {
+  @override
+  ChatTarget? build() => null;
+
+  void set(ChatTarget? target) => state = target;
+}
+
+/// The conversation the person is looking at right now, or null. On a call,
+/// the call's: they hear it and speak to it, though the chat is under the call.
 final viewedChatProvider = Provider<ChatTarget?>((ref) {
-  if (!ref.watch(appForegroundProvider) || !ref.watch(chatOnScreenProvider)) return null;
+  if (!ref.watch(appForegroundProvider)) return null;
+  if (ref.watch(callChatProvider) case final call?) return call;
+  if (!ref.watch(chatOnScreenProvider)) return null;
   final session = ref.watch(currentSessionProvider);
   if (session == null) return null;
   return (host: ref.watch(activeHostProvider), sessionId: session);
@@ -216,8 +231,9 @@ AlertDelivery deliveryFor(
   bool petOnScreen = false,
 }) {
   if (!prefs.allows(alert.kind)) return AlertDelivery.none;
-  if (viewed != null && viewed.host == alert.host && viewed.sessionId == alert.sessionId) return AlertDelivery.none;
+  // A lifecycle listener may still see the last foreground viewed target.
   if (!foreground) return AlertDelivery.system;
+  if (viewed != null && viewed.host == alert.host && viewed.sessionId == alert.sessionId) return AlertDelivery.none;
   return petOnScreen ? AlertDelivery.pet : AlertDelivery.banner;
 }
 
@@ -234,6 +250,7 @@ NotifyPost postFor(ChatAlert alert) => NotifyPost(
   eventId: alert.eventId,
   canApprove: alert.canApprove,
   fullText: alert.fullText,
+  requestToken: alert.petToken,
 );
 
 class _PhoneAlertPrompt {
@@ -338,16 +355,17 @@ class ChatAlertsController extends Notifier<ChatAlert?> {
       }
     });
     ref.listen(appForegroundProvider, (_, foreground) {
-      // Leaving the app with a banner up: keep it as a notification.
+      // Attention banners are recovered from pending requests below, exactly
+      // once. Only terminal banners need a separate migration to the shade.
       final banner = _banner;
       if (!foreground && banner != null) {
         _banner = null;
-        if (!banner.kind.attention || !banner.host.isLocal) unawaited(_channel.show(postFor(banner)));
+        if (!banner.kind.attention) unawaited(_channel.show(postFor(banner)));
       }
       if (!foreground) {
-        // An approval can already be visible in the chat when the person
-        // leaves for another app. It still needs an operational prompt.
-        final pending = _trackers[HostRef.local]?.$2.pendingAlerts.toList() ?? const <ChatAlert>[];
+        // A request may have been quiet because its conversation was visible.
+        // Revisit every host; only local requests can use the phone prompt.
+        final pending = [for (final (_, tracker) in _trackers.values) ...tracker.pendingAlerts];
         for (final alert in pending) {
           if (!_offerPhonePrompt(alert)) _deliver(alert);
         }
@@ -359,6 +377,7 @@ class ChatAlertsController extends Notifier<ChatAlert?> {
 
   /// Answers the approval behind a tapped notification button on its host.
   Future<NotifyActionResult> respondAction(NotifyAction action) async {
+    if (ref.read(operatingSystemProvider) == 'ohos') return _respondOhosAction(action);
     final attached = _trackers[action.host];
     if (attached == null || !attached.$2.source.connected) return NotifyActionResult.failed;
     final request = attached.$2.approvalFor(action.eventId);
@@ -366,6 +385,47 @@ class ChatAlertsController extends Notifier<ChatAlert?> {
     try {
       await attached.$1.client.respondApproval(request, action.decision);
       return NotifyActionResult.handled;
+    } catch (_) {
+      return NotifyActionResult.failed;
+    }
+  }
+
+  Future<NotifyActionResult> _respondOhosAction(NotifyAction action) async {
+    final attached = _trackers[action.host];
+    if (attached == null || !attached.$2.source.connected) return NotifyActionResult.failed;
+    final sessionId = action.sessionId;
+    final token = action.requestToken;
+    if (sessionId == null ||
+        token == null ||
+        action.actionId == null ||
+        action.group != notifyGroup(action.host, sessionId) ||
+        action.key != action.eventId) {
+      return NotifyActionResult.gone;
+    }
+    final scope = ref;
+    final lifetime = _lifetime;
+    final generation = attached.$1.client.mux.generation;
+    bool current() =>
+        scope.mounted &&
+        identical(_lifetime, lifetime) &&
+        identical(_trackers[action.host]?.$1.client, attached.$1.client) &&
+        identical(_trackers[action.host]?.$2, attached.$2) &&
+        attached.$2.petRequestMatches(action.eventId, sessionId, token);
+    if (!current()) return NotifyActionResult.gone;
+    if (generation == null) return NotifyActionResult.failed;
+    // Notification previews deliberately allow more than the floating pet can show.
+    // The displayed session is the root; the original request can belong to a subagent.
+    final request = attached.$2.approvalFor(action.eventId);
+    if (request == null) return NotifyActionResult.gone;
+    try {
+      final sent = await answerPhoneApproval(
+        client: attached.$1.client,
+        generation: generation,
+        request: request,
+        decision: action.decision,
+        current: current,
+      );
+      return sent ? NotifyActionResult.handled : NotifyActionResult.gone;
     } catch (_) {
       return NotifyActionResult.failed;
     }
@@ -450,7 +510,16 @@ class ChatAlertsController extends Notifier<ChatAlert?> {
 
   void _attach(HostRef host, HostConnection? connection) {
     final current = _trackers[host];
-    if (current != null && identical(current.$1.client, connection?.client)) return;
+    if (current != null && identical(current.$1, connection)) return;
+    if (current != null &&
+        connection != null &&
+        identical(current.$1.client, connection.client) &&
+        current.$2.updateCompanionConnection(previous: current.$1, next: connection)) {
+      // A name/cwd refresh wraps the same live client. Keep its pending scopes,
+      // phone card and alert history; future metadata uses the new wrapper.
+      _trackers[host] = (connection, current.$2);
+      return;
+    }
     if (current != null) {
       _cancelPhonePrompt(host: host);
       _trackers.remove(host);
@@ -458,20 +527,63 @@ class ChatAlertsController extends Notifier<ChatAlert?> {
     }
     if (connection == null) return;
     final timing = ref.read(alertTimingProvider);
-    final tracker = HostAlertTracker(
+    final scope = ref, lifetime = _lifetime;
+    late final HostAlertTracker tracker;
+    bool attached() =>
+        scope.mounted &&
+        identical(_lifetime, lifetime) &&
+        identical(_trackers[host]?.$1.client, connection.client) &&
+        identical(_trackers[host]?.$2, tracker);
+    tracker = HostAlertTracker(
       host: host,
       source: ref.read(alertSourceFactoryProvider)(connection),
-      onAlert: _onAlert,
-      onWithdraw: _onWithdraw,
-      onSessionGone: _onSessionGone,
-      onReannounce: (alert) => _offerPhonePrompt(alert),
-      onRequestEpochChanged: (host) => _cancelPhonePrompt(host: host),
-      skipApproval: (sessionId) => ref.exists(chatProvider(sessionId)) && ref.read(chatProvider(sessionId)).autoApprove,
+      onAlert: (alert) {
+        if (attached()) _onAlert(alert);
+      },
+      onWithdraw: (host, session, key) {
+        if (attached()) _onWithdraw(host, session, key);
+      },
+      onSessionGone: (host, session) {
+        if (attached()) _onSessionGone(host, session);
+      },
+      onReannounce: (alert) {
+        if (attached()) _onReannounce(alert);
+      },
+      onRequestEpochChanged: (host) {
+        if (attached()) _cancelPhonePrompt(host: host);
+      },
+      companionConnection: connection,
+      isCompanionAttached: attached,
+      onCompanionSignal: (delivery) {
+        if (attached()) scope.read(petEventBusProvider).companionSignal(delivery);
+      },
+      skipApproval: (sessionId) =>
+          attached() && scope.exists(chatProvider(sessionId)) && scope.read(chatProvider(sessionId)).autoApprove,
       announceDelay: timing.announce,
       reconcileDelay: timing.reconcile,
     );
     _trackers[host] = (connection, tracker);
     tracker.start();
+  }
+
+  void _onReannounce(ChatAlert alert) {
+    if (ref.read(operatingSystemProvider) != 'ohos') {
+      _offerPhonePrompt(alert);
+      return;
+    }
+    if (_offerPhonePrompt(alert) || ref.read(dsBotSessionFilterProvider)(alert.host, alert.sessionId)) return;
+    // HostReady invalidates old action tokens even when the same event is redelivered.
+    // Refresh only a system notification; do not replay banners or pet activity.
+    if (deliveryFor(
+          alert,
+          prefs: ref.read(notifyPrefsProvider),
+          foreground: ref.read(appForegroundProvider),
+          viewed: ref.read(viewedChatProvider),
+          petOnScreen: ref.read(petOnScreenProvider),
+        ) ==
+        AlertDelivery.system) {
+      unawaited(_channel.show(postFor(alert)));
+    }
   }
 
   void _onAlert(ChatAlert alert, {bool ownerWaited = false}) {
@@ -669,6 +781,10 @@ class ChatAlertsController extends Notifier<ChatAlert?> {
   void _deliver(ChatAlert alert) {
     // DS Bot's own conversations: it sends its own notifications.
     if (ref.read(dsBotSessionFilterProvider)(alert.host, alert.sessionId)) return;
+    // The companion's reply is on her page; it isn't a finished task. A request
+    // that really waits on the person (an older host's preset has tools) still
+    // goes through.
+    if (!alert.kind.attention && ref.read(companionSessionFilterProvider)(alert.host, alert.sessionId)) return;
     final prefs = ref.read(notifyPrefsProvider);
     final foreground = ref.read(appForegroundProvider);
     final delivery = deliveryFor(

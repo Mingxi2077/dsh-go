@@ -2,8 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:url_launcher/url_launcher.dart';
 
-import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../../state/plugins_state.dart';
 import '../common/app_sheet.dart' show groupTitleStyle;
@@ -130,7 +130,7 @@ class _MarketSliverState extends ConsumerState<MarketSliver> {
                   ),
                   for (final c in categories)
                     _CategoryChip(
-                      label: c.title.resolve('zh'),
+                      label: c.title.resolve(Localizations.localeOf(context).languageCode),
                       selected: filter.category == c.id,
                       onSelected: () =>
                           ref.read(marketFilterProvider.notifier).setCategory(filter.category == c.id ? null : c.id),
@@ -287,7 +287,7 @@ class _SubmitPlugin extends StatelessWidget {
     final l10n = context.l10n;
     final messenger = ScaffoldMessenger.maybeOf(context);
     final uri = Uri.parse(marketSubmitUrl);
-    if (!await BrowserLinks.open(uri)) {
+    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
       messenger?.showSnackBar(SnackBar(content: Text(l10n.hubPluginBrowserFailed(uri.host))));
     }
   }

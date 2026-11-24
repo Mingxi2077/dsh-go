@@ -7,6 +7,8 @@ import 'package:dsh_app/state/update_state.dart';
 import 'package:dsh_app/update/installer.dart';
 import 'package:dsh_app/update/release.dart';
 import 'package:dsh_app/update/update_config.dart';
+import 'package:dsh_app/update/update_http.dart';
+import 'package:dsh_app/update/version.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -127,7 +129,8 @@ void main() {
     });
 
     test('daily auto check: offers once, then waits a day; remembers the endpoint that answered', () async {
-      http.routes[_manifest] = (_, _) => textResponse(jsonEncode(_release()));
+      const m1 = 'https://mirror-one.example/$_manifest';
+      http.routes[m1] = (_, _) => textResponse(jsonEncode(_release()));
       final c = container();
       final controller = await ready(c);
 
@@ -136,7 +139,7 @@ void main() {
       expect(state.check, UpdateCheckPhase.available);
       expect(state.latest!.version.name, '1.2.0');
       expect(state.asset!.name, 'dsh-go-1.2.0-arm64.apk');
-      expect(http.urls, [_api, _manifest]);
+      expect(http.urls, [_manifest, m1]);
 
       now = now.add(const Duration(hours: 5));
       expect(await controller.autoCheckIfDue(), isFalse);
@@ -145,7 +148,28 @@ void main() {
       now = now.add(const Duration(hours: 20));
       http.requests.clear();
       expect(await controller.autoCheckIfDue(), isTrue);
-      expect(http.urls, [_manifest], reason: 'starts where it worked last time');
+      expect(http.urls, [m1], reason: 'starts where it worked last time');
+    });
+
+    test('a build without the APK installer (HarmonyOS) never checks or offers', () async {
+      // A real channel with no handler behind it, as on HarmonyOS.
+      TestWidgetsFlutterBinding.ensureInitialized();
+      final c = ProviderContainer(
+        overrides: [
+          updateHttpProvider.overrideWithValue(http),
+          updateInstallerProvider.overrideWithValue(const ChannelUpdateInstaller()),
+          updateSourcesProvider.overrideWithValue(_sources),
+          updateClockProvider.overrideWithValue(() => now),
+          updateDirectoryProvider.overrideWithValue(() async => dir),
+        ],
+      );
+      addTearDown(c.dispose);
+      final controller = await ready(c);
+      expect(c.read(appUpdateProvider).loaded, isTrue);
+      expect(c.read(appUpdateProvider).installable, isFalse);
+      expect(await controller.autoCheckIfDue(), isFalse);
+      expect(await controller.check(), UpdateCheckPhase.idle);
+      expect(http.requests, isEmpty);
     });
 
     test('switched off: no automatic check', () async {
@@ -155,6 +179,22 @@ void main() {
       expect(await controller.autoCheckIfDue(), isFalse);
       expect(http.requests, isEmpty);
       expect((await SharedPreferences.getInstance()).getBool('update_auto_check'), isFalse);
+    });
+
+    test('switched off while the check is in flight: no offer, but the result is kept', () async {
+      final answer = Completer<UpdateHttpResponse>();
+      http.routes[_manifest] = (_, _) => answer.future;
+      final c = container();
+      final controller = await ready(c);
+      final offered = controller.autoCheckIfDue();
+      await pumpEventQueue();
+      expect(http.urls, [_manifest]);
+      await controller.setAutoCheck(false);
+      answer.complete(textResponse(jsonEncode(_release())));
+      expect(await offered, isFalse);
+      final state = c.read(appUpdateProvider);
+      expect(state.autoCheck, isFalse);
+      expect(state.hasUpdate, isTrue, reason: 'a manual look still finds it');
     });
 
     test('a skipped version is not offered again, a newer one is; a manual check still shows it', () async {
@@ -174,6 +214,18 @@ void main() {
       expect(await controller.autoCheckIfDue(), isTrue);
       expect(c.read(appUpdateProvider).latest!.version.name, '1.2.1');
       expect(c.read(appUpdateProvider).isSkipped, isFalse);
+    });
+
+    test('a release skipped from one source stays skipped from the other', () {
+      AppUpdateState offer(String latest, String skipped) => AppUpdateState(
+        current: AppVersion.tryParse('1.0.0')!,
+        latest: ReleaseInfo(version: AppVersion.tryParse(latest)!, tag: 'v1.2.0', apks: const {}),
+        skippedVersion: skipped,
+      );
+      // The manifest's 1.2.0+N and the API's tag v1.2.0 are one release.
+      expect(offer('1.2.0', '1.2.0+11170000').isSkipped, isTrue);
+      expect(offer('1.2.0+11170000', '1.2.0').isSkipped, isTrue);
+      expect(offer('1.2.0+11170001', '1.2.0+11170000').isSkipped, isFalse);
     });
 
     test('same version as installed → up to date', () async {
@@ -320,6 +372,27 @@ void main() {
       expect(http.urls.where((u) => u.endsWith('.apk')), isEmpty);
     });
 
+    test('an APK already here needs room only for its install copy', () async {
+      http.routes[_manifest] = (_, _) => textResponse(jsonEncode(_release()));
+      http.routes[_apkUrl] = fileRoute(_apk);
+      final c = container();
+      final controller = await ready(c);
+      await controller.check();
+      await controller.startDownload();
+      expect(c.read(appUpdateProvider).task, UpdateTaskPhase.ready);
+      // Room for one more copy, not two: the cached APK is checked and reused.
+      installer.app = InstalledApp(
+        versionName: '1.0.0',
+        versionCode: 1,
+        abi: 'arm64',
+        freeBytes: _apk.length + 64 * 1024 * 1024,
+      );
+      http.requests.clear();
+      await controller.startDownload();
+      expect(c.read(appUpdateProvider).task, UpdateTaskPhase.ready);
+      expect(http.urls.where((u) => u.endsWith('.apk')), isEmpty);
+    });
+
     test('a system dialog that closes without reporting frees the install after a grace period', () async {
       http.routes[_manifest] = (_, _) => textResponse(jsonEncode(_release()));
       http.routes[_apkUrl] = fileRoute(_apk);
@@ -333,6 +406,7 @@ void main() {
       expect(c.read(appUpdateProvider).task, UpdateTaskPhase.installing);
       await controller.onAppResumed(confirmGrace: const Duration(milliseconds: 10));
       expect(c.read(appUpdateProvider).task, UpdateTaskPhase.ready);
+      expect(c.read(appUpdateProvider).problem, UpdateProblem.installUnconfirmed);
       // A late answer from the abandoned attempt changes nothing.
       installer.pending!.complete(const InstallResult(InstallStatus.failure));
       await installing;

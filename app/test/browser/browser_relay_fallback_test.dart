@@ -85,22 +85,12 @@ void main() {
       expect(relay.pendingLogin!.isCompleted, isFalse);
       expect(relay.cancellations, 0);
 
-      if (scenario.expected == 'google') {
-        expect(authorizations, isEmpty, reason: 'Google must bypass the embedded authorization handler');
-        expect(systemCalls, hasLength(1));
-        final call = systemCalls.single;
-        expect(call.method, 'launch');
-        final arguments = call.arguments as Map;
-        expect(arguments['url'], waiting.loginUrl.toString());
-        expect(arguments['useWebView'], isFalse);
-        expect(arguments['useSafariVC'], isFalse);
-      } else {
-        expect(systemCalls, isEmpty);
-        final request = authorizations.single;
-        expect(request.url, waiting.loginUrl);
-        expect(request.preferSystem, isFalse);
-        expect(request.isCurrent(), isTrue);
-      }
+      expect(authorizations, isEmpty, reason: 'relay sign-in uses the platform browser, not the embedded WebView');
+      expect(systemCalls, hasLength(1));
+      final call = systemCalls.single;
+      expect(call.method, 'launch');
+      final arguments = call.arguments as Map;
+      expect(arguments['url'], waiting.loginUrl.toString());
 
       final user = RelayUser(id: 'signed-in', displayName: 'Test account', provider: scenario.expected);
       relay.pendingLogin!.complete(user);
@@ -112,10 +102,7 @@ void main() {
       expect(finished.error, isNull);
       expect(finished.hosts, sampleRelayHosts);
       expect(relay.cancellations, 0, reason: 'opening either browser must not cancel a successful login');
-      if (authorizations.isNotEmpty) {
-        await authorizations.single.completed;
-        expect(authorizations.single.isCurrent(), isFalse);
-      }
+
     });
   }
 }

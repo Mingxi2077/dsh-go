@@ -1,9 +1,10 @@
 // Golden screenshots of 不打扰模式's channel picker: a first visit, Sui in use,
 // Sui waiting for its permission, root failing with its own reason and root
 // waiting for its manager, root unfolded before the first su and its notice,
-// self-paired ADB mid-pairing, and an old native module's three-way page; then
-// 自动恢复无障碍 granting through root and offering it. The dense ones again at
-// 320 dp with 1.3× text (`_320`), one in English.
+// self-paired ADB mid-pairing, and an old native module's three-way page; 保持
+// on for root (connected, unfolded), for ADB waiting for Wi-Fi and for Sui after
+// a failed reconnect; then 自动恢复无障碍 granting through root and offering it.
+// The dense ones again at 320 dp with 1.3× text (`_320`), some in English.
 //
 //   flutter test --update-goldens test/phone/dnd_mode_golden_test.dart
 
@@ -53,8 +54,13 @@ void dndGolden(
 }
 
 Future<void> Function(WidgetTester) tapText(String text) => (tester) async {
-  await tester.tap(find.text(text));
-  await tester.pumpAndSettle();
+  if (text == 'Root' || text == 'Sui' || text == '自连 ADB') {
+    await openPhoneChannel(tester, text);
+  } else {
+    await tester.ensureVisible(find.text(text));
+    await tester.tap(find.text(text));
+    await tester.pumpAndSettle();
+  }
 };
 
 Map<String, Object?> firstVisit() => privilegedStatus();
@@ -79,6 +85,30 @@ Map<String, Object?> rootLost() => privilegedStatus(
   reason: 'root 通道已断开，请重新选择以连接',
   root: {'checked': true, 'available': true, 'reasonCode': 'rootDisconnected'},
   shizukuApp: true,
+);
+
+Map<String, Object?> rootKept() => privilegedStatus(
+  mode: 'root',
+  ready: true,
+  root: {'checked': true, 'available': true, 'connected': true},
+  keep: {'enabled': true, 'mode': 'root', 'phase': 'connected', 'reasonCode': null},
+);
+
+Map<String, Object?> adbKeptOffline() => privilegedStatus(
+  mode: 'adb',
+  reason: '无线调试未连接',
+  wirelessDebugging: null,
+  paired: true,
+  keep: {'enabled': true, 'mode': 'adb', 'phase': 'waiting', 'reasonCode': 'networkUnavailable'},
+);
+
+Map<String, Object?> suiKeptFailed() => privilegedStatus(
+  mode: 'sui',
+  reason: '特权通道未就绪',
+  provider: 'sui',
+  running: true,
+  granted: true,
+  keep: {'enabled': true, 'mode': 'sui', 'phase': 'failed', 'reasonCode': 'connectFailed'},
 );
 
 /// The old field 自动恢复无障碍 still reads for the computer's command.
@@ -142,6 +172,13 @@ void main() {
     narrow: true,
     before: tapText('自连 ADB'),
   );
+
+  // 保持 on: root connected and unfolded, then two channels still reconnecting.
+  dndGolden('dnd_keep_root', rootKept, before: tapText('Root'));
+  dndGolden('dnd_keep_root', rootKept, narrow: true, before: tapText('Root'));
+  dndGolden('dnd_keep_root', rootKept, narrow: true, english: true, before: tapText('Root'));
+  dndGolden('dnd_keep_adb_waiting', adbKeptOffline, size: const Size(390, 1150), narrow: true);
+  dndGolden('dnd_keep_sui_failed', suiKeptFailed, narrow: true);
 
   // An old native module: Shizuku and ADB only, Shizuku in use.
   dndGolden(

@@ -2,11 +2,11 @@
 // step of the sign-in sheet against a fake bridge, polling that stops with
 // the sheet, and the signed-in page's sign-out.
 
-import 'dart:async';
-
-import 'package:dsh_app/browser/browser_links.dart';
 import 'package:dsh_app/l10n/l10n.dart';
-import 'package:dsh_app/state/account_state.dart' show EmbeddedAccountBrowser, accountBrowserProvider;
+import 'package:dsh_app/state/account_state.dart' show accountBrowserProvider;
+import 'package:dsh_app/state/android_features.dart';
+import 'package:dsh_app/state/connection_state.dart';
+import 'package:dsh_app/state/hosts_state.dart';
 import 'package:dsh_app/state/models_state.dart';
 import 'package:dsh_app/state/subscriptions_state.dart';
 import 'package:dsh_app/ui/common/list_page_row.dart';
@@ -16,10 +16,14 @@ import 'package:dsh_app/ui/providers/subscription_sheet.dart';
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart' show AsyncData;
 import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 
 import '../account/support.dart' show FakeBrowser;
+import '../clipboard/fake_paste.dart';
+import '../engine_settings/support.dart' show FakeSettingsHost;
+import '../phone/support.dart' show FixedActiveHost;
 import '../shell/golden_harness.dart' show goldenApp, loadGoldenFonts;
 import 'support.dart';
 
@@ -37,6 +41,26 @@ final _codexCatalog = ModelCatalog(
     ProviderGroup('openai-codex', 'ChatGPT', [
       ModelInfo(provider: 'openai-codex', id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex'),
       ModelInfo(provider: 'openai-codex', id: 'gpt-5.1', name: 'gpt-5.1'),
+    ]),
+  ],
+  failures: const [],
+);
+
+const _official = Subscription.chatgptOfficial;
+const _signedOutOfficial = SubscriptionStatus(subscription: _official, signedIn: false);
+const _officialProfile = ProviderProfile(
+  route: 'openai-siwc',
+  displayName: 'OpenAI',
+  modelOverrides: {'test-model': ModelOverride(contextWindow: 65536)},
+);
+
+final _officialCatalog = ModelCatalog(
+  defaultSelection: null,
+  routableProviders: ['openai-siwc', ..._codexCatalog.routableProviders],
+  groups: [
+    ..._codexCatalog.groups,
+    const ProviderGroup('openai-siwc', 'OpenAI', [
+      ModelInfo(provider: 'openai-siwc', id: 'test-model', name: 'Official test model'),
     ]),
   ],
   failures: const [],
@@ -85,9 +109,10 @@ Future<void> _pump(WidgetTester tester, Widget home, List<Override> overrides, {
 }
 
 /// Opens the sheet against [bridge]; returns the browser fake.
-Future<FakeBrowser> _openSheet(WidgetTester tester, FakeSubscriptionBackend bridge) async {
+Future<FakeBrowser> _openSheet(WidgetTester tester, FakeSubscriptionBackend bridge, {String? os}) async {
   final browser = FakeBrowser();
   await _pump(tester, const _Opener(), [
+    if (os != null) operatingSystemProvider.overrideWithValue(os),
     ...providerOverrides(FakeProviderBackend(), subscriptions: bridge),
     accountBrowserProvider.overrideWithValue(browser),
   ]);
@@ -104,34 +129,6 @@ List<String> _mockClipboard(WidgetTester tester) {
   });
   addTearDown(() => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, null));
   return copied;
-}
-
-Future<List<BrowserAuthorization>> _openEmbeddedSheet(
-  WidgetTester tester,
-  FakeSubscriptionBackend bridge, {
-  Future<bool> Function(BrowserAuthorization)? authorize,
-}) async {
-  final requests = <BrowserAuthorization>[];
-  final oldPage = BrowserLinks.openPage;
-  final oldAuth = BrowserLinks.openAuthorization;
-  BrowserLinks.openPage = (_) async {
-    fail('subscription authorization must never open in the persistent browser');
-  };
-  BrowserLinks.openAuthorization = (request) async {
-    requests.add(request);
-    return authorize == null ? true : authorize(request);
-  };
-  addTearDown(() {
-    BrowserLinks.openPage = oldPage;
-    BrowserLinks.openAuthorization = oldAuth;
-  });
-  await _pump(tester, const _Opener(), [
-    ...providerOverrides(FakeProviderBackend(), subscriptions: bridge),
-    accountBrowserProvider.overrideWithValue(const EmbeddedAccountBrowser()),
-  ]);
-  await tester.tap(find.text('open'));
-  await settle(tester);
-  return requests;
 }
 
 void main() {
@@ -160,7 +157,7 @@ void main() {
         for (final row in tester.widgetList<ListPageRow>(find.byType(ListPageRow)))
           row.title ?? row.spot?.title(appL10n),
       ];
-      expect(titles, ['DeepSeek', 'ChatGPT', 'Claude', 'My Gateway', '添加渠道']);
+      expect(titles, [appL10n.viewModelSelect, 'DeepSeek', 'ChatGPT', 'Claude', 'My Gateway', '添加渠道']);
       // Plain letters, no brand marks: 「G」 and 「C」.
       expect(find.text('G'), findsOneWidget);
       expect(find.text('C'), findsOneWidget);
@@ -190,6 +187,198 @@ void main() {
       expect(capsule.center.dy, moreOrLessEquals(row.center.dy, epsilon: 0.6));
       expect(capsule.height, moreOrLessEquals(LoginCapsule.height, epsilon: 0.6));
       expect(row.height, moreOrLessEquals(52, epsilon: 0.6));
+    });
+  });
+
+  group('official OpenAI', () {
+    testWidgets('local Android shows OpenAI under DeepSeek and starts SIWC in the shared sheet', (tester) async {
+      final bridge = FakeSubscriptionBackend(
+        statuses: [..._signedInChatGpt, _signedOutOfficial],
+        steps: const [LoginStep(phase: LoginPhase.open, url: _url)],
+      );
+      final browser = FakeBrowser();
+      await _pump(tester, const ProvidersPage(), [
+        ...providerOverrides(FakeProviderBackend(profiles: const [_officialProfile]), subscriptions: bridge),
+        operatingSystemProvider.overrideWithValue('android'),
+        modelCatalogProvider.overrideWith((ref) async => _codexCatalog),
+        accountBrowserProvider.overrideWithValue(browser),
+      ]);
+      final officialCard = find.widgetWithText(ListPageCard, appL10n.engineProvidersOfficial);
+      final rows = find.descendant(of: officialCard, matching: find.byType(ListPageRow));
+      expect(tester.widgetList<ListPageRow>(rows).map((row) => row.title), ['DeepSeek', 'OpenAI']);
+      expect(find.text('OpenAI'), findsOneWidget, reason: 'not repeated as a custom channel');
+      expect(find.text('ChatGPT 官方订阅'), findsOneWidget);
+      final legacyCard = find.widgetWithText(ListPageCard, appL10n.engineProvidersSubscription);
+      expect(find.descendant(of: legacyCard, matching: find.text('ChatGPT')), findsOneWidget);
+      expect(find.descendant(of: legacyCard, matching: find.text('Claude')), findsOneWidget);
+
+      final openAi = find.widgetWithText(ListPageRow, 'OpenAI');
+      await tester.tap(find.descendant(of: openAi, matching: find.widgetWithText(FilledButton, '登录')));
+      await settle(tester);
+      expect(find.text('登录 ChatGPT'), findsOneWidget);
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(bridge.calls.where((call) => call.startsWith('begin:')), ['begin:openai-siwc']);
+      expect(browser.opened, [Uri.parse(_url)]);
+      await tester.tap(find.byTooltip('关闭'));
+      await settle(tester);
+      expect(bridge.calls, contains('cancel:att-1'));
+    });
+
+    for (final (button, expected) in [
+      ('取消', null),
+      ('登录原账号', 'begin:openai-siwc'),
+      ('使用其他账号', 'begin:openai-siwc:newAccount'),
+    ]) {
+      testWidgets('previous official registration: $button', (tester) async {
+        final bridge = FakeSubscriptionBackend(
+          statuses: const [SubscriptionStatus(subscription: _official, signedIn: false, reconnectAvailable: true)],
+          steps: const [LoginStep(phase: LoginPhase.failed)],
+        );
+        await _pump(tester, const ProvidersPage(), [
+          ...providerOverrides(FakeProviderBackend(), subscriptions: bridge),
+          operatingSystemProvider.overrideWithValue('android'),
+          modelCatalogProvider.overrideWith((ref) async => _codexCatalog),
+        ]);
+        final openAi = find.widgetWithText(ListPageRow, 'OpenAI');
+        await tester.tap(find.descendant(of: openAi, matching: find.byType(LoginCapsule)));
+        await settle(tester);
+        expect(find.widgetWithText(AlertDialog, '登录 ChatGPT'), findsOneWidget);
+        expect(find.widgetWithText(FilledButton, '登录原账号'), findsOneWidget);
+        expect(find.widgetWithText(TextButton, '使用其他账号'), findsOneWidget);
+        expect(bridge.calls.where((call) => call.startsWith('begin:')), isEmpty);
+        await tester.tap(find.text(button));
+        await settle(tester);
+        expect(bridge.calls.where((call) => call.startsWith('begin:')), [?expected]);
+        expect(find.byType(SubscriptionLoginSheet), expected == null ? findsNothing : findsOneWidget);
+      });
+    }
+
+    testWidgets('pending sign-out blocks login and can be retried after a refreshed failure', (tester) async {
+      final bridge = _PendingSignOutBridge();
+      await _pump(tester, const ProvidersPage(), [
+        ...providerOverrides(FakeProviderBackend(), subscriptions: bridge),
+        operatingSystemProvider.overrideWithValue('android'),
+        modelCatalogProvider.overrideWith((ref) async => _officialCatalog),
+      ]);
+      final openAi = find.widgetWithText(ListPageRow, 'OpenAI');
+      expect(find.descendant(of: openAi, matching: find.byType(LoginCapsule)), findsNothing);
+      await tester.tap(find.text('OpenAI'));
+      await settle(tester);
+      expect(find.byType(SubscriptionPage), findsOneWidget);
+      expect(find.text('Official test model'), findsNothing);
+      expect(find.text('重新登录'), findsNothing);
+      expect(find.text('使用其他账号'), findsNothing);
+
+      Future<void> signOut() async {
+        await tester.tap(find.text('退出登录'));
+        await settle(tester);
+        await tester.tap(find.widgetWithText(FilledButton, '退出登录'));
+        await settle(tester);
+      }
+
+      final before = bridge.calls.where((call) => call == 'list').length;
+      await signOut();
+      expect(bridge.calls.where((call) => call == 'list').length, greaterThan(before));
+      expect(find.byType(SubscriptionPage), findsOneWidget);
+      expect(find.byType(SubscriptionLoginSheet), findsNothing);
+      await signOut();
+      expect(find.byType(SubscriptionPage), findsNothing);
+      expect(find.descendant(of: openAi, matching: find.byType(LoginCapsule)), findsOneWidget);
+      expect(bridge.calls.where((call) => call.startsWith('signOut:')), ['signOut:openai-siwc', 'signOut:openai-siwc']);
+      expect(bridge.calls.where((call) => call.startsWith('begin:')), isEmpty);
+    });
+
+    for (final (os, local, advertised) in [
+      ('ohos', true, true),
+      ('ios', true, true),
+      ('android', false, true),
+      ('android', true, false),
+    ]) {
+      testWidgets('$os, local=$local, advertised=$advertised does not show OpenAI', (tester) async {
+        final bridge = FakeSubscriptionBackend(
+          statuses: [..._signedInChatGpt, if (advertised) _signedOutOfficial],
+        );
+        final client = DshClient.withCarrier(FakeSettingsHost());
+        addTearDown(client.close);
+        final host = local ? HostRef.local : const HostRef.ssh('mock-host');
+        final overrides = providerOverrides(FakeProviderBackend(isLocal: local), subscriptions: bridge);
+        await _pump(tester, const ProvidersPage(), [
+          for (final override in overrides)
+            if (override.origin != activeConnectionProvider) override,
+          activeHostProvider.overrideWith(() => FixedActiveHost(host)),
+          activeConnectionProvider.overrideWithValue(
+            AsyncData(
+              HostConnection(client: client, isLocal: local, kind: host.kind, hostId: local ? null : host.id),
+            ),
+          ),
+          operatingSystemProvider.overrideWithValue(os),
+          modelCatalogProvider.overrideWith((ref) async => _officialCatalog),
+        ]);
+        expect(bridge.calls, contains('list'));
+        expect(find.text('OpenAI'), findsNothing);
+        expect(find.text('ChatGPT'), findsOneWidget);
+        expect(find.text('Claude'), findsOneWidget);
+      });
+    }
+
+    testWidgets('detail shows only its own catalog, with no pi-ai override controls', (tester) async {
+      final bridge = FakeSubscriptionBackend(
+        statuses: const [SubscriptionStatus(subscription: _official, signedIn: true, planEnabled: true)],
+      );
+      var profileReads = 0;
+      await _pump(tester, const ProvidersPage(), [
+        ...providerOverrides(FakeProviderBackend(), subscriptions: bridge),
+        operatingSystemProvider.overrideWithValue('android'),
+        modelCatalogProvider.overrideWith((ref) async => _officialCatalog),
+        subscriptionProfileProvider(_official).overrideWith((ref) async {
+          profileReads++;
+          return _officialProfile;
+        }),
+      ]);
+      expect(find.text('2 个渠道 · 2 个可用'), findsOneWidget);
+      await tester.tap(find.text('OpenAI'));
+      await settle(tester);
+      expect(tester.widget<SubscriptionPage>(find.byType(SubscriptionPage)).subscription, _official);
+      expect(find.text('模型 · 1'), findsOneWidget);
+      expect(find.text('GPT-5.1 Codex'), findsNothing);
+      final row = tester.widget<ListPageRow>(find.widgetWithText(ListPageRow, 'Official test model'));
+      expect(row.onTap, isNull);
+      expect(row.value, isNull);
+      expect(profileReads, 0);
+    });
+
+    testWidgets('a disabled plan stays signed in and unconfirmed revocation refreshes to signed out', (tester) async {
+      final bridge = _UnconfirmedRevocationBridge();
+      await _pump(tester, const ProvidersPage(), [
+        ...providerOverrides(FakeProviderBackend(), subscriptions: bridge),
+        operatingSystemProvider.overrideWithValue('android'),
+        modelCatalogProvider.overrideWith((ref) async => _officialCatalog),
+      ]);
+      expect(find.text('2 个渠道 · 1 个可用'), findsOneWidget);
+      await tester.tap(find.text('OpenAI'));
+      await settle(tester);
+      expect(find.widgetWithText(ListPageRow, '已登录'), findsOneWidget);
+      expect(find.text(appL10n.engineSubscriptionPlanNotEnabled), findsOneWidget);
+      expect(find.text('Official test model'), findsNothing);
+      await tester.tap(find.text('重新登录'));
+      await settle(tester);
+      expect(tester.widget<SubscriptionLoginSheet>(find.byType(SubscriptionLoginSheet)).subscription, _official);
+      expect(bridge.calls.where((call) => call.startsWith('begin:')), ['begin:openai-siwc']);
+      expect(bridge.calls.where((call) => call.startsWith('signOut:')), isEmpty);
+      await tester.tap(find.byTooltip('关闭'));
+      await settle(tester);
+      await tester.ensureVisible(find.text('退出登录'));
+      await tester.tap(find.text('退出登录'));
+      await settle(tester);
+      await tester.tap(find.widgetWithText(FilledButton, '退出登录'));
+      await settle(tester);
+      expect(bridge.calls.where((call) => call.startsWith('signOut:')), ['signOut:openai-siwc']);
+      expect(find.byType(SubscriptionPage), findsNothing);
+      expect(find.text(appL10n.engineSubscriptionRevocationUnconfirmed), findsOneWidget);
+      expect(
+        find.descendant(of: find.widgetWithText(ListPageRow, 'OpenAI'), matching: find.byType(LoginCapsule)),
+        findsOneWidget,
+      );
     });
   });
 
@@ -318,6 +507,58 @@ void main() {
       expect(bridge.calls, isNot(contains('cancel:att-1')), reason: 'a finished attempt is not cancelled');
     });
 
+    group('prompt 粘贴', () {
+      const prompt = [LoginStep(phase: LoginPhase.prompt, message: 'Paste the authorization code')];
+
+      String field(WidgetTester tester) => tester.widget<TextField>(find.byType(TextField)).controller!.text;
+
+      testWidgets('Android: Flutter\'s clipboard, trimmed, only filled in', (tester) async {
+        final paste = FakePaste(tester, flutterText: '  abc#xyz ');
+        final bridge = FakeSubscriptionBackend(steps: prompt);
+        await _openSheet(tester, bridge);
+        await tester.tap(find.byTooltip('粘贴'));
+        await settle(tester);
+        expect(field(tester), 'abc#xyz');
+        expect(paste.flutterReads, 1);
+        expect(paste.reads, isEmpty);
+        expect(bridge.calls.where((call) => call.startsWith('answer')), isEmpty);
+      });
+
+      testWidgets('HarmonyOS: the system paste button, trimmed, only filled in', (tester) async {
+        final paste = FakePaste(tester, reply: FakePaste.text('  abc#xyz '), flutterText: 'wrong');
+        final bridge = FakeSubscriptionBackend(steps: prompt);
+        await _openSheet(tester, bridge, os: 'ohos');
+        await tester.tap(find.byTooltip('粘贴'));
+        await settle(tester);
+        expect(field(tester), 'abc#xyz');
+        expect(paste.flutterReads, 0);
+        expect(bridge.calls.where((call) => call.startsWith('answer')), isEmpty);
+      });
+
+      testWidgets('HarmonyOS: a failure shows on the field the sheet covers no notice of, until it changes', (
+        tester,
+      ) async {
+        FakePaste(tester, reply: {'status': 'busy'});
+        await _openSheet(tester, FakeSubscriptionBackend(steps: prompt), os: 'ohos');
+        await tester.tap(find.byTooltip('粘贴'));
+        await settle(tester);
+        const text = '粘贴窗口尚未结束或仍在关闭，请完成或取消后重试。';
+        expect(find.text(text), findsOneWidget);
+        await tester.enterText(find.byType(TextField), 'a');
+        await settle(tester);
+        expect(find.text(text), findsNothing);
+      });
+
+      testWidgets('HarmonyOS: backed out of, nothing is said', (tester) async {
+        FakePaste(tester, reply: {'status': 'cancelled'});
+        await _openSheet(tester, FakeSubscriptionBackend(steps: prompt), os: 'ohos');
+        await tester.tap(find.byTooltip('粘贴'));
+        await settle(tester);
+        expect(field(tester), isEmpty);
+        expect(tester.widget<TextField>(find.byType(TextField)).decoration!.errorText, isNull);
+      });
+    });
+
     testWidgets('failed: the reason and 再试一次 starts a new attempt', (tester) async {
       final bridge = FakeSubscriptionBackend(
         steps: const [LoginStep(phase: LoginPhase.failed, error: '授权已过期')],
@@ -350,167 +591,163 @@ void main() {
     });
   });
 
-  group('temporary subscription browser', () {
-    testWidgets('returning with a code keeps the session alive and permits reopening', (tester) async {
-      final bridge = FakeSubscriptionBackend(
-        steps: const [LoginStep(phase: LoginPhase.open, url: _url)],
-      );
-      final requests = await _openEmbeddedSheet(tester, bridge);
-      final first = requests.single;
-      expect(first.url, Uri.parse(_url));
-      expect(first.callbackOrigin, isNull);
-      expect(first.isCurrent(), isTrue);
-      await tester.tap(find.text('重新打开'));
-      await tester.pump();
-      expect(requests, hasLength(1), reason: 'an active temporary page is not duplicated');
-
-      await first.cancel();
-      await first.completed;
-      expect(first.isCurrent(), isFalse);
-      await tester.pump(const Duration(seconds: 1));
-      expect(bridge.calls, isNot(contains('cancel:att-1')));
-      expect(requests, hasLength(1), reason: 'polling must not reopen a page that the person just closed');
-
-      await tester.tap(find.text('重新打开'));
-      await tester.pump();
-      final second = requests.last;
-      expect(requests, hasLength(2));
-      expect(second.id, isNot(same(first.id)));
-      await first.cancel();
-      expect(second.isCurrent(), isTrue, reason: 'a late close belongs only to its own page');
-
-      bridge.steps = const [LoginStep(phase: LoginPhase.prompt, message: 'Paste the authorization code')];
-      await tester.pump(const Duration(seconds: 1));
-      await settle(tester);
-      await second.completed;
-      expect(second.isCurrent(), isFalse);
-      expect(find.text('粘贴授权码'), findsOneWidget);
-      bridge.steps = const [LoginStep(phase: LoginPhase.done)];
-      await tester.enterText(find.byType(TextField), 'copied-code');
-      await tester.pump();
-      await tester.tap(find.widgetWithText(FilledButton, '确定'));
-      await settle(tester);
-      expect(bridge.calls, contains('answer:att-1:copied-code'));
-      expect(bridge.calls, isNot(contains('cancel:att-1')));
-      await tester.pump(SubscriptionLoginSheet.doneDwell);
-      await settle(tester);
-      expect(find.text('result: true'), findsOneWidget);
-    });
-
-    testWidgets('device pages open on request; disposing the sheet ends the page and session', (tester) async {
-      final bridge = FakeSubscriptionBackend(
-        steps: const [LoginStep(phase: LoginPhase.device, url: _url, userCode: 'ABCD-EFGH')],
-      );
-      final requests = await _openEmbeddedSheet(tester, bridge);
-      expect(requests, isEmpty);
-      await tester.tap(find.text('打开验证页'));
-      await tester.pump();
-      await tester.tap(find.text('打开验证页'));
-      await tester.pump();
-      expect(requests, hasLength(1));
-      final request = requests.single;
-      await tester.tap(find.byTooltip('关闭'));
-      await settle(tester);
-      await request.completed;
-      expect(request.isCurrent(), isFalse);
-      expect(bridge.calls, contains('cancel:att-1'));
-      expect(find.text('result: false'), findsOneWidget);
-    });
-
-    for (final phase in [LoginPhase.failed, LoginPhase.cancelled]) {
-      testWidgets('$phase ends the temporary page and retry gets a new session', (tester) async {
-        final bridge = FakeSubscriptionBackend(
-          steps: const [LoginStep(phase: LoginPhase.open, url: _url)],
-        );
-        final requests = await _openEmbeddedSheet(tester, bridge);
-        final first = requests.single;
-        bridge.steps = [LoginStep(phase: phase)];
-        await tester.pump(const Duration(seconds: 1));
-        await settle(tester);
-        await first.completed;
-        expect(first.isCurrent(), isFalse);
-        expect(find.text('再试一次'), findsOneWidget);
-        bridge.steps = const [LoginStep(phase: LoginPhase.open, url: _url)];
-        await tester.tap(find.text('再试一次'));
-        await settle(tester);
-        expect(requests, hasLength(2));
-        expect(requests.last.isCurrent(), isTrue);
-        expect(bridge.calls, contains('poll:att-2'));
-        await first.cancel();
-        expect(requests.last.isCurrent(), isTrue);
-        await tester.tap(find.byTooltip('关闭'));
-        await settle(tester);
-        await requests.last.completed;
-        expect(bridge.calls, contains('cancel:att-2'));
-      });
-    }
-
-    testWidgets('failed browser opening can retry without restarting the engine login', (tester) async {
-      var succeeds = false;
-      final bridge = FakeSubscriptionBackend(
-        steps: const [LoginStep(phase: LoginPhase.open, url: _url)],
-      );
-      final requests = await _openEmbeddedSheet(tester, bridge, authorize: (_) async => succeeds);
-      await requests.single.completed;
-      expect(requests.single.isCurrent(), isFalse);
-      expect(find.text('没能打开浏览器'), findsOneWidget);
-      succeeds = true;
-      await tester.tap(find.text('重新打开'));
-      await tester.pump();
-      expect(requests, hasLength(2));
-      expect(requests.last.isCurrent(), isTrue);
-      expect(bridge.calls.where((c) => c.startsWith('begin:')), hasLength(1));
-      await tester.tap(find.byTooltip('关闭'));
-      await settle(tester);
-    });
-
-    testWidgets('system handoff can reopen the same login without cancelling the engine session', (tester) async {
-      final bridge = FakeSubscriptionBackend(
-        steps: const [LoginStep(phase: LoginPhase.open, url: _url)],
-      );
-      final requests = await _openEmbeddedSheet(tester, bridge);
-      final first = requests.single;
-      first.onSystemBrowserOpened!();
-      await first.completed;
-      expect(first.isCurrent(), isFalse);
-      expect(bridge.calls, isNot(contains('cancel:att-1')));
-      await tester.tap(find.text('重新打开'));
-      await tester.pump();
-      expect(requests, hasLength(2));
-      expect(requests.last.isCurrent(), isTrue);
-      expect(bridge.calls.where((call) => call.startsWith('begin:')), hasLength(1));
-      await tester.tap(find.byTooltip('关闭'));
-      await settle(tester);
-    });
-
-    testWidgets('done ends authorization and closes only its sheet below another route', (tester) async {
-      final bridge = FakeSubscriptionBackend(
-        steps: const [LoginStep(phase: LoginPhase.open, url: _url)],
-      );
-      final requests = await _openEmbeddedSheet(tester, bridge);
-      final navigator = Navigator.of(tester.element(find.byType(SubscriptionLoginSheet)));
-      unawaited(navigator.push<void>(MaterialPageRoute<void>(builder: (_) => const Scaffold(body: Text('cover')))));
-      await tester.pump();
-      bridge.steps = const [LoginStep(phase: LoginPhase.done)];
-      await tester.pump(const Duration(seconds: 1));
-      await requests.single.completed;
-      expect(requests.single.isCurrent(), isFalse);
-      await tester.pump(SubscriptionLoginSheet.doneDwell);
-      await settle(tester);
-      expect(find.text('cover'), findsOneWidget, reason: 'done must not pop a newer route');
-      expect(find.byType(SubscriptionLoginSheet, skipOffstage: false), findsNothing);
-      navigator.pop();
-      await settle(tester);
-      expect(find.text('result: true'), findsOneWidget);
-      expect(bridge.calls, isNot(contains('cancel:att-1')));
-    });
-  });
-
   test('unrecognized login errors use local copy', () {
     expect(describeLoginError(const DshRemoteException('gateway/internal', 'secret raw error')), '没能完成登录，再试一次');
   });
 
   group('session', () {
+    testWidgets('[login-cancel] failed polling is cancelled when the real sheet closes', (tester) async {
+      final bridge = _CancellationBridge(failPoll: true);
+      try {
+        await _openSheet(tester, bridge);
+        expect(bridge.calls.where((c) => c.startsWith('begin:')).toList(), ['begin:openai-codex']);
+        expect(bridge.calls.where((c) => c.startsWith('poll:')).toList(), ['poll:att-1']);
+        await tester.pump(const Duration(seconds: 1));
+        expect(bridge.polls, 2);
+        await tester.pump(const Duration(seconds: 1));
+        expect(bridge.polls, 3);
+        expect(find.text('登录没有完成'), findsOneWidget);
+
+        // A local transport failure did not report a terminal Host step.
+        // Cancelling as soon as polling is abandoned is also valid.
+        await tester.tap(find.byTooltip('关闭'));
+        await settle(tester);
+        await Future.wait(bridge.cancellations);
+        expect(find.byType(SubscriptionLoginSheet), findsNothing);
+        expect(find.text('result: false'), findsOneWidget);
+        expect(bridge.calls.where((c) => c.startsWith('cancel:')).toList(), ['cancel:att-1']);
+        await tester.pump(const Duration(seconds: 3));
+        expect(bridge.polls, 3);
+      } finally {
+        await _closeCancellationSheet(tester, bridge);
+      }
+    });
+
+    testWidgets('[login-cancel] failed answer is cancelled before the next poll', (tester) async {
+      final bridge = _CancellationBridge(
+        steps: const [LoginStep(phase: LoginPhase.prompt, message: 'Paste the code')],
+        failAnswer: true,
+      );
+      final session = LoginSession(bridge, Subscription.claude);
+      try {
+        await session.start();
+        expect(session.step.phase, LoginPhase.prompt);
+        expect(bridge.calls, ['begin:anthropic', 'poll:att-1']);
+        await session.answer('code');
+        expect(bridge.calls, contains('answer:att-1:code'));
+        expect(session.step.phase, LoginPhase.failed);
+        expect(session.answering, isFalse);
+        expect(bridge.polls, 1);
+
+        // Do not advance the existing polling timer before this close.
+        session.close();
+        session.close();
+        await Future.wait(bridge.cancellations);
+        expect(bridge.calls.where((c) => c.startsWith('cancel:')).toList(), ['cancel:att-1']);
+        await tester.pump(const Duration(seconds: 1));
+        expect(bridge.polls, 1);
+      } finally {
+        session.dispose();
+        await Future.wait(bridge.cancellations);
+      }
+    });
+
+    for (final phase in [LoginPhase.done, LoginPhase.failed, LoginPhase.cancelled]) {
+      testWidgets('[login-cancel] Host ${phase.name} remains terminal when closing', (tester) async {
+        final bridge = _CancellationBridge(steps: [LoginStep(phase: phase)]);
+        final session = LoginSession(bridge, Subscription.claude);
+        try {
+          await session.start();
+          expect(session.step.phase, phase);
+          expect(bridge.calls, ['begin:anthropic', 'poll:att-1']);
+          session.close();
+          session.close();
+          await Future.wait(bridge.cancellations);
+          expect(bridge.calls.where((c) => c.startsWith('cancel:')), isEmpty);
+          await tester.pump(const Duration(seconds: 1));
+          expect(bridge.polls, 1);
+        } finally {
+          session.dispose();
+          await Future.wait(bridge.cancellations);
+        }
+      });
+    }
+
+    testWidgets('[login-cancel] failed begin has no known attempt to cancel', (tester) async {
+      final bridge = _CancellationBridge()..beginError = const DshTransportException('timeout');
+      final session = LoginSession(bridge, Subscription.claude);
+      try {
+        await session.start();
+        expect(session.step.phase, LoginPhase.failed);
+        expect(bridge.calls, ['begin:anthropic']);
+        session.close();
+        await Future.wait(bridge.cancellations);
+        expect(bridge.calls.where((c) => c.startsWith('cancel:')), isEmpty);
+      } finally {
+        session.dispose();
+        await Future.wait(bridge.cancellations);
+      }
+    });
+
+    testWidgets('[login-cancel] retry after Host failure cancels only the new attempt', (tester) async {
+      final bridge = _CancellationBridge(
+        steps: const [LoginStep(phase: LoginPhase.failed, error: '授权已过期')],
+      );
+      try {
+        await _openSheet(tester, bridge);
+        expect(find.text('登录没有完成'), findsOneWidget);
+        expect(bridge.calls.where((c) => c.startsWith('poll:')).toList(), ['poll:att-1']);
+        bridge.steps = const [LoginStep(phase: LoginPhase.open, url: _url)];
+        await tester.tap(find.text('再试一次'));
+        await settle(tester);
+        expect(bridge.calls.where((c) => c.startsWith('begin:')).toList(), [
+          'begin:openai-codex',
+          'begin:openai-codex',
+        ]);
+        expect(bridge.calls.where((c) => c.startsWith('poll:')).toList(), ['poll:att-1', 'poll:att-2']);
+        expect(find.text('在浏览器中完成登录'), findsOneWidget);
+        await tester.tap(find.byTooltip('关闭'));
+        await settle(tester);
+        await Future.wait(bridge.cancellations);
+        expect(find.byType(SubscriptionLoginSheet), findsNothing);
+        expect(find.text('result: false'), findsOneWidget);
+        expect(bridge.calls.where((c) => c.startsWith('cancel:')).toList(), ['cancel:att-2']);
+        final polls = bridge.polls;
+        await tester.pump(const Duration(seconds: 3));
+        expect(bridge.polls, polls);
+      } finally {
+        await _closeCancellationSheet(tester, bridge);
+      }
+    });
+
+    testWidgets('[login-cancel] retry after local failure still cancels when begin fails', (tester) async {
+      final bridge = _CancellationBridge(failPoll: true);
+      final session = LoginSession(bridge, Subscription.claude);
+      try {
+        await session.start();
+        expect(bridge.calls, ['begin:anthropic', 'poll:att-1']);
+        await tester.pump(const Duration(seconds: 1));
+        expect(bridge.polls, 2);
+        await tester.pump(const Duration(seconds: 1));
+        expect(bridge.polls, 3);
+        expect(session.step.phase, LoginPhase.failed);
+
+        bridge.beginError = const DshRemoteException('gateway/internal', 'could not reach https://auth.example.com');
+        await session.start();
+        expect(bridge.calls.where((c) => c.startsWith('begin:')).toList(), ['begin:anthropic', 'begin:anthropic']);
+        expect(session.step.phase, LoginPhase.failed);
+        session.close();
+        session.close();
+        await Future.wait(bridge.cancellations);
+        expect(bridge.calls.where((c) => c.startsWith('cancel:')).toList(), ['cancel:att-1']);
+        await tester.pump(const Duration(seconds: 1));
+        expect(bridge.polls, 3);
+      } finally {
+        session.dispose();
+        await Future.wait(bridge.cancellations);
+      }
+    });
+
     test('three failed polls in a row give up; one recovers', () async {
       final bridge = _FlakyBridge(failures: 3);
       final session = LoginSession(bridge, Subscription.claude, interval: Duration.zero);
@@ -578,6 +815,38 @@ class _PageOpener extends StatelessWidget {
   );
 }
 
+class _PendingSignOutBridge extends FakeSubscriptionBackend {
+  _PendingSignOutBridge()
+    : super(
+        statuses: const [
+          SubscriptionStatus(subscription: _official, signedIn: false, reconnectAvailable: true, signOutPending: true),
+        ],
+      );
+
+  bool fail = true;
+
+  @override
+  Future<void> signOut(Subscription subscription) async {
+    if (fail) {
+      fail = false;
+      calls.add('signOut:${subscription.wire}');
+      throw const DshRemoteException('app-auth/sign-out-failed', 'local cleanup failed');
+    }
+    await super.signOut(subscription);
+  }
+}
+
+class _UnconfirmedRevocationBridge extends FakeSubscriptionBackend {
+  _UnconfirmedRevocationBridge()
+    : super(statuses: const [SubscriptionStatus(subscription: _official, signedIn: true, planEnabled: false)]);
+
+  @override
+  Future<void> signOut(Subscription subscription) async {
+    await super.signOut(subscription);
+    throw const DshRemoteException('app-auth/revocation-unconfirmed', 'remote revocation failed');
+  }
+}
+
 /// Polls fail [failures] times, then the attempt is done.
 class _FlakyBridge extends FakeSubscriptionBackend {
   _FlakyBridge({required this.failures});
@@ -589,4 +858,43 @@ class _FlakyBridge extends FakeSubscriptionBackend {
     if (failures-- > 0) throw const DshTransportException('timeout');
     return const LoginStep(phase: LoginPhase.done);
   }
+}
+
+/// The existing backend seam, with only ordinary transport errors added.
+class _CancellationBridge extends FakeSubscriptionBackend {
+  _CancellationBridge({super.steps, this.failPoll = false, this.failAnswer = false});
+
+  final bool failPoll;
+  final bool failAnswer;
+  final cancellations = <Future<void>>[];
+
+  @override
+  Future<LoginStep> poll(String attemptId) async {
+    if (!failPoll) return super.poll(attemptId);
+    calls.add('poll:$attemptId');
+    throw const DshTransportException('timeout');
+  }
+
+  @override
+  Future<void> answer(String attemptId, String value) async {
+    await super.answer(attemptId, value);
+    if (failAnswer) throw const DshTransportException('timeout');
+  }
+
+  @override
+  Future<void> cancel(String attemptId) {
+    final cancellation = super.cancel(attemptId);
+    cancellations.add(cancellation);
+    return cancellation;
+  }
+}
+
+Future<void> _closeCancellationSheet(WidgetTester tester, _CancellationBridge bridge) async {
+  if (find.byType(SubscriptionLoginSheet).evaluate().isNotEmpty) {
+    await tester.tap(find.byTooltip('关闭'));
+    await settle(tester);
+  }
+  await Future.wait(bridge.cancellations);
+  await tester.pumpWidget(const SizedBox.shrink());
+  await tester.pump();
 }

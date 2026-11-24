@@ -31,7 +31,7 @@ import 'status_chip.dart';
 ///   leading: OverviewGlyph(AppIcons.phoneControl, tint: 6),
 ///   title: const Text('手机操控'),
 ///   subtitle: const Text('可以操作手机'),
-///   trailing: Switch(value: on, onChanged: ...),   // 不传且有 onTap 时画箭头
+///   trailing: Switch.adaptive(value: on, onChanged: ...),   // 不传且有 onTap 时画箭头
 ///   onTap: ...,
 ///   footer: OverviewFooter(tone: StatusTone.ok, text: '无障碍已开启'),
 ///   onFooterTap: ...,
@@ -90,13 +90,22 @@ class OverviewCard extends StatefulWidget {
 }
 
 class _OverviewCardState extends State<OverviewCard> {
+  /// The card without its margin: where a page opened from it grows from.
+  final _cardKey = GlobalKey();
+
   @override
   Widget build(BuildContext context) {
     const inset = OverviewCard.inset;
     const avatarSize = OverviewCard.avatarSize;
     const gap = OverviewCard.gap;
     final widget = this.widget;
-    final onTap = widget.onTap;
+    final onTap = switch (widget.onTap) {
+      final open? => () {
+        CardOrigin.remember(_cardKey.currentContext ?? context);
+        open();
+      },
+      null => null,
+    };
     final onFooterTap = widget.onFooterTap;
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
@@ -104,7 +113,7 @@ class _OverviewCardState extends State<OverviewCard> {
 
     Widget tappable(Widget child, VoidCallback? onTap) => onTap == null
         ? child
-        : InkWell(onTap: onTap, splashFactory: NoSplash.splashFactory, highlightColor: highlight, child: child);
+        : InkWell(onTap: onTap, splashFactory: rowSplash(context), highlightColor: highlight, child: child);
 
     Widget chevron() => const OverviewChevron();
 
@@ -202,6 +211,7 @@ class _OverviewCardState extends State<OverviewCard> {
     return Padding(
       padding: widget.margin,
       child: Pressable(
+        key: _cardKey,
         // Feedback only: the two parts below own their taps.
         enabled: onTap != null || onFooterTap != null,
         child: GlassSurface(

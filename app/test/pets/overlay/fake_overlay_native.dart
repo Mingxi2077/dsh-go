@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 class FakeOverlayNative {
   FakeOverlayNative({
+    this.platform = 'android',
     this.permission = 'denied',
     this.enabled = false,
     this.alwaysShow = false,
@@ -12,10 +13,12 @@ class FakeOverlayNative {
     this.sdk = 35,
     this.manufacturer = 'vivo',
     this.opens = true,
+    this.companionFallback = false,
   });
 
   static const channel = MethodChannel('dsh/pet_overlay');
 
+  final String platform;
   String permission;
   bool enabled;
   bool alwaysShow;
@@ -26,11 +29,15 @@ class FakeOverlayNative {
   /// What requestPermission / openAppDetails answer (the settings page opened).
   bool opens;
 
+  /// The companion gave up and the pixel pet is filling in.
+  bool companionFallback;
+
   final calls = <MethodCall>[];
 
   List<String> get methods => [for (final c in calls) c.method];
 
   Map<String, Object?> get status => {
+    'platform': platform,
     'enabled': enabled,
     'alwaysShow': alwaysShow,
     'permission': permission,
@@ -40,6 +47,7 @@ class FakeOverlayNative {
     'showing': false,
     'sdk': sdk,
     'manufacturer': manufacturer,
+    if (companionFallback) 'companionFallback': true,
   };
 
   TestDefaultBinaryMessenger get _messenger => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
@@ -53,7 +61,7 @@ class FakeOverlayNative {
     calls.add(call);
     final args = call.arguments is Map ? call.arguments as Map : const {};
     switch (call.method) {
-      case 'push':
+      case 'push' || 'reloadPack':
         return null;
       case 'setEnabled':
         enabled = args['enabled'] == true;
@@ -65,6 +73,8 @@ class FakeOverlayNative {
         snoozed = false;
         return status;
       case 'status' || 'permissionStatus':
+        return status;
+      case 'configureCompanion':
         return status;
       case 'requestPermission' || 'openAppDetails':
         return opens;

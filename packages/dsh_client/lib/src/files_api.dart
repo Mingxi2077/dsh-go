@@ -13,7 +13,9 @@
 ///   converts DOC/DOCX/XLS/XLSX/PPT/PPTX with LibreOffice).
 library;
 
+import 'dart:async';
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'carrier.dart';
@@ -55,20 +57,40 @@ extension DshFilesApi on DshClient {
     return DshFileStat.fromJson(value);
   }
 
+  /// Whether [url] is served by this client's own engine, over HTTP.
+  bool isEngineUrl(String url) {
+    final carrier = this.carrier;
+    return carrier is DshHttpCarrier && carrier.connection.ownUri(url) != null;
+  }
+
+  /// The bytes at [url], which [isEngineUrl] accepted, read with the session's
+  /// credentials: no redirects, at most [maxBytes].
+  Future<Uint8List> readEngineUrl(String url, {required int maxBytes}) async {
+    final carrier = this.carrier;
+    if (carrier is! DshHttpCarrier) throw ArgumentError.value(url, 'url', 'not this engine');
+    final response = await carrier.connection.getBoundedOwn(url, maxBytes: maxBytes, autoUncompress: true);
+    if (response.statusCode == 200) return response.body;
+    throw DshHttpException(response.statusCode, 'GET ${Uri.parse(url).path}: HTTP ${response.statusCode}');
+  }
+
   /// Whether this client can read raw file bytes at all.
   bool get canReadFileBytes => carrier is DshHttpCarrier || supportsEndpoint('workspaceFiles/readBytes');
 
   /// Streams a file's bytes to [onChunk], in order; returns the byte count.
+  /// Each chunk is consumed before reporting progress or requesting the next
+  /// window. An asynchronous [onChunk] is awaited; its failure stops the read.
   ///
   /// [maxBytes] refuses larger files up front (`workspace-file/too-large`)
   /// when the size is known. [onProgress] gets (received, total?).
   /// Failures are [DshRemoteException]s with `workspace-file/*` codes
   /// (`not-found`, `not-allowed`, `too-large`, `unsupported`), or the
-  /// carrier's transport errors.
+  /// carrier's transport errors. A changed non-empty window version fails locally
+  /// with `workspace-file/changed` before delivering that window. Missing versions
+  /// remain compatible; this check does not provide an atomic file snapshot.
   Future<int> readFile(
     String sessionId,
     String path, {
-    required void Function(Uint8List chunk) onChunk,
+    required FutureOr<void> Function(Uint8List chunk) onChunk,
     void Function(int received, int? total)? onProgress,
     int? maxBytes,
   }) async {
@@ -85,20 +107,28 @@ extension DshFilesApi on DshClient {
       throw DshRemoteException('workspace-file/unsupported', 'this connection cannot read file bytes', {'path': path});
     }
     var delivered = 0;
-    void sink(Uint8List chunk) {
+    Future<void> sink(Uint8List chunk) async {
       delivered += chunk.length;
-      onChunk(chunk);
+      await onChunk(chunk);
     }
 
     try {
-      return await _readWindows(sessionId, path, sink, onProgress, maxBytes, total);
+      return await _readWindows(
+        sessionId,
+        path,
+        sink,
+        onProgress,
+        maxBytes,
+        total,
+        stat.version.isEmpty ? null : stat.version,
+      );
     } on DshProtocolException {
       // An HTTP answer this client cannot decode: the plain file route, if
       // nothing has been handed out yet.
       final carrier = this.carrier;
       if (carrier is! DshHttpCarrier || delivered > 0) rethrow;
       final bytes = await _readWhole(carrier, stat.absolutePath.isEmpty ? path : stat.absolutePath, path, maxBytes);
-      onChunk(bytes);
+      await onChunk(bytes);
       onProgress?.call(bytes.length, total ?? bytes.length);
       return bytes.length;
     }
@@ -130,10 +160,11 @@ extension DshFilesApi on DshClient {
   Future<int> _readWindows(
     String sessionId,
     String path,
-    void Function(Uint8List chunk) onChunk,
+    FutureOr<void> Function(Uint8List chunk) onChunk,
     void Function(int received, int? total)? onProgress,
     int? maxBytes,
     int? total,
+    String? expectedVersion,
   ) async {
     var offset = 0;
     while (true) {
@@ -146,7 +177,15 @@ extension DshFilesApi on DshClient {
           },
         }),
       );
-      final data = _bytesOf(value['data']);
+      final version = asString(value['version']);
+      if (version != null && version.isNotEmpty) {
+        if (expectedVersion != null && version != expectedVersion) {
+          throw DshRemoteException('workspace-file/changed', '"$path" changed while reading', {'path': path});
+        }
+        expectedVersion ??= version;
+      }
+      final raw = value['data'];
+      final data = raw is String && raw.length > 256 * 1024 ? await _decodeLargeFileWindow(raw) : _bytesOf(raw);
       offset += data.length;
       if (maxBytes != null && offset > maxBytes) {
         throw DshRemoteException('workspace-file/too-large', '"$path" exceeds $maxBytes bytes', {
@@ -154,7 +193,7 @@ extension DshFilesApi on DshClient {
           'limit': maxBytes,
         });
       }
-      if (data.isNotEmpty) onChunk(data);
+      if (data.isNotEmpty) await onChunk(data);
       onProgress?.call(offset, asInt(value['bytes']) ?? total);
       if (value['eof'] == true || data.isEmpty) return offset;
     }
@@ -198,3 +237,5 @@ Uint8List _bytesOf(Object? data) {
   if (data is List) return Uint8List.fromList([for (final b in data) asInt(b) ?? 0]);
   return Uint8List(0);
 }
+
+Future<Uint8List> _decodeLargeFileWindow(String data) => Isolate.run(() => base64Decode(data));

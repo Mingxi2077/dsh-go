@@ -15,6 +15,7 @@ import 'package:dsh_app/state/hosts_state.dart';
 import 'package:dsh_app/state/sessions_state.dart';
 import 'package:dsh_app/ui/chat/chat_list.dart';
 import 'package:dsh_app/ui/chat/chat_screen.dart';
+import 'package:dsh_app/ui/chat/widgets/attachments.dart';
 import 'package:dsh_app/ui/theme/app_icons.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -42,9 +43,22 @@ ChatHarness _two() =>
 
 const _old = '旧版留下的一整段\n第二行';
 
-void _legacy() => SharedPreferences.setMockInitialValues({
+const _oldWebQuote = {
+  'id': 'legacy-page',
+  'url': 'https://example.com/guide',
+  'title': 'Legacy handbook',
+  'text': 'Saved passage from the old browser',
+  'selection': true,
+  'truncated': false,
+};
+
+void _legacy({bool withWebQuote = false}) => SharedPreferences.setMockInitialValues({
   DraftStore.legacyPreferenceKey: jsonEncode({
-    'A': {'t': _old, 'at': DateTime(2025).millisecondsSinceEpoch},
+    'A': {
+      't': _old,
+      'at': DateTime(2025).millisecondsSinceEpoch,
+      if (withWebQuote) 'webQuotes': [_oldWebQuote],
+    },
   }),
 });
 
@@ -121,6 +135,37 @@ void main() {
     await c.read(draftStoreProvider.notifier).flush();
     final prefs = await SharedPreferences.getInstance();
     expect(prefs.getString(DraftStore.legacyPreferenceKey), contains('旧版留下的一整段'));
+  });
+
+  testWidgets('a legacy web reference can be previewed and restored with its draft', (tester) async {
+    _legacy(withWebQuote: true);
+    final h = _two();
+    final c = await _pump(tester, h);
+    await tester.enterText(find.byType(TextField), '当前草稿');
+
+    await _openLegacy(tester);
+    final card = find.byKey(const ValueKey('web-quote-legacy-page'));
+    expect(card, findsOneWidget);
+    await tester.tap(card);
+    await tester.pumpAndSettle();
+    expect(find.text('Saved passage from the old browser'), findsOneWidget);
+    Navigator.of(tester.element(find.text('Saved passage from the old browser'))).pop();
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('legacy-draft-append')));
+    await tester.pumpAndSettle();
+    expect(_text(tester), '当前草稿\n\n$_old');
+    final tray = tester.widget<ComposerTray>(find.byType(ComposerTray));
+    expect(tray.webQuotes.single.text, 'Saved passage from the old browser');
+    final recovered = c.read(draftStoreProvider).drafts[localDraft('A')]!;
+    expect(recovered.webQuotes.single.text, 'Saved passage from the old browser');
+    expect(recovered.webQuotes.single.selection, isTrue);
+    expect(h.controllers['A']!.sent, isEmpty);
+
+    await c.read(draftStoreProvider.notifier).flush();
+    final prefs = await SharedPreferences.getInstance();
+    final legacy = jsonDecode(prefs.getString(DraftStore.legacyPreferenceKey)!) as Map;
+    expect(legacy['A']['webQuotes'].single['text'], 'Saved passage from the old browser');
   });
 
   for (final hop in ['A → B → A', 'host switch']) {

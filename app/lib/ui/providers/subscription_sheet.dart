@@ -8,12 +8,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
-import '../../state/account_state.dart' show EmbeddedAccountBrowser, accountBrowserProvider;
+import '../../state/account_state.dart' show accountBrowserProvider;
 import '../../state/app_foreground.dart';
 import '../../state/subscriptions_state.dart';
 import '../common/app_sheet.dart';
+import '../common/field_paste.dart';
 import '../common/sheet_title_bar.dart';
 import '../common/smooth_size.dart';
 import '../theme/app_icons.dart';
@@ -21,26 +21,32 @@ import '../theme/theme.dart';
 
 /// A subscription's monogram letter (a plain letter, no brand mark).
 String subscriptionLetter(Subscription s) => switch (s) {
-  Subscription.chatgpt => 'G',
+  Subscription.chatgpt || Subscription.chatgptOfficial => 'G',
   Subscription.claude => 'C',
 };
 
 /// Opens the sign-in sheet; true once signed in. Closing it cancels the
 /// attempt.
-Future<bool> showSubscriptionLogin(BuildContext context, Subscription subscription) async {
+Future<bool> showSubscriptionLogin(BuildContext context, Subscription subscription, {bool newAccount = false}) async {
   final signedIn = await showAppSheet<bool>(
     context,
     dismissal: SheetDismissal.button,
     isScrollControlled: true,
-    builder: (_) => SubscriptionLoginSheet(subscription: subscription),
+    builder: (_) => SubscriptionLoginSheet(subscription: subscription, newAccount: newAccount),
   );
   return signedIn ?? false;
 }
 
 class SubscriptionLoginSheet extends ConsumerStatefulWidget {
-  const SubscriptionLoginSheet({super.key, required this.subscription, this.interval = const Duration(seconds: 1)});
+  const SubscriptionLoginSheet({
+    super.key,
+    required this.subscription,
+    this.newAccount = false,
+    this.interval = const Duration(seconds: 1),
+  });
 
   final Subscription subscription;
+  final bool newAccount;
 
   /// Poll interval (tests shorten it).
   final Duration interval;
@@ -59,7 +65,6 @@ class _SubscriptionLoginSheetState extends ConsumerState<SubscriptionLoginSheet>
   /// The URL already handed to the browser for this attempt.
   String? _opened;
   bool _browserFailed = false;
-  Completer<void>? _authorizationDone;
 
   /// Which button just copied (its label reads 「已复制」 for a moment).
   String? _copied;
@@ -69,13 +74,14 @@ class _SubscriptionLoginSheetState extends ConsumerState<SubscriptionLoginSheet>
   @override
   void initState() {
     super.initState();
-    _startSession();
-  }
-
-  void _startSession() {
     final backend = ref.read(subscriptionBackendProvider);
     if (backend == null) return;
-    final session = LoginSession(backend, widget.subscription, interval: widget.interval)..addListener(_onStep);
+    final session = LoginSession(
+      backend,
+      widget.subscription,
+      newAccount: widget.newAccount,
+      interval: widget.interval,
+    )..addListener(_onStep);
     _session = session;
     unawaited(session.start());
   }
@@ -84,7 +90,6 @@ class _SubscriptionLoginSheetState extends ConsumerState<SubscriptionLoginSheet>
   void dispose() {
     _copiedTimer?.cancel();
     _doneTimer?.cancel();
-    _finishAuthorization();
     _session
       ?..removeListener(_onStep)
       ..dispose();
@@ -94,76 +99,25 @@ class _SubscriptionLoginSheetState extends ConsumerState<SubscriptionLoginSheet>
 
   void _onStep() {
     if (!mounted) return;
-    final session = _session!;
-    final step = session.step;
-    if ((step.phase != LoginPhase.open && step.phase != LoginPhase.device) || step.url != _opened) {
-      _finishAuthorization();
-    }
+    final step = _session!.step;
     if (step.phase == LoginPhase.open && step.url != null && step.url != _opened) {
       unawaited(_open(step.url!));
     }
     if (step.phase == LoginPhase.done && _doneTimer == null) {
-      // The temporary page has completed; a system-browser fallback may still cover the app.
+      // Signed in through the browser: close its tab and come back here.
       if (_opened != null) unawaited(ref.read(appForegroundProvider)());
       refreshAfterSubscriptionChange(ref);
-      final route = ModalRoute.of(context);
       _doneTimer = Timer(SubscriptionLoginSheet.doneDwell, () {
-        if (!mounted || !identical(_session, session) || route == null || !route.isActive) return;
-        if (route.isCurrent) {
-          route.navigator?.pop(true);
-        } else {
-          route.navigator?.removeRoute(route, true);
-        }
+        if (mounted) Navigator.of(context).pop(true);
       });
     }
     setState(() {});
   }
 
   Future<void> _open(String url) async {
-    final session = _session;
-    if (!mounted || session == null) return;
-    if ((session.step.phase != LoginPhase.open && session.step.phase != LoginPhase.device) || session.step.url != url) {
-      return;
-    }
-    final browser = ref.read(accountBrowserProvider);
-    if (browser is EmbeddedAccountBrowser) {
-      if (_authorizationDone != null && _opened == url) return;
-      _finishAuthorization();
-      _opened = url;
-      final done = _authorizationDone = Completer<void>();
-      bool current() => mounted && identical(_session, session) && identical(_authorizationDone, done);
-      final request = BrowserAuthorization(
-        id: done,
-        url: Uri.parse(url),
-        completed: done.future,
-        isCurrent: current,
-        // Device and prompt flows have no trusted loopback callback origin.
-        callbackOrigin: null,
-        onSystemBrowserOpened: () {
-          if (current()) _finishAuthorization();
-        },
-        cancel: () async {
-          if (!current()) return;
-          // Returning with a copied code must keep this login alive. Only
-          // closing the sheet cancels the session; reopening gets a fresh page.
-          _finishAuthorization();
-        },
-      );
-      final ok = await browser.authorize(request).catchError((_) => false);
-      if (!current()) return;
-      if (!ok) _finishAuthorization();
-      setState(() => _browserFailed = !ok);
-      return;
-    }
     _opened = url;
-    final ok = await browser.open(Uri.parse(url));
-    if (mounted && identical(_session, session)) setState(() => _browserFailed = !ok);
-  }
-
-  void _finishAuthorization() {
-    final done = _authorizationDone;
-    _authorizationDone = null;
-    if (done != null && !done.isCompleted) done.complete();
+    final ok = await ref.read(accountBrowserProvider).open(Uri.parse(url));
+    if (mounted) setState(() => _browserFailed = !ok);
   }
 
   Future<void> _copy(String id, String text) async {
@@ -177,19 +131,13 @@ class _SubscriptionLoginSheetState extends ConsumerState<SubscriptionLoginSheet>
   }
 
   void _retry() {
-    _finishAuthorization();
-    _doneTimer?.cancel();
-    _doneTimer = null;
-    // Retire callbacks from the old attempt before starting another login.
-    _session
-      ?..removeListener(_onStep)
-      ..dispose();
-    _session = null;
+    _copiedTimer?.cancel();
+    _copiedTimer = null;
+    _copied = null;
     _answer.clear();
     _opened = null;
     _browserFailed = false;
-    _startSession();
-    setState(() {});
+    unawaited(_session?.start());
   }
 
   @override
@@ -482,7 +430,7 @@ final _cjk = RegExp(r'[\u4e00-\u9fff]');
 String promptTitle(String? message) {
   final m = message?.toLowerCase() ?? '';
   // l10n:keep matches the engine’s prompt wording
-  return m.contains('url') || m.contains('redirect') || m.contains('链接')
+  return m.contains('url') || m.contains('redirect') || m.contains('链接') || m.contains('网址')
       ? appL10n.engineSubscriptionPasteRedirect
       : appL10n.engineSubscriptionPasteCode;
 }
@@ -507,11 +455,20 @@ class _PromptBody extends StatefulWidget {
   State<_PromptBody> createState() => _PromptBodyState();
 }
 
-class _PromptBodyState extends State<_PromptBody> {
+class _PromptBodyState extends State<_PromptBody> with FieldPaste<_PromptBody> {
+  String? _pasteError;
+
   @override
   void initState() {
     super.initState();
     widget.controller.addListener(_changed);
+  }
+
+  @override
+  void didUpdateWidget(_PromptBody oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Another question on the same field: a paste still waiting was for the last one.
+    if (oldWidget.helper != widget.helper || oldWidget.hint != widget.hint) cancelPaste();
   }
 
   @override
@@ -520,10 +477,10 @@ class _PromptBodyState extends State<_PromptBody> {
     super.dispose();
   }
 
-  void _changed() => setState(() {});
+  void _changed() => setState(() => _pasteError = null);
 
   Future<void> _paste() async {
-    final text = (await Clipboard.getData(Clipboard.kTextPlain))?.text?.trim();
+    final text = (await readClipboard(say: (message) => setState(() => _pasteError = message)))?.trim();
     if (text == null || text.isEmpty || !mounted) return;
     widget.controller.value = TextEditingValue(
       text: text,
@@ -535,6 +492,7 @@ class _PromptBodyState extends State<_PromptBody> {
     final value = widget.controller.text.trim();
     if (value.isEmpty || widget.busy) return;
     FocusManager.instance.primaryFocus?.unfocus();
+    widget.controller.clear();
     widget.onSubmit(value);
   }
 
@@ -563,6 +521,8 @@ class _PromptBodyState extends State<_PromptBody> {
             hintText: widget.hint?.trim().isNotEmpty == true ? widget.hint : l10n.engineSubscriptionPasteHere,
             helperText: _cjk.hasMatch(widget.helper ?? '') ? widget.helper!.trim() : null,
             helperMaxLines: 3,
+            errorText: _pasteError,
+            errorMaxLines: 3,
             suffixIcon: IconButton(
               tooltip: l10n.commonPaste,
               icon: const Icon(AppIcons.paste, size: 20),

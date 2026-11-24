@@ -1,18 +1,31 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 
-import 'package:flutter/gestures.dart';
+import 'package:clock/clock.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
 import 'performance_policy.dart';
 
-/// Requests the fastest rate at the current resolution, subject to system policy.
-/// A request is not a measurement of rendered FPS. Auto follows Flutter frames
-/// and input; Android independently follows native touch/scroll activity so an
-/// idle Flutter tree cannot cancel a WebView fling. Max requests continuously in
-/// the foreground; system clears our preferences.
-class RefreshRateService with WidgetsBindingObserver {
+/// Tells the platform when the app wants the screen's fastest refresh rate.
+///
+/// [RefreshRateMode.auto]: while Flutter is producing frames (animations, scrolling,
+/// streaming output) the window asks for the fastest mode at its resolution; after
+/// [idleAfter] without a frame it drops the preference and the system decides again.
+/// [RefreshRateMode.max] keeps it pinned; [RefreshRateMode.system] never declares one.
+///
+/// Some ROMs (HyperOS, OriginOS, ColorOS) cap third-party apps at 60 Hz unless the app
+/// asks, and once it does they show the per-app refresh-rate switch as an in-app setting
+/// — so the app has to offer the choice itself, including handing the decision back.
+///
+/// HarmonyOS has no such switch, but its Flutter engine votes its own rate: 120 under a
+/// finger, 60 from 3 s after, and only scrolls and routes vote in between, so springs, sheets
+/// and streaming output run at what that leaves. There active asks the engine for 120, which
+/// is a real cost rather than a preference, so it follows motion and not any frame: several
+/// frames in a row at animation cadence. A blinking cursor, two frames a second, doesn't
+/// start it or hold it up. The price is about [motionFrames] frames at the old rate at the
+/// start of a motion that no finger began.
+class RefreshRateService {
   RefreshRateService._();
 
   static final RefreshRateService instance = RefreshRateService._();
@@ -21,142 +34,153 @@ class RefreshRateService with WidgetsBindingObserver {
   @visibleForTesting
   static MethodChannel channel = const MethodChannel('dsh/app');
 
+  /// The OS by Dart's name for it, so a test can be on another one.
+  @visibleForTesting
+  static String operatingSystem = Platform.operatingSystem;
+
   /// How long after the last frame the preference is released.
   static const idleAfter = Duration(milliseconds: 700);
+
+  /// HarmonyOS: frames this close together are animating. 20 fps, so a panel the system
+  /// has lowered to 30 Hz still counts, and a cursor's half-second blink never does.
+  static const motionGap = Duration(milliseconds: 50);
+
+  /// HarmonyOS: this many such gaps in a row are motion.
+  static const motionFrames = 3;
+
+  /// HarmonyOS: how often motion says so again. The native side stops by itself without it,
+  /// so a UI thread that stops answering can't leave 120 running.
+  static const renewEvery = Duration(seconds: 1);
 
   RefreshRateMode _mode = RefreshRateMode.auto;
   bool _active = false;
   bool _started = false;
-  bool _foreground = false;
-  bool _observing = false;
-  bool _frameListenerInstalled = false;
   Timer? _idle;
-  Future<void> _activation = Future<void>.value();
+
+  /// One timer per idle stretch, not one per frame: a held frame's time stamp, the
+  /// clock's time for it, and the latest frame held since. On firing the timer
+  /// waits out whatever is left after that latest frame.
+  Duration _anchor = Duration.zero;
+  DateTime _anchorAt = DateTime(0);
+  Duration _heldAt = Duration.zero;
+  Duration _lastFrame = Duration.zero;
+  Duration _renewedAt = Duration.zero;
+  int _motionRun = 0;
 
   RefreshRateMode get mode => _mode;
 
-  /// Safe to call twice. Tests can explicitly enable activity observation;
-  /// ordinary widget tests only send settings and do not leave idle timers.
-  void start({bool? observeActivity}) {
-    if (_started) return;
+  /// Registers the frame listener and sends the initial mode. Safe to call twice.
+  void start() {
+    if (_started || _systemDecides) return;
     _started = true;
-    final binding = WidgetsBinding.instance;
-    _foreground = binding.lifecycleState == null || binding.lifecycleState == AppLifecycleState.resumed;
-    _observing = observeActivity ?? !Platform.environment.containsKey('FLUTTER_TEST');
-    if (_observing) {
-      binding.addObserver(this);
-      binding.pointerRouter.addGlobalRoute(_onPointer);
-      // Persistent callbacks cannot be removed. Install once, and gate it on
-      // _started/_observing so test resets cannot accumulate live listeners.
-      if (!_frameListenerInstalled) {
-        _frameListenerInstalled = true;
-        binding.addPersistentFrameCallback(_onFrame);
-      }
-    }
-    unawaited(_sendMode());
-    if (_observing) unawaited(requestActivity());
+    // Widget tests have no platform side and must not leave timers behind; the mode is
+    // still sent so a test can assert the channel traffic.
+    if (!_testing) WidgetsBinding.instance.addPersistentFrameCallback(_onFrame);
+    _sendMode();
   }
 
-  /// Called by the settings row and by the stored preference after launch.
-  Future<void> setMode(RefreshRateMode mode) async {
-    if (_mode == mode) return;
-    _mode = mode;
-    _release();
-    final sent = _sendMode();
-    if (_observing && mode == RefreshRateMode.auto) unawaited(requestActivity());
-    await sent;
-  }
+  static bool get _testing => Platform.environment.containsKey('FLUTTER_TEST');
 
-  /// Call before a programmatic AnimationController.forward/reverse or route
-  /// transition. Native touch dispatch already does this for touch-driven UI.
-  /// Awaiting this acknowledges the request, not a completed display-mode switch.
-  /// Later Flutter frames extend the lease without per-frame channel calls.
+  static bool get _motionOnly => operatingSystem == 'ohos';
+
+  /// iOS paces frames itself (ProMotion); nothing to ask for.
+  static bool get _systemDecides => operatingSystem == 'ios';
+
+  /// Keeps the automatic refresh preference active for a programmatic
+  /// animation that may not produce Flutter frames (for example, a WebView
+  /// transition). Subsequent frames continue the same activity window.
   Future<void> requestActivity() {
-    if (!_started || !_foreground || _mode != RefreshRateMode.auto) return Future<void>.value();
+    if (!_started || _systemDecides || _mode != RefreshRateMode.auto) return Future<void>.value();
     _idle?.cancel();
     _idle = Timer(idleAfter, _release);
     if (!_active) {
       _active = true;
-      _activation = _sendActive(true);
+      _sendActive(true);
     }
-    return _activation;
+    return Future<void>.value();
   }
 
-  void _onFrame(Duration _) {
-    if (_started && _observing) unawaited(requestActivity());
+  /// Called by the settings row and by the stored preference after launch.
+  Future<void> setMode(RefreshRateMode mode) async {
+    if (_mode == mode || _systemDecides) return;
+    _mode = mode;
+    _idle?.cancel();
+    _idle = null;
+    if (mode != RefreshRateMode.auto) _active = false;
+    _sendMode();
   }
 
-  void _onPointer(PointerEvent event) {
-    if (event is PointerDownEvent ||
-        event is PointerMoveEvent ||
-        event is PointerUpEvent ||
-        event is PointerSignalEvent) {
-      unawaited(requestActivity());
-    }
+  void _onFrame(Duration timeStamp) {
+    if (_mode != RefreshRateMode.auto) return;
+    if (_motionOnly) return _onMotionFrame(timeStamp);
+    _hold(timeStamp);
+    if (_active) return;
+    _active = true;
+    _sendActive(true);
   }
 
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (!_started) return;
-    _foreground = state == AppLifecycleState.resumed;
-    if (!_foreground) {
-      _release();
+  void _onMotionFrame(Duration timeStamp) {
+    _motionRun = timeStamp - _lastFrame <= motionGap ? _motionRun + 1 : 0;
+    _lastFrame = timeStamp;
+    if (_motionRun < motionFrames) return;
+    _hold(timeStamp);
+    if (_active && timeStamp - _renewedAt < renewEvery) return;
+    _active = true;
+    _renewedAt = timeStamp;
+    _sendActive(true);
+  }
+
+  /// Releases [idleAfter] after the frame at [timeStamp], unless a later one is held.
+  void _hold(Duration timeStamp) {
+    _heldAt = timeStamp;
+    if (_idle != null) return;
+    _anchor = timeStamp;
+    _anchorAt = clock.now();
+    _idle = Timer(idleAfter, _idleCheck);
+  }
+
+  /// Measured from now, so a timer that ran late doesn't add its delay.
+  void _idleCheck() {
+    final lastAt = _anchorAt.add(_heldAt - _anchor);
+    final left = idleAfter - clock.now().difference(lastAt);
+    if (left > Duration.zero) {
+      _anchor = _heldAt;
+      _anchorAt = lastAt;
+      _idle = Timer(left, _idleCheck);
       return;
     }
-    // The engine outlives MainActivity: resend even an unchanged setting when
-    // Android recreates its channel/window, then request before the first frame.
-    unawaited(_sendMode());
-    unawaited(requestActivity());
+    _idle = null;
+    _release();
   }
 
   void _release() {
-    _idle?.cancel();
-    _idle = null;
     if (!_active) return;
     _active = false;
-    unawaited(_sendActive(false));
+    _sendActive(false);
   }
 
-  /// Read-only numeric metadata. reportedRefreshRateHz is Android's app-visible
-  /// display rate; it is NOT a measurement of Flutter/WebView FPS.
-  Future<Map<Object?, Object?>?> diagnostics() async {
-    try {
-      return await channel.invokeMapMethod<Object?, Object?>('getRefreshRateDiagnostics');
-    } on MissingPluginException {
-      return null;
-    } on PlatformException {
-      return null;
-    }
+  void _sendMode() => _send('setRefreshRateMode', {'mode': _mode.name});
+
+  void _sendActive(bool active) => _send('setFrameActive', {'active': active});
+
+  void _send(String method, Map<String, Object?> arguments) {
+    unawaited(channel.invokeMethod<void>(method, arguments).catchError((Object _) {}));
   }
 
-  Future<void> _sendMode() => _send('setRefreshRateMode', {'mode': _mode.name});
-
-  Future<void> _sendActive(bool active) => _send('setFrameActive', {'active': active});
-
-  Future<void> _send(String method, Map<String, Object?> arguments) async {
-    try {
-      await channel.invokeMethod<void>(method, arguments);
-    } on MissingPluginException {
-      // Unsupported platform, or the activity is between channel attachments.
-    } on PlatformException {
-      // A display preference must not break input or animation.
-    }
-  }
+  /// Test seam: a frame, since tests don't register the listener.
+  @visibleForTesting
+  void frameForTest(Duration timeStamp) => _onFrame(timeStamp);
 
   /// Test seam: forget the listener, the timer and the current mode.
   @visibleForTesting
   void resetForTest() {
     _idle?.cancel();
     _idle = null;
-    if (_observing) {
-      WidgetsBinding.instance.removeObserver(this);
-      WidgetsBinding.instance.pointerRouter.removeGlobalRoute(_onPointer);
-    }
-    _observing = false;
     _mode = RefreshRateMode.auto;
     _active = false;
-    _foreground = false;
     _started = false;
-    _activation = Future<void>.value();
+    _lastFrame = Duration.zero;
+    _renewedAt = Duration.zero;
+    _motionRun = 0;
   }
 }

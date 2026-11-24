@@ -1,13 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Platform;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
-import '../browser/browser_links.dart';
 import '../l10n/l10n.dart';
 import '../remote/link_status.dart';
 import '../remote/relay/dsh_remote_backend.dart';
+import 'android_features.dart';
 import 'app_info.dart';
 import '../remote/relay/relay_backend.dart';
 import '../remote/relay/webrtc_peer.dart';
@@ -138,18 +140,22 @@ class HostsController extends Notifier<HostsState> {
     state = HostsState(ssh: hosts, loaded: true);
   }
 
-  Future<void> _persist(List<SshHostConfig> hosts) async {
+  Future<bool> _persist(List<SshHostConfig> hosts) async {
     state = HostsState(ssh: List.unmodifiable(hosts), loaded: true);
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(prefsKey, jsonEncode([for (final h in hosts) h.toJson()]));
-    } catch (_) {}
+      return await prefs.setString(prefsKey, jsonEncode([for (final h in hosts) h.toJson()]));
+    } catch (_) {
+      return false;
+    }
   }
 
   /// Adds or replaces [config]. With [secrets], stores the one matching the
   /// auth method and deletes the other kind, so a host never keeps a stale
   /// password next to its key.
-  Future<void> saveSsh(SshHostConfig config, {SshSecrets? secrets}) async {
+  /// Returns the preferences write result. A false result does not undo the
+  /// in-memory config or any completed secret operations.
+  Future<bool> saveSsh(SshHostConfig config, {SshSecrets? secrets}) async {
     await _loaded;
     ref.read(readListCredentialEpochProvider.notifier).advance();
     if (secrets != null) await _writeSecrets(config, secrets);
@@ -160,7 +166,7 @@ class HostsController extends Notifier<HostsState> {
     } else {
       hosts.add(config);
     }
-    await _persist(hosts);
+    return _persist(hosts);
   }
 
   Future<void> _writeSecrets(SshHostConfig config, SshSecrets secrets) async {
@@ -182,6 +188,12 @@ class HostsController extends Notifier<HostsState> {
       await put(SshSecrets.passphraseKey(id), secrets.passphrase);
       await _secrets.delete(SshSecrets.passwordKey(id));
     }
+    // A failure writing the credential the person just entered must be
+    // reported as that failure, not hidden behind unrelated token cleanup.
+    await put(
+      SshSecrets.attachTokenKey(id),
+      config.dshMode == SshDshMode.attachOnly ? secrets.attachToken?.trim() : null,
+    );
   }
 
   Future<SshSecrets> loadSecrets(String id) async {
@@ -197,6 +209,7 @@ class HostsController extends Notifier<HostsState> {
       password: await get(SshSecrets.passwordKey(id)),
       privateKey: await get(SshSecrets.privateKeyKey(id)),
       passphrase: await get(SshSecrets.passphraseKey(id)),
+      attachToken: await get(SshSecrets.attachTokenKey(id)),
     );
   }
 
@@ -204,7 +217,12 @@ class HostsController extends Notifier<HostsState> {
   Future<void> removeSsh(String id) async {
     await _loaded;
     await _persist([...state.ssh.where((h) => h.id != id)]);
-    for (final key in [SshSecrets.passwordKey(id), SshSecrets.privateKeyKey(id), SshSecrets.passphraseKey(id)]) {
+    for (final key in [
+      SshSecrets.passwordKey(id),
+      SshSecrets.privateKeyKey(id),
+      SshSecrets.passphraseKey(id),
+      SshSecrets.attachTokenKey(id),
+    ]) {
       try {
         await _secrets.delete(key);
       } catch (_) {}
@@ -262,26 +280,67 @@ class RemoteAutoConnectController extends Notifier<bool> {
 
 final remoteAutoConnectProvider = NotifierProvider<RemoteAutoConnectController, bool>(RemoteAutoConnectController.new);
 
+/// Reduces history payloads on supporting Remote Hosts, never live events.
+/// Changes apply to the next client, so an active turn is not interrupted.
+class RemoteCompactHistoryController extends Notifier<bool> {
+  static const prefsKey = 'remote_compact_history';
+  late Future<void> _loaded;
+
+  @override
+  bool build() {
+    _loaded = _load();
+    return false;
+  }
+
+  Future<void> get ready => _loaded;
+
+  Future<void> _load() async {
+    try {
+      final stored = (await SharedPreferences.getInstance()).getBool(prefsKey);
+      if (stored != null && ref.mounted) state = stored;
+    } catch (_) {}
+  }
+
+  Future<void> set(bool value) async {
+    await _loaded;
+    if (!ref.mounted) return;
+    state = value;
+    try {
+      await (await SharedPreferences.getInstance()).setBool(prefsKey, value);
+    } catch (_) {}
+  }
+}
+
+final remoteCompactHistoryProvider = NotifierProvider<RemoteCompactHistoryController, bool>(
+  RemoteCompactHistoryController.new,
+);
+
 /// Which host the chat, session list and new chats use. Persisted.
 class ActiveHostController extends Notifier<HostRef> {
   static const prefsKey = 'active_host';
   bool _touched = false;
+  late Future<void> _loaded;
 
   @override
   HostRef build() {
     // Read the startup preference now, so the remote hosts page shows the
     // stored value from its first frame.
     ref.read(remoteAutoConnectProvider);
-    unawaited(_restore());
+    _loaded = _restore();
     return HostRef.local;
   }
 
+  /// The startup host choice has settled, including a disabled auto-connect
+  /// preference or an earlier explicit selection.
+  Future<void> get ready => _loaded;
+
   Future<void> _restore() async {
+    final owner = ref;
     try {
       final prefs = await SharedPreferences.getInstance();
       final restored = HostRef.decode(prefs.getString(prefsKey));
       final autoConnect = prefs.getBool(RemoteAutoConnectController.prefsKey) ?? true;
-      if (!_touched && ref.mounted && autoConnect) state = restored;
+      if (!_touched && owner.mounted && autoConnect) state = restored;
     } catch (_) {
       // No preferences backend (tests): stay on 本机.
     }
@@ -322,7 +381,7 @@ final activeHostProvider = NotifierProvider<ActiveHostController, HostRef>(Activ
 // ── DSH Remote (relay) account ───────────────────────────────────────────────
 
 /// The DSH Remote server: null for the hosted dsh.r2049.cn, else a
-/// self-hosted origin (an advanced option; it signs in with email + password).
+/// self-hosted origin with its own sign-in methods.
 class RelayServerController extends Notifier<String?> {
   static const prefsKey = 'remote_relay_server';
   bool _touched = false;
@@ -353,19 +412,64 @@ class RelayServerController extends Notifier<String?> {
   }
 
   /// Back to dsh.r2049.cn (each server keeps its own sign-in).
-  Future<void> useDefault() async {
-    await _set(null);
-    ref.invalidate(relayAccountProvider);
-  }
+  Future<void> useDefault() => ref.read(_relayServerActionsProvider).useDefault();
+
+  /// Switches to [server] after the person selects it or agrees to a pairing code;
+  /// each Server keeps its own sign-in. Throws [HostLinkError] when invalid.
+  Future<void> useServer(String server) => ref.read(_relayServerActionsProvider).useServer(server);
 
   /// Switches to [server] (normalized; throws [HostLinkError] when invalid)
   /// and signs in there with email + password.
+  Future<void> loginWithPassword({required String server, required String email, required String password}) =>
+      ref.read(_relayServerActionsProvider).loginWithPassword(server: server, email: email, password: password);
+}
+
+// Commands need their own Ref: the backend watches the server state, so the
+// server notifier cannot read/invalidate its downstream providers. This provider
+// does not watch the selection and remains alive when a login sheet closes.
+final _relayServerActionsProvider = Provider<_RelayServerActions>(_RelayServerActions.new);
+
+class _RelayServerActions {
+  _RelayServerActions(this.ref);
+
+  final Ref ref;
+  int _operation = 0;
+
+  bool _owns(int operation, String? selection) =>
+      ref.mounted && operation == _operation && ref.read(relayServerProvider) == selection;
+
+  Future<void> useDefault() async {
+    final operation = ++_operation;
+    await ref.read(relayServerProvider.notifier)._set(null);
+    if (_owns(operation, null)) ref.invalidate(relayAccountProvider);
+  }
+
+  Future<void> useServer(String server) async {
+    final origin = DshRemoteRelayBackend.normalizeServer(server);
+    final selection = origin == defaultRelayServer ? null : origin;
+    final operation = ++_operation;
+    await ref.read(relayServerProvider.notifier)._set(selection);
+    if (_owns(operation, selection)) ref.invalidate(relayAccountProvider);
+  }
+
   Future<void> loginWithPassword({required String server, required String email, required String password}) async {
     ref.read(readListCredentialEpochProvider.notifier).advance();
     final origin = DshRemoteRelayBackend.normalizeServer(server);
-    await _set(origin == defaultRelayServer ? null : origin);
-    await ref.read(relayBackendProvider).loginWithPassword(email.trim(), password);
-    ref.invalidate(relayAccountProvider);
+    final selection = origin == defaultRelayServer ? null : origin;
+    final operation = ++_operation;
+    await ref.read(relayServerProvider.notifier)._set(selection);
+    // Persistence may yield to another server action, including A -> B -> A.
+    // Never resolve a retired request against the newly selected backend.
+    if (!_owns(operation, selection)) {
+      throw HostLinkError(HostLinkErrorKind.other, appL10n.remoteSignInCancelled);
+    }
+    final backend = ref.read(relayBackendProvider);
+    await backend.loginWithPassword(email.trim(), password);
+    // The captured account may have completed successfully after selection
+    // changed. Keep that result, but do not rebuild/cancel its successor login.
+    if (_owns(operation, selection) && identical(backend, ref.read(relayBackendProvider))) {
+      ref.invalidate(relayAccountProvider);
+    }
   }
 }
 
@@ -376,11 +480,23 @@ final relayServerProvider = NotifierProvider<RelayServerController, String?>(Rel
 /// The relay client (`packages/dsh_remote`) for the chosen server. Tests
 /// override with a fake; [UnavailableRelayBackend] turns the native relay off.
 final relayBackendProvider = Provider<RelayBackend>((ref) {
+  final history = ref.read(remoteCompactHistoryProvider.notifier);
   final backend = DshRemoteRelayBackend(
     secrets: ref.watch(secretStoreProvider),
     serverUrl: ref.watch(relayServerProvider),
     clientVersion: AppInfo.version.split('+').first,
-    peerConnector: flutterPeerConnector,
+    // flutter_webrtc has no HarmonyOS implementation: straight to the relay,
+    // not two handshakes that fail on the way there.
+    peerConnector: ref.watch(webRtcAvailableProvider) ? flutterPeerConnector : null,
+    loadCompactHistory: () async {
+      await history.ready;
+      return ref.read(remoteCompactHistoryProvider);
+    },
+  );
+  ref.listen<bool>(
+    remoteCompactHistoryProvider,
+    (_, enabled) => backend.compactHistory = enabled,
+    fireImmediately: true,
   );
   // The old default-off preference no longer controls automatic transport selection.
   unawaited(
@@ -390,14 +506,19 @@ final relayBackendProvider = Provider<RelayBackend>((ref) {
   return backend;
 });
 
-/// Opens a temporary authorization page; a system-browser action remains
-/// available for providers that reject embedded browsers.
+/// Opens the login page: a Custom Tab on Android (Google sign-in refuses
+/// WebViews), the browser elsewhere.
 typedef UrlOpener = Future<bool> Function(Uri url);
 
 final urlOpenerProvider = Provider<UrlOpener>(
-  (ref) => (url) {
-    final request = ref.read(relayAccountProvider.notifier)._browserAuthorization(url);
-    return request == null ? BrowserLinks.open(url) : BrowserLinks.authorize(request);
+  (ref) => (url) async {
+    // HarmonyOS's url_launcher answers the in-app mode with a developer's toast.
+    if (Platform.operatingSystem == 'ohos') return launchUrl(url, mode: LaunchMode.externalApplication);
+    try {
+      return await launchUrl(url, mode: LaunchMode.inAppBrowserView);
+    } catch (_) {
+      return launchUrl(url, mode: LaunchMode.externalApplication);
+    }
   },
 );
 
@@ -469,7 +590,6 @@ class RelayAccountState {
 /// DSH Remote account: login via browser + polling, host list with presence.
 class RelayAccountController extends AsyncNotifier<RelayAccountState> {
   RelayLoginSession? _login;
-  String? _loginProvider;
   int _epoch = 0;
 
   RelayBackend get _backend => ref.read(relayBackendProvider);
@@ -504,7 +624,6 @@ class RelayAccountController extends AsyncNotifier<RelayAccountState> {
     _epoch++;
     final session = _login;
     _login = null;
-    _loginProvider = null;
     session?.cancel();
   }
 
@@ -531,12 +650,12 @@ class RelayAccountController extends AsyncNotifier<RelayAccountState> {
   Future<void> login({String? providerId}) async {
     if (_now.loggingIn) return;
     final backend = _backend;
-    final selectedProvider = providerId ?? _now.providers.firstOrNull?.id;
+    final selectedProviderId = providerId ?? (_now.providers.isEmpty ? null : _now.providers.first.id);
     final epoch = ++_epoch;
     ref.read(readListCredentialEpochProvider.notifier).advance();
     state = AsyncData(_now.copyWith(loggingIn: true, error: () => null));
     try {
-      final session = await backend.login(providerId: selectedProvider);
+      final session = await backend.login(providerId: selectedProviderId);
       // Cancellation may finish this future before the browser returns, or
       // while an obsolete login is still creating its server session.
       session.completed.ignore();
@@ -545,7 +664,6 @@ class RelayAccountController extends AsyncNotifier<RelayAccountState> {
         return;
       }
       _login = session;
-      _loginProvider = selectedProvider;
       state = AsyncData(_now.copyWith(loginUrl: () => session.loginUrl));
       final opened = await ref.read(urlOpenerProvider)(session.loginUrl);
       if (!_isCurrent(epoch, backend)) return;
@@ -573,28 +691,8 @@ class RelayAccountController extends AsyncNotifier<RelayAccountState> {
         ),
       );
     } finally {
-      if (_isCurrent(epoch, backend)) {
-        _login = null;
-        _loginProvider = null;
-      }
+      if (_isCurrent(epoch, backend)) _login = null;
     }
-  }
-
-  BrowserAuthorization? _browserAuthorization(Uri url) {
-    final session = _login;
-    final epoch = _epoch;
-    final backend = _backend;
-    if (session == null || session.loginUrl != url || !_now.loggingIn) return null;
-    return BrowserAuthorization(
-      id: session,
-      url: url,
-      preferSystem: _loginProvider?.toLowerCase() == 'google',
-      completed: session.completed.then<void>((_) {}, onError: (Object _, StackTrace _) {}),
-      isCurrent: () => ref.mounted && _isCurrent(epoch, backend) && identical(_login, session) && _now.loggingIn,
-      cancel: () async {
-        if (ref.mounted && _isCurrent(epoch, backend) && identical(_login, session)) cancelLogin();
-      },
-    );
   }
 
   void cancelLogin() {

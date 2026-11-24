@@ -8,27 +8,37 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../l10n/l10n.dart';
 import '../../state/connection_state.dart';
 import '../../state/hosts_state.dart';
+import '../../state/session_deletion_state.dart';
 import '../../state/session_search.dart';
 import '../../state/sessions_state.dart';
 import '../common/app_sheet.dart';
 import '../common/empty_view.dart';
 import '../common/fade_in.dart';
-import '../common/pressable.dart';
 import '../common/side_insets.dart';
 import '../common/status_dot.dart';
 import '../theme/app_icons.dart';
 import '../theme/theme.dart';
+import 'drawer/session_deletion.dart';
 import 'page_frame.dart';
 import 'sessions_drawer.dart' show sessionSelectionColor, sessionTitle;
 
 /// "搜索对话" at the top of the sessions drawer. Opens [SessionSearchPage];
 /// picking a result opens that conversation and closes the drawer.
 class SessionSearchBar extends ConsumerWidget {
-  const SessionSearchBar({super.key, required this.onClose, this.padding = const EdgeInsets.fromLTRB(10, 2, 10, 6)});
+  const SessionSearchBar({
+    super.key,
+    required this.onClose,
+    this.padding = const EdgeInsets.fromLTRB(10, 2, 10, 6),
+    this.trailing,
+  });
 
   /// Closes the drawer.
   final VoidCallback onClose;
   final EdgeInsetsGeometry padding;
+
+  /// A key beside the bar, outside it (the list's options when nothing else
+  /// in the drawer has room for them).
+  final Widget? trailing;
 
   Future<void> _open(BuildContext context, WidgetRef ref) async {
     final sessionId = await showSessionSearch(context);
@@ -42,39 +52,45 @@ class SessionSearchBar extends ConsumerWidget {
     final l10n = context.l10n;
     final theme = Theme.of(context);
     final tertiary = DshColors.of(context).textTertiary;
-    return Padding(
-      padding: padding,
-      child: Semantics(
-        button: true,
-        label: l10n.shellSearchChats,
+    final bar = Semantics(
+      button: true,
+      label: l10n.shellSearchChats,
+      onTap: () => _open(context, ref),
+      excludeSemantics: true,
+      child: GlassSurface(
+        tier: GlassTier.pill,
+        stadium: true,
         onTap: () => _open(context, ref),
-        excludeSemantics: true,
-        child: Pressable(
-          child: GlassSurface(
-            tier: GlassTier.pill,
-            stadium: true,
-            onTap: () => _open(context, ref),
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(minHeight: 40),
-              child: Row(
-                children: [
-                  Icon(AppIcons.search, size: 20, color: tertiary),
-                  const SizedBox(width: 8),
-                  Flexible(
-                    child: Text(
-                      l10n.shellSearchChats,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.bodyMedium?.copyWith(color: tertiary),
-                    ),
-                  ),
-                ],
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 40),
+          child: Row(
+            children: [
+              Icon(AppIcons.search, size: 20, color: tertiary),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  l10n.shellSearchChats,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodyMedium?.copyWith(color: tertiary),
+                ),
               ),
-            ),
+            ],
           ),
         ),
       ),
+    );
+    return Padding(
+      padding: padding,
+      child: trailing == null
+          ? bar
+          : Row(
+              children: [
+                Expanded(child: bar),
+                trailing!,
+              ],
+            ),
     );
   }
 }
@@ -294,6 +310,8 @@ class _SearchField extends StatelessWidget {
   }
 }
 
+enum _ArchivedAction { restore, delete }
+
 class _SearchBody extends ConsumerWidget {
   const _SearchBody({required this.onPick, this.now, this.archivedOnly = false});
 
@@ -335,7 +353,7 @@ class _SearchBody extends ConsumerWidget {
     }
     if (sessions.value == null) return _Notice(icon: AppIcons.loading, title: l10n.shellLoadingChatsEllipsis);
 
-    final archived = ref.read(sessionsProvider.notifier).archivedSessions;
+    late final archived = ref.read(sessionsProvider.notifier).archivedSessions;
     final results = !archivedOnly
         ? view.results
         : SessionSearchResults(
@@ -376,38 +394,43 @@ class _SearchBody extends ConsumerWidget {
       onTap: () => r.archived ? _openArchived(context, ref, r.session) : onPick(r.session.sessionId),
     );
     final side = SessionSearchPage.sideFor(MediaQuery.sizeOf(context).width);
-    return ListView(
+    final activeCount = results.active.length;
+    final footerIndex = results.length + (results.archived.isEmpty ? 0 : 1);
+    return ListView.builder(
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       padding: EdgeInsets.fromLTRB(side, 4, side, MediaQuery.paddingOf(context).bottom + 24),
-      children: [
-        // The first page of hits rises in; later keystrokes just update.
-        ...FadeInList.wrap([
-          for (final r in results.active) tile(r),
-          if (results.archived.isNotEmpty) ...[_Eyebrow(l10n.shellArchived), for (final r in results.archived) tile(r)],
-        ]),
-        _ContentFooter(view: view),
-      ],
+      itemCount: footerIndex + 1,
+      itemBuilder: (context, i) {
+        if (i == footerIndex) return _ContentFooter(view: view);
+        final row = i < activeCount
+            ? tile(results.active[i])
+            : i == activeCount
+            ? _Eyebrow(l10n.shellArchived)
+            : tile(results.archived[i - activeCount - 1]);
+        return FadeSlideIn(index: i, child: row);
+      },
     );
   }
 
   /// Archived conversations can't be opened as they are (the Host stops their
-  /// work); offer to restore first, like DSH Web's search does.
+  /// work); offer to restore before opening, or permanently delete them.
   Future<void> _openArchived(BuildContext context, WidgetRef ref, SessionSummary session) async {
     final container = ProviderScope.containerOf(context, listen: false);
     final owner = container.read(activeHostProvider);
     final connection = container.read(activeConnectionProvider).value;
     final generation = connection?.client.mux.generation;
+    final deletionOwner = captureSessionDeletionOwner(ref);
     var retired = false;
     final hosts = container.listen(activeHostProvider, (_, next) {
       if (next != owner) retired = true;
     });
     final connections = container.listen(activeConnectionProvider, (_, next) {
       if (next.isLoading || next.hasError || !identical(next.value, connection)) retired = true;
-    });
+    }, fireImmediately: true);
     bool owned() =>
         !retired && !hosts.closed && !connections.closed && identical(connection?.client.mux.generation, generation);
     try {
-      final restore = await showAppSheet<bool>(
+      final action = await showAppSheet<_ArchivedAction>(
         context,
         builder: (sheet) => SafeArea(
           top: false,
@@ -429,7 +452,13 @@ class _SearchBody extends ConsumerWidget {
                   ListTile(
                     leading: const Icon(AppIcons.unarchive),
                     title: Text(context.l10n.shellRestoreAndOpen),
-                    onTap: () => Navigator.pop(sheet, true),
+                    onTap: () => Navigator.pop(sheet, _ArchivedAction.restore),
+                  ),
+                  SessionDeleteTile(
+                    ids: [session.sessionId],
+                    owner: deletionOwner,
+                    archived: true,
+                    onTap: () => Navigator.pop(sheet, _ArchivedAction.delete),
                   ),
                 ],
               ),
@@ -438,7 +467,12 @@ class _SearchBody extends ConsumerWidget {
           ),
         ),
       );
-      if (restore != true || !context.mounted || !owned()) return;
+      if (!context.mounted) return;
+      if (action == _ArchivedAction.delete && deletionOwner != null) {
+        await deleteSessionsFlow(context, ref, [session.sessionId], owner: deletionOwner, archived: true);
+        return;
+      }
+      if (action != _ArchivedAction.restore || !owned()) return;
       final messenger = ScaffoldMessenger.maybeOf(context);
       try {
         await unarchiveSession(ref, session.sessionId);
@@ -447,6 +481,7 @@ class _SearchBody extends ConsumerWidget {
         if (context.mounted && owned()) messenger?.showSnackBar(SnackBar(content: Text(appL10n.shellRestoreFailed)));
       }
     } finally {
+      deletionOwner?.close();
       hosts.close();
       connections.close();
     }

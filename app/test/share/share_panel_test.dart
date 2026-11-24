@@ -5,6 +5,7 @@
 //
 //   flutter test --update-goldens test/share/share_panel_test.dart
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -33,7 +34,8 @@ import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart' show AsyncData;
+import 'package:flutter_riverpod/flutter_riverpod.dart' show AsyncData, ProviderScope;
+import 'package:dsh_app/state/android_features.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:share_plus/share_plus.dart';
 
@@ -50,13 +52,18 @@ class _Exporter extends ShareExporter {
 
   final shared = <ShareParams>[];
   final saved = <File>[];
+  Object? saveError;
+  Completer<void>? shareGate;
 
   @override
-  Future<void> share(File image, {String? text}) async =>
-      shared.add(ShareParams(files: [XFile(image.path)], text: text));
+  Future<void> share(File image, {String? text}) async {
+    shared.add(ShareParams(files: [XFile(image.path)], text: text));
+    if (shareGate case final gate?) await gate.future;
+  }
 
   @override
   Future<String> save(File image) async {
+    if (saveError case final error?) throw error;
     saved.add(image);
     return 'Download/DSH-Go/${image.uri.pathSegments.last}';
   }
@@ -68,6 +75,7 @@ class _Out extends ConversationOut {
   final shared = <(File, ConversationFormat)>[];
   final saved = <(File, ConversationFormat)>[];
   final texts = <String>[];
+  Object? saveError;
 
   @override
   Future<void> shareFile(File file, ConversationFormat format) async => shared.add((file, format));
@@ -76,7 +84,9 @@ class _Out extends ConversationOut {
   Future<void> shareText(String text) async => texts.add(text);
 
   @override
-  Future<String> save(File file, ConversationFormat format) async {
+  Future<String> save(String name, String content, ConversationFormat format) async {
+    if (saveError case final error?) throw error;
+    final file = await write(name, content);
     saved.add((file, format));
     return 'Download/DSH-Go/${file.uri.pathSegments.last}';
   }
@@ -87,6 +97,8 @@ class _Links implements ConversationLinkMaker {
   final revoked = <String>[];
   final restored = <String>[];
   bool fail = false;
+  bool unsaved = false;
+  bool undoUnsaved = false;
 
   @override
   Future<ConversationLink> upload(Uint8List fileBytes, LinkExpiry expiry, {required String title}) async {
@@ -96,14 +108,22 @@ class _Links implements ConversationLinkMaker {
       url: Uri.parse('https://go.example.cn/c/a1B2c3D4e5#k=${'K' * 43}'),
       expiresAt: expiry == LinkExpiry.forever ? null : DateTime.utc(2026, 11, 24, 12),
       id: 'a1B2c3D4e5',
+      locallySaved: !unsaved,
     );
   }
 
   @override
-  Future<void> revoke(ConversationLink link) async => revoked.add(link.id!);
+  Future<void> revoke(ConversationLink link) async {
+    if (fail) throw StateError('controlled failure');
+    revoked.add(link.id!);
+  }
 
   @override
-  Future<void> restore(ConversationLink link) async => restored.add(link.id!);
+  Future<void> restore(ConversationLink link) async {
+    if (fail) throw StateError('controlled failure');
+    if (undoUnsaved) throw const ConversationLinkRestoreUnsaved();
+    restored.add(link.id!);
+  }
 
   @override
   Duration get undoWindow => const Duration(seconds: 4);
@@ -145,6 +165,7 @@ Future<_Panel> _open(
   bool links = true,
   double textScale = 1,
   Size? size,
+  String? operatingSystem,
 }) async {
   await tester.runAsync(loadTestFonts);
   usePhoneView(tester);
@@ -190,6 +211,7 @@ Future<_Panel> _open(
       ),
       brightness: brightness,
       overrides: [
+        if (operatingSystem != null) operatingSystemProvider.overrideWithValue(operatingSystem),
         settingsProvider.overrideWith(() => TestSettings()),
         // No engine: pictures in replies give up at once.
         activeConnectionProvider.overrideWithValue(const AsyncData<HostConnection?>(null)),
@@ -232,6 +254,31 @@ Future<void> _back(WidgetTester tester) async {
   await tester.pumpAndSettle();
 }
 
+// The undo checks need no image decoding or real-time settling.
+ChatState _undoFixture() {
+  final state = _fixture();
+  return ChatState(
+    items: [
+      for (final item in state.items)
+        if (item is UserChatItem)
+          UserChatItem(seq: item.seq, time: item.time, text: item.text, images: const [], files: item.files)
+        else
+          item,
+    ],
+    turns: state.turns,
+    commands: state.commands,
+    title: state.title,
+    loading: state.loading,
+  );
+}
+
+Future<void> _tapAndPump(WidgetTester tester, Finder finder) async {
+  await tester.ensureVisible(finder);
+  await tester.pumpAndSettle();
+  await tester.tap(finder);
+  await tester.pumpAndSettle();
+}
+
 ShareCard _card(WidgetTester tester) => tester.widget<ShareCard>(find.byType(ShareCard));
 
 String _summary(WidgetTester tester) => tester.widget<Text>(find.byKey(const ValueKey('share-summary'))).data!;
@@ -255,6 +302,8 @@ void _expectWhole(WidgetTester tester, String text) {
 }
 
 void main() {
+  _selectionTests();
+  _wholeScopeAfterUpdateTests();
   // ── Goldens ───────────────────────────────────────────────────────────────
 
   for (final brightness in Brightness.values) {
@@ -477,6 +526,57 @@ void main() {
     expect(find.byKey(const ValueKey('share-link-make')), findsOneWidget);
   });
 
+  testWidgets('failed revoke remains an active link and reports an error without an unhandled future', (tester) async {
+    final panel = await _open(tester, state: _fixture(), reply: 'a6', operatingSystem: 'ohos');
+    await _key(tester, 'share-to-link');
+    await _key(tester, 'share-link-make');
+    final model = tester.widget<SharePanelScope>(find.byType(SharePanelScope)).notifier!;
+    final original = model.link;
+    panel.links.fail = true;
+    await model.stopLink();
+    expect(model.link, same(original));
+    expect(model.error, isNot(contains('生成')));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('failed restore keeps the stopped state and its expiry timer', (tester) async {
+    final panel = await _open(tester, state: _fixture(), reply: 'a6', operatingSystem: 'ohos');
+    await _key(tester, 'share-to-link');
+    await _key(tester, 'share-link-make');
+    final model = tester.widget<SharePanelScope>(find.byType(SharePanelScope)).notifier!;
+    await model.stopLink();
+    panel.links.fail = true;
+    await model.restoreLink();
+    expect(model.link, isNull);
+    expect(model.error, isNot(contains('生成')));
+    await tester.pump(const Duration(seconds: 5));
+    expect(model.stopped, isNull);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('an uploaded unsaved link stays copyable and explains the save failure', (tester) async {
+    final panel = await _open(tester, state: _fixture(), reply: 'a6', operatingSystem: 'ohos');
+    panel.links.unsaved = true;
+    await _key(tester, 'share-to-link');
+    await _key(tester, 'share-link-make');
+    expect(find.byKey(const ValueKey('share-link-copy')), findsOneWidget);
+    expect(find.textContaining('链接已创建'), findsOneWidget);
+  });
+  testWidgets('session-only undo restores the link and displays restart warning', (tester) async {
+    final panel = await _open(tester, state: _fixture(), reply: 'a6', operatingSystem: 'ohos');
+    await _key(tester, 'share-to-link');
+    await _key(tester, 'share-link-make');
+    final model = tester.widget<SharePanelScope>(find.byType(SharePanelScope)).notifier!;
+    await model.stopLink();
+    panel.links.undoUnsaved = true;
+    await model.restoreLink();
+    await tester.pump();
+    expect(model.link, isNotNull);
+    expect(model.stopped, isNull);
+    expect(find.textContaining('重启后可能继续删除'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 5));
+    expect(model.link, isNotNull);
+  });
   testWidgets('a new scope or privacy asks for a new link; the old one stays in 我的分享链接', (tester) async {
     await _open(tester, state: _fixture(), reply: 'a6');
     await _key(tester, 'share-to-link');
@@ -491,6 +591,94 @@ void main() {
     await _key(tester, 'share-to-link');
     expect(find.byKey(const ValueKey('share-link-copy')), findsOneWidget, reason: 'the same content, the same link');
     expect(find.text('我的分享链接'), findsOneWidget);
+  });
+
+  testWidgets('[link-undo] restoring unchanged settings keeps the original link', (tester) async {
+    final panel = await _open(tester, state: _undoFixture(), reply: 'a6');
+    try {
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-to-link')));
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-make')));
+      expect(panel.links.uploads, hasLength(1));
+      expect(find.byKey(const ValueKey('share-link-copy')), findsOneWidget);
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-stop')));
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-stop-confirm')));
+      expect(panel.links.revoked, ['a1B2c3D4e5']);
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-restore')));
+      expect(panel.links.restored, ['a1B2c3D4e5']);
+      expect(panel.links.uploads, hasLength(1), reason: 'undo restores the old bytes, without uploading again');
+      expect(find.byKey(const ValueKey('share-link-copy')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    } finally {
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump();
+    }
+  });
+
+  testWidgets('[link-undo] restored bytes do not acquire the new privacy selection', (tester) async {
+    final panel = await _open(tester, state: _undoFixture(), reply: 'a6');
+    try {
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-to-link')));
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-make')));
+      final uploaded = decodeConversationFile(utf8.decode(panel.links.uploads.single.$1));
+      expect(uploaded.share.entries.where((entry) => entry.type == 'tool'), isNotEmpty);
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-stop')));
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-stop-confirm')));
+      await _back(tester);
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-toggle-工具调用')));
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-to-link')));
+      final model = SharePanelScope.of(tester.element(find.byType(ShareLinkPage)));
+      expect(model.privacy.tools, isFalse);
+      expect(model.built!.share.entries.where((entry) => entry.type == 'tool'), isEmpty);
+      expect(find.byKey(const ValueKey('share-link-restore')), findsOneWidget);
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-restore')));
+      expect(panel.links.restored, ['a1B2c3D4e5']);
+      expect(panel.links.uploads, hasLength(1), reason: 'undo did not publish the new tool-free content');
+      expect(find.byKey(const ValueKey('share-link-copy')), findsNothing);
+      expect(find.byKey(const ValueKey('share-link-make')), findsOneWidget);
+      await _back(tester);
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-toggle-工具调用')));
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-to-link')));
+      expect(
+        find.byKey(const ValueKey('share-link-copy')),
+        findsOneWidget,
+        reason: 'the old privacy still owns the restored link',
+      );
+      expect(tester.takeException(), isNull);
+    } finally {
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump();
+    }
+  });
+
+  testWidgets('[link-undo] restoring a month link does not make it permanent', (tester) async {
+    final panel = await _open(tester, state: _undoFixture(), reply: 'a6');
+    try {
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-to-link')));
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-make')));
+      expect(panel.links.uploads.single.$2, LinkExpiry.month);
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-stop')));
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-stop-confirm')));
+      await _tapAndPump(tester, find.text(LinkExpiry.forever.label));
+      expect(
+        tester.widget<SegmentedPill<LinkExpiry>>(find.byType(SegmentedPill<LinkExpiry>)).selected,
+        LinkExpiry.forever,
+      );
+      await _tapAndPump(tester, find.byKey(const ValueKey('share-link-restore')));
+      expect(panel.links.restored, ['a1B2c3D4e5']);
+      expect(panel.links.uploads, hasLength(1), reason: 'undo did not create a permanent upload');
+      expect(find.byKey(const ValueKey('share-link-copy')), findsNothing);
+      expect(find.byKey(const ValueKey('share-link-make')), findsOneWidget);
+      await _tapAndPump(tester, find.text(LinkExpiry.month.label));
+      expect(
+        find.byKey(const ValueKey('share-link-copy')),
+        findsOneWidget,
+        reason: 'returning to the original expiry reuses its link',
+      );
+      expect(tester.takeException(), isNull);
+    } finally {
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump();
+    }
   });
 
   testWidgets('a failed upload says so; without a share host there is no 链接', (tester) async {
@@ -508,6 +696,19 @@ void main() {
   });
 
   // ── 文件 ──────────────────────────────────────────────────────────────────
+
+  testWidgets('文件: backing out of the save window reads as neither saved nor failed', (tester) async {
+    final panel = await _open(tester, state: _fixture(), reply: 'a6', scope: ShareScope.whole);
+    await _key(tester, 'share-to-file');
+    panel.out.saveError = PlatformException(code: 'cancelled');
+    await _key(tester, 'share-file-save');
+    expect(find.text('已保存'), findsNothing);
+    expect(find.text('没能保存，请重试'), findsNothing);
+
+    panel.out.saveError = PlatformException(code: 'failed');
+    await _key(tester, 'share-file-save');
+    expect(find.text('没能保存，请重试'), findsOneWidget);
+  });
 
   testWidgets('文件: a DSH Go file, a web page, Markdown; 预览 opens the replay', (tester) async {
     final panel = await _open(tester, state: _fixture(), reply: 'a6', scope: ShareScope.whole);
@@ -547,9 +748,7 @@ void main() {
     expect(tester.widget<ReplayPage>(find.byType(ReplayPage)).preview, isTrue);
   });
 
-  testWidgets('over the limit: the file and the link say so and nothing goes out; Markdown still does', (
-    tester,
-  ) async {
+  testWidgets('over the limit: the file and the link say so and nothing goes out; Markdown still does', (tester) async {
     final random = Random(7);
     const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
     final noise = String.fromCharCodes(List.generate(5200000, (_) => alphabet.codeUnitAt(random.nextInt(64))));
@@ -606,6 +805,54 @@ void main() {
     expect(home.showMeta, isFalse);
   });
 
+  testWidgets('图片: exporting pins the resolved style and disables toggle semantics until cleanup', (tester) async {
+    final semantics = tester.ensureSemantics();
+    try {
+      final panel = await _open(tester);
+      await _key(tester, 'share-to-image');
+      final original = _card(tester);
+      final gate = Completer<void>();
+      panel.exporter.shareGate = gate;
+      await tester.tap(find.byKey(const ValueKey('share-send')));
+      try {
+        for (var i = 0; i < 80 && panel.exporter.shared.isEmpty; i++) {
+          await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 20)));
+          await tester.pump(const Duration(milliseconds: 16));
+        }
+        expect(panel.exporter.shared, hasLength(1));
+        final style = SharePanelScope.of(tester.element(find.byType(ShareImagePage))).style;
+        style
+          ..template = ShareTemplate.dark
+          ..showQuestion = false
+          ..showMeta = false;
+        await tester.pump();
+        final pinned = _card(tester);
+        expect(pinned.template, original.template);
+        expect(pinned.accent, original.accent);
+        expect(pinned.accent, isNotNull, reason: 'the ambient accent was resolved at export start');
+        expect(pinned.showQuestion, original.showQuestion);
+        expect(pinned.showMeta, original.showMeta);
+        expect(find.byType(ShareToggle), findsNWidgets(2));
+        for (final element in find.byType(ShareToggle).evaluate()) {
+          final toggle = element.widget as ShareToggle;
+          expect(toggle.onSelected, isNull);
+          final data = tester.getSemantics(find.byWidget(toggle)).getSemanticsData();
+          expect(data.flagsCollection.isEnabled, ui.Tristate.isFalse);
+          expect(data.hasAction(ui.SemanticsAction.tap), isFalse);
+        }
+      } finally {
+        gate.complete();
+        await _settle(tester);
+      }
+      expect(_card(tester).template, ShareTemplate.dark);
+      expect(_card(tester).showQuestion, isFalse);
+      expect(_card(tester).showMeta, isFalse);
+      expect(tester.widget<ShareToggle>(find.byType(ShareToggle).first).onSelected, isNotNull);
+    } finally {
+      semantics.dispose();
+    }
+  });
+
   testWidgets('图片: 分享 hands a 1170 px wide PNG over, 保存图片 confirms in place', (tester) async {
     final panel = await _open(tester);
     await _key(tester, 'share-to-image');
@@ -629,6 +876,22 @@ void main() {
     await tester.pump(const Duration(seconds: 3));
     await tester.pumpAndSettle();
     expect(find.text('保存图片'), findsOneWidget);
+  });
+
+  testWidgets('图片: backing out of the save window reads as neither saved nor failed', (tester) async {
+    final panel = await _open(tester, state: _fixture(), reply: 'a6', scope: ShareScope.whole);
+    await _key(tester, 'share-to-image');
+    panel.exporter.saveError = PlatformException(code: 'cancelled');
+    await tester.tap(find.byKey(const ValueKey('share-save')));
+    await _settle(tester);
+    expect(find.text('已保存'), findsNothing);
+    expect(find.text('没能保存，请重试'), findsNothing);
+    expect(find.text('保存图片'), findsOneWidget);
+
+    panel.exporter.saveError = PlatformException(code: 'failed');
+    await tester.tap(find.byKey(const ValueKey('share-save')));
+    await _settle(tester);
+    expect(find.text('没能保存，请重试'), findsOneWidget);
   });
 
   // ── Large text, narrow phones ─────────────────────────────────────────────
@@ -676,7 +939,8 @@ void main() {
     await _open(tester);
     final sheet = tester.getRect(find.byType(SharePanel));
     final keys = [
-      for (final k in ['share-to-link', 'share-to-image', 'share-to-file', 'share-to-text']) tester.getRect(find.byKey(ValueKey(k))),
+      for (final k in ['share-to-link', 'share-to-image', 'share-to-file', 'share-to-text'])
+        tester.getRect(find.byKey(ValueKey(k))),
     ];
     for (final cell in keys) {
       expect(cell.width, moreOrLessEquals(keys.first.width));
@@ -703,7 +967,9 @@ void main() {
     for (final label in ['思考过程', '工具调用', '图片']) {
       final capsule = tester.getRect(find.byKey(ValueKey('share-toggle-$label')));
       final check = tester.getRect(find.byKey(ValueKey('share-toggle-check-$label')));
-      final text = tester.getRect(find.descendant(of: find.byKey(ValueKey('share-privacy')), matching: find.text(label)));
+      final text = tester.getRect(
+        find.descendant(of: find.byKey(ValueKey('share-privacy')), matching: find.text(label)),
+      );
       expect(capsule.height, ShareToggle.height);
       expect(check.left - capsule.left, moreOrLessEquals(ShareToggle.padding));
       expect(capsule.right - text.right, moreOrLessEquals(ShareToggle.padding));
@@ -717,7 +983,9 @@ void main() {
     // Off: no check, the same air.
     await _tap(tester, find.byKey(const ValueKey('share-toggle-图片')));
     final capsule = tester.getRect(find.byKey(const ValueKey('share-toggle-图片')));
-    final text = tester.getRect(find.descendant(of: find.byKey(const ValueKey('share-privacy')), matching: find.text('图片')));
+    final text = tester.getRect(
+      find.descendant(of: find.byKey(const ValueKey('share-privacy')), matching: find.text('图片')),
+    );
     expect(text.left - capsule.left, moreOrLessEquals(ShareToggle.padding));
     expect(capsule.right - text.right, moreOrLessEquals(ShareToggle.padding));
   });
@@ -737,9 +1005,7 @@ void main() {
     expect(adjust.center.dy, moreOrLessEquals(after.center.dy, epsilon: 0.5));
   });
 
-  testWidgets('文件 and 链接 buttons: equal halves 12 apart on the 20 gutter; the make button full width', (
-    tester,
-  ) async {
+  testWidgets('文件 and 链接 buttons: equal halves 12 apart on the 20 gutter; the make button full width', (tester) async {
     await _open(tester, state: _fixture(), reply: 'a6');
     final sheet = tester.getRect(find.byType(SharePanel));
     await _key(tester, 'share-to-file');
@@ -782,4 +1048,256 @@ void main() {
     }
     expect(find.byType(SharePanelHome), findsOneWidget);
   });
+}
+
+ChatState _selectionFixture() {
+  final source = _fixture();
+  return ChatState(
+    items: [
+      for (final item in source.items)
+        if (item is UserChatItem)
+          UserChatItem(seq: item.seq, time: item.time, text: item.text, images: const [], files: item.files)
+        else
+          item,
+    ],
+    turns: source.turns,
+    commands: source.commands,
+    title: source.title,
+    loading: false,
+  );
+}
+
+Future<void> _selectionTap(WidgetTester tester, Finder finder) async {
+  await tester.ensureVisible(finder);
+  await tester.pumpAndSettle();
+  await tester.tap(finder);
+  await tester.pumpAndSettle();
+}
+
+void _selectionTests() {
+  for (final append in [false, true]) {
+    testWidgets(
+      '[share-new-selection] explicitly selected reply is exported after initial preparation: append=$append',
+      (tester) async {
+        final initial = _selectionFixture();
+        await _open(tester, state: initial, reply: null);
+        try {
+          final home = tester.element(find.byType(SharePanelHome));
+          final container = ProviderScope.containerOf(home, listen: false);
+          final controller = container.read(chatProvider('s1').notifier) as _Chat;
+          final model = SharePanelScope.of(home);
+          expect(model.scope, ShareScope.whole);
+          await _selectionTap(tester, find.byKey(const ValueKey('share-to-file')));
+          final first = await model.prepare();
+          expect(first.share.entries.whereType<ReplyEntry>().map((e) => e.text), contains(_reply(initial, 'a15').text));
+          await _selectionTap(tester, find.byTooltip('返回'));
+
+          final addedPrompt = UserChatItem(
+            seq: 19,
+            time: at(150100),
+            text: '请补充本轮验收结论',
+            images: const [],
+            files: const [],
+          );
+          final addedReply = AssistantChatItem(
+            id: 'a20',
+            seq: 20,
+            time: at(151000),
+            text: '新增验收结论：第三轮已完整核对。',
+            reasoning: '',
+            model: 'deepseek-v4-pro',
+          );
+          if (append) {
+            controller.emit(
+              ChatState(
+                items: [...initial.items, addedPrompt, addedReply],
+                turns: [
+                  ...initial.turns,
+                  TurnTrace(
+                    turn: 3,
+                    startSeq: 18,
+                    start: at(150000),
+                    endSeq: 21,
+                    end: at(151100),
+                    endReason: const TurnEndReason('completed'),
+                    spans: [_selectionModelSpan()],
+                  ),
+                ],
+                commands: initial.commands,
+                title: initial.title,
+                loading: false,
+              ),
+            );
+            await tester.pump();
+            expect(model.shareable.map((i) => i.key), contains(addedReply.key));
+            expect(model.card!.blocks.whereType<ShareAnswer>().map((b) => b.markdown), contains(addedReply.text));
+            expect(first.share.entries.whereType<ReplyEntry>().map((e) => e.text), isNot(contains(addedReply.text)));
+          }
+          final target = append ? addedReply : _reply(initial, 'a15');
+          final prompt = append ? addedPrompt : initial.items.whereType<UserChatItem>().last;
+          await _selectionTap(tester, find.text('选中消息'));
+          final picker = tester.widget<MessagePicker>(find.byType(MessagePicker));
+          expect(picker.items.map((i) => i.key), contains(target.key));
+          expect(picker.selected, {prompt.key, target.key});
+          final promptRow = find.byWidgetPredicate((w) => w is MessagePickRow && w.item.key == prompt.key);
+          await _selectionTap(tester, promptRow);
+          final targetRow = tester.widget<MessagePickRow>(
+            find.byWidgetPredicate((w) => w is MessagePickRow && w.item.key == target.key),
+          );
+          expect(targetRow.picked, isTrue);
+          await _selectionTap(tester, find.text('完成（1）'));
+          expect(model.keys, {target.key});
+          expect(model.scope, ShareScope.picked);
+          expect(model.card!.blocks.whereType<ShareAnswer>().map((b) => b.markdown), [target.text]);
+          await _selectionTap(tester, find.byKey(const ValueKey('share-to-file')));
+          final selected = await model.prepare();
+          final decoded = decodeConversationFile(selected.file.text);
+          expect(selected.share.entries.whereType<ReplyEntry>().map((e) => e.text), [target.text]);
+          expect(decoded.share.entries.whereType<ReplyEntry>().map((e) => e.text), [target.text]);
+          expect(tester.takeException(), isNull);
+        } finally {
+          await tester.pumpWidget(const SizedBox.shrink());
+          await tester.pump();
+        }
+      },
+    );
+  }
+}
+
+TraceSpan _selectionModelSpan() => TraceSpan(
+  kind: TraceKind.model,
+  step: 1,
+  seq: 20,
+  start: at(150200),
+  firstToken: at(150300),
+  lastToken: at(151000),
+  end: at(151000),
+);
+
+Future<void> _wholeScopeTap(WidgetTester tester, Finder finder) async {
+  await tester.ensureVisible(finder);
+  await tester.pumpAndSettle();
+  await tester.tap(finder);
+  await tester.pumpAndSettle();
+}
+
+void _wholeScopeAfterUpdateTests() {
+  for (final append in [false, true]) {
+    testWidgets('[share-whole-update] whole export uses current messages: append=$append', (tester) async {
+      final source = _fixture();
+      final initial = ChatState(
+        items: [
+          for (final item in source.items)
+            if (item is UserChatItem)
+              UserChatItem(seq: item.seq, time: item.time, text: item.text, images: const [], files: item.files)
+            else
+              item,
+        ],
+        turns: [...source.turns],
+        commands: [...source.commands],
+        title: source.title,
+        loading: false,
+      );
+      try {
+        final panel = await _open(tester, state: initial, reply: 'a15');
+        final panelState = tester.state(find.byType(SharePanel));
+        final home = tester.element(find.byType(SharePanelHome));
+        final container = ProviderScope.containerOf(home, listen: false);
+        final controller = container.read(chatProvider('s1').notifier) as _Chat;
+        final model = SharePanelScope.of(home);
+        expect(model.scope, ShareScope.reply);
+        expect(model.anchor?.id, 'a15');
+        await _wholeScopeTap(tester, find.byKey(const ValueKey('share-to-file')));
+        final first = await model.prepare();
+        expect(
+          first.share.entries.whereType<ReplyEntry>().where((entry) => entry.text == _reply(initial, 'a15').text),
+          hasLength(1),
+        );
+        await _wholeScopeTap(tester, find.byTooltip('返回'));
+        expect(tester.state(find.byType(SharePanel)), same(panelState));
+        expect(SharePanelScope.of(tester.element(find.byType(SharePanelHome))), same(model));
+
+        final addedPrompt = UserChatItem(
+          seq: 19,
+          time: at(150100),
+          text: '请补充本轮验收结论',
+          images: const [],
+          files: const [],
+        );
+        final addedReply = AssistantChatItem(
+          id: 'a20',
+          seq: 20,
+          time: at(151000),
+          text: '新增验收结论：第三轮已完整核对。',
+          reasoning: '',
+          model: 'deepseek-v4-pro',
+        );
+        if (append) {
+          final updated = ChatState(
+            items: [...initial.items, addedPrompt, addedReply],
+            turns: [
+              ...initial.turns,
+              TurnTrace(
+                turn: 3,
+                startSeq: 18,
+                start: at(150000),
+                endSeq: 21,
+                end: at(151100),
+                endReason: const TurnEndReason('completed'),
+                spans: [
+                  TraceSpan(
+                    kind: TraceKind.model,
+                    step: 1,
+                    seq: 20,
+                    start: at(150200),
+                    firstToken: at(150300),
+                    lastToken: at(151000),
+                    end: at(151000),
+                  ),
+                ],
+              ),
+            ],
+            commands: [...initial.commands],
+            title: initial.title,
+            loading: false,
+          );
+          controller.emit(updated);
+          await tester.pump();
+          expect(container.read(chatProvider('s1')), same(updated));
+          expect(model.shareable.map((item) => item.key), contains(addedReply.key));
+          expect(initial.items.map((item) => item.key), isNot(contains(addedReply.key)));
+        }
+        expect(first.share.entries.whereType<ReplyEntry>().map((e) => e.text), isNot(contains(addedReply.text)));
+        await _wholeScopeTap(tester, find.text('整段对话'));
+        expect(
+          tester.widget<SegmentedPill<ShareScope>>(find.byType(SegmentedPill<ShareScope>)).selected,
+          ShareScope.whole,
+        );
+        expect(model.scope, ShareScope.whole);
+        expect(find.byType(MessagePicker), findsNothing);
+        expect(tester.state(find.byType(SharePanel)), same(panelState));
+        expect(SharePanelScope.of(tester.element(find.byType(SharePanelHome))), same(model));
+        expect(model.keys, {for (final item in model.shareable) item.key});
+        await _wholeScopeTap(tester, find.byKey(const ValueKey('share-to-file')));
+        final whole = await model.prepare();
+        await tester.runAsync(() => model.saveFile());
+        expect(model.fileSaved, isTrue);
+        expect(panel.out.saved, hasLength(1));
+        final (saved, format) = panel.out.saved.single;
+        expect(format, ConversationFormat.file);
+        final text = (await tester.runAsync(saved.readAsString))!;
+        final decoded = _decode(text);
+        for (final share in [decoded, whole.share]) {
+          expect(share.range, isNull, reason: 'the whole conversation');
+          final replies = share.entries.whereType<ReplyEntry>();
+          expect(replies.where((entry) => entry.text == _reply(initial, 'a15').text), hasLength(1));
+          expect(replies.where((entry) => entry.text == addedReply.text), hasLength(append ? 1 : 0));
+        }
+        expect(tester.takeException(), isNull);
+      } finally {
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+      }
+    });
+  }
 }

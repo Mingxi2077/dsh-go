@@ -30,8 +30,8 @@ class DraftState {
   /// By [draftStorageKey], including the host and nullable session id.
   final Map<String, ChatDraft> drafts;
 
-  /// Read-only v1 texts, keyed by their original session id / `new`. Their host
-  /// is unknown: show only for manual recovery, never as a current draft fallback.
+  /// Unscoped records, keyed by their original session id / `new`. Their host is
+  /// unknown: show only for manual recovery, never as a current draft fallback.
   final Map<String, ChatDraft> legacyDrafts;
 
   /// The saved texts are in (they arrive a moment after launch).
@@ -42,9 +42,8 @@ class DraftState {
 /// save, clear and forget. The text of the latest 30 survives a restart;
 /// attachments only live as long as the app.
 ///
-/// Legacy `chat_drafts_v1` has no host ownership. It is preserved untouched and
-/// exposed separately for preview. Only [importLegacy] copies a confirmed text
-/// into an explicitly scoped draft; there is no automatic migration or fallback.
+/// Unscoped `chat_drafts_v1` and earlier `chat_drafts_v2` records remain
+/// available for manual recovery; they are never current-draft fallbacks.
 class DraftStore extends Notifier<DraftState> {
   static const preferenceKey = 'chat_drafts_v2';
   static const legacyPreferenceKey = 'chat_drafts_v1';
@@ -69,8 +68,15 @@ class DraftStore extends Notifier<DraftState> {
     try {
       final prefs = await SharedPreferences.getInstance();
       // Parse independently: corruption in either version cannot hide the other.
-      restored = _readSaved(prefs, preferenceKey);
+      final saved = _readSaved(prefs, preferenceKey);
+      restored = Map.fromEntries(saved.entries.where((entry) => _isScopedKey(entry.key)));
       legacy = _readSaved(prefs, legacyPreferenceKey);
+      for (final entry in saved.entries.where((entry) => !_isScopedKey(entry.key))) {
+        final previous = legacy[entry.key];
+        if (previous == null || previous.updatedAt.isBefore(entry.value.updatedAt)) {
+          legacy[entry.key] = entry.value;
+        }
+      }
     } catch (_) {
       // No preferences backend (tests) or an unreadable value: start empty.
     }
@@ -96,9 +102,12 @@ class DraftStore extends Notifier<DraftState> {
       for (final MapEntry(:key, :value) in decoded.entries) {
         if (key is! String || value is! Map || value['t'] is! String || value['at'] is! int) continue;
         try {
+          final text = _textWithoutPastedImageBytes(value['t'] as String);
+          final webQuotes = DraftWebQuote.readList(value['webQuotes']);
+          if (text.isEmpty && webQuotes.isEmpty) continue;
           restored[key] = ChatDraft(
-            text: value['t'] as String,
-            webQuotes: preference == preferenceKey ? DraftWebQuote.readList(value['webQuotes']) : const [],
+            text: text,
+            webQuotes: webQuotes,
             updatedAt: DateTime.fromMillisecondsSinceEpoch(value['at'] as int),
           );
         } on Object {
@@ -109,6 +118,15 @@ class DraftStore extends Notifier<DraftState> {
       // Keep the original preference intact even if it cannot be decoded.
     }
     return restored;
+  }
+
+  String _textWithoutPastedImageBytes(String text) {
+    final jpeg = text.indexOf('\ufffd\ufffd\ufffd\ufffd\x00\x10JFIF');
+    final png = text.indexOf('\ufffdPNG\r\n\x1a\n');
+    final starts = [jpeg, png].where((index) => index >= 0).toList();
+    if (starts.isEmpty) return text;
+    starts.sort();
+    return text.substring(0, starts.first).trimRight();
   }
 
   Map<String, ChatDraft> _latest(Map<String, ChatDraft> drafts) {
@@ -164,15 +182,39 @@ class DraftStore extends Notifier<DraftState> {
   /// attachments and schedules the usual v2 save without a host-switch await gap.
   ///
   /// False means not loaded, missing/empty or changed preview, invalid destination
-  /// or a deleted session. No writes happen on failure. v1 and [DraftState.legacyDrafts]
-  /// remain intact on success; another confirmed call deliberately appends again.
-  bool importLegacy({required String legacyKey, required String expectedText, required String targetKey}) {
+  /// or a deleted session. No writes happen on failure. Legacy records remain
+  /// intact on success; another confirmed call deliberately appends again.
+  bool importLegacy({
+    required String legacyKey,
+    required String expectedText,
+    required String targetKey,
+    List<DraftWebQuote> expectedWebQuotes = const [],
+  }) {
     if (!state.loaded || _forgotten.contains(targetKey) || !_isScopedKey(targetKey)) return false;
     final legacy = state.legacyDrafts[legacyKey];
-    if (legacy == null || legacy.text != expectedText || legacy.text.trim().isEmpty) return false;
+    if (legacy == null ||
+        legacy.text != expectedText ||
+        !listEquals(legacy.webQuotes, expectedWebQuotes) ||
+        (legacy.text.trim().isEmpty && legacy.webQuotes.isEmpty)) {
+      return false;
+    }
     final current = state.drafts[targetKey];
     final text = current?.text ?? '';
-    save(targetKey, text.isEmpty ? legacy.text : '$text\n\n${legacy.text}', current?.attachments ?? const []);
+    final quotes = <DraftWebQuote>[];
+    for (final quote in [...?current?.webQuotes, ...legacy.webQuotes]) {
+      if (quotes.length == DraftWebQuote.limit) break;
+      if (!quotes.any((existing) => existing.id == quote.id)) quotes.add(quote);
+    }
+    save(
+      targetKey,
+      text.isEmpty
+          ? legacy.text
+          : legacy.text.isEmpty
+          ? text
+          : '$text\n\n${legacy.text}',
+      current?.attachments ?? const [],
+      webQuotes: quotes,
+    );
     return true;
   }
 
@@ -213,8 +255,8 @@ class DraftStore extends Notifier<DraftState> {
     // Writing before the saved drafts are in would drop them.
     await _restored;
     if (!ref.mounted) return;
-    final json = jsonEncode({
-      for (final MapEntry(:key, :value) in state.drafts.entries)
+    String encode(Map<String, ChatDraft> drafts) => jsonEncode({
+      for (final MapEntry(:key, :value) in drafts.entries)
         if (value.text.isNotEmpty || value.webQuotes.isNotEmpty)
           key: {
             't': value.text,
@@ -222,12 +264,15 @@ class DraftStore extends Notifier<DraftState> {
             if (value.webQuotes.isNotEmpty) 'webQuotes': value.webQuotes.map((q) => q.toJson()).toList(),
           },
     });
+    final json = encode(state.drafts);
+    final legacyJson = encode(state.legacyDrafts);
     // A slow older platform write must finish before a newer edit/deletion.
     // Catch inside the queue so one failed write cannot block future saves.
     _writes = _writes.then((_) async {
       try {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString(preferenceKey, json);
+        await prefs.setString(legacyPreferenceKey, legacyJson);
       } catch (_) {}
     });
     await _writes;

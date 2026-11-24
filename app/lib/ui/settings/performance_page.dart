@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../l10n/l10n.dart';
 import '../../performance/performance_state.dart';
+import '../../state/android_features.dart';
 import '../shell/page_frame.dart';
 import '../theme/app_icons.dart';
 import 'settings_widgets.dart';
@@ -40,6 +41,7 @@ class PerformancePage extends ConsumerWidget {
     final defaults = ref.watch(performanceDefaultsProvider);
     final thermal = ref.watch(performanceProvider.select((s) => s.thermalLightweight));
     final notifier = ref.read(performancePrefsProvider.notifier);
+    final ohos = ref.watch(operatingSystemProvider) == 'ohos';
     return AppPage.list(
       title: l10n.performanceTitle,
       children: [
@@ -67,22 +69,36 @@ class PerformancePage extends ConsumerWidget {
               ),
           ],
         ),
-        SettingsSection(
-          footer: Text(l10n.performanceRefreshHint),
-          children: [
-            SettingsSegmentTile<RefreshRateMode>(
-              key: const ValueKey('performance-refresh-rate'),
-              spot: Spots.refreshRate,
-              segments: [
-                PillSegment(RefreshRateMode.auto, l10n.performanceAuto),
-                PillSegment(RefreshRateMode.max, l10n.performanceRefreshMax),
-                PillSegment(RefreshRateMode.system, l10n.performanceRefreshSystem),
-              ],
-              selected: prefs.refreshRate,
-              onChanged: (mode) => unawaited(notifier.setRefreshRate(mode)),
-            ),
-          ],
-        ),
+        // iOS paces frames itself (RefreshRateService leaves it alone).
+        if (ref.watch(operatingSystemProvider) != 'ios')
+          SettingsSection(
+            footer: Text(ohos ? l10n.performanceRefreshHintOhos : l10n.performanceRefreshHint),
+            children: [
+              SettingsSegmentTile<RefreshRateMode>(
+                key: const ValueKey('performance-refresh-rate'),
+                spot: Spots.refreshRate,
+                segments: [
+                  PillSegment(RefreshRateMode.auto, l10n.performanceAuto),
+                  PillSegment(RefreshRateMode.max, l10n.performanceRefreshMax),
+                  PillSegment(RefreshRateMode.system, l10n.performanceRefreshSystem),
+                ],
+                selected: prefs.refreshRate,
+                onChanged: (mode) => unawaited(notifier.setRefreshRate(mode)),
+              ),
+            ],
+          ),
+        if (ohos)
+          SettingsSection(
+            children: [
+              SettingsSwitchTile(
+                key: const ValueKey('performance-frame-cache'),
+                title: l10n.performanceFrameCache,
+                subtitle: l10n.performanceFrameCacheHint,
+                value: prefs.frameCache,
+                onChanged: (value) => unawaited(notifier.setFrameCache(value)),
+              ),
+            ],
+          ),
         SettingsSection(
           title: l10n.performanceEffects,
           children: [
@@ -99,7 +115,16 @@ class PerformancePage extends ConsumerWidget {
               value: !defaults.reduceMotion,
               onChanged: (value) => unawaited(notifier.setAnimations(value)),
             ),
-            if (prefs.blur != null || prefs.animations != null)
+            // A finer choice inside animations: with them off there is nothing to choose.
+            if (!defaults.reduceMotion && !MediaQuery.disableAnimationsOf(context))
+              SettingsSwitchTile(
+                key: const ValueKey('performance-fluid'),
+                spot: Spots.fluidMotion,
+                subtitle: l10n.performanceFluidHint,
+                value: defaults.fluidMotion,
+                onChanged: (value) => unawaited(notifier.setFluid(value)),
+              ),
+            if (prefs.blur != null || prefs.animations != null || prefs.fluid != null)
               SettingsTile(
                 key: const ValueKey('performance-reset-effects'),
                 title: l10n.performanceFollowMode,

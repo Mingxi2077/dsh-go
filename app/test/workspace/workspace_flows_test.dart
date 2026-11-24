@@ -5,6 +5,8 @@
 
 import 'dart:ui' show Tristate;
 
+import 'package:dsh_app/state/connection_state.dart';
+import 'package:dsh_app/state/hosts_state.dart';
 import 'package:dsh_app/state/sessions_state.dart';
 import 'package:dsh_app/state/workspaces_state.dart';
 import 'package:dsh_app/ui/common/breadcrumb_row.dart';
@@ -13,6 +15,7 @@ import 'package:dsh_app/ui/shell/sessions_drawer.dart';
 import 'package:dsh_app/ui/workspace/directory_picker.dart';
 import 'package:dsh_app/ui/workspace/workspace_switcher.dart';
 import 'package:dsh_app/ui/workspace/workspaces_page.dart';
+import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/misc.dart' show Override;
@@ -33,6 +36,24 @@ Future<ProviderContainer> _pump(WidgetTester tester, Widget home, List<Override>
   await tester.pumpWidget(goldenApp(home: home, brightness: Brightness.light, overrides: overrides));
   await _settle(tester);
   return ProviderScope.containerOf(tester.element(find.byType(home.runtimeType).first));
+}
+
+/// A registry whose first baseline arrives only when the test says so.
+class _LateWorkspaces extends WorkspacesController {
+  @override
+  WorkspacesState build() => const WorkspacesState(status: WorkspacesStatus.loading);
+
+  void arrive(FakeWorkspaceHost host) => state = WorkspacesState(
+    status: WorkspacesStatus.ready,
+    workspaces: host.workspaces.map(Workspace.fromJson).toList(),
+  );
+}
+
+class _RemoteHost extends ActiveHostController {
+  _RemoteHost(this.id);
+  final String id;
+  @override
+  HostRef build() => HostRef.ssh(id);
 }
 
 /// The real phone-side view (shared preferences), starting empty.
@@ -115,7 +136,7 @@ void main() {
         sessionsProvider.overrideWith(() => FakeSessions(sampleSessions())),
       ]);
       expect(find.text('全部对话'), findsNothing);
-      expect(tester.getSize(find.byType(WorkspaceSwitcher)).height, 0);
+      expect(find.byType(WorkspaceSwitcher), findsNothing);
     });
   });
 
@@ -194,7 +215,7 @@ void main() {
       await tester.enterText(find.byType(TextField), 'sdcard');
       await tester.tap(find.text('前往'));
       await tester.pump();
-      expect(find.text('从「/」开始写完整路径'), findsOneWidget);
+      expect(find.text('写完整路径，如 /root/workspace 或 C:/Users/me'), findsOneWidget);
       await tester.enterText(find.byType(TextField), '/sdcard/Documents/');
       await tester.tap(find.text('前往'));
       await _settle(tester);
@@ -203,6 +224,28 @@ void main() {
       expect(find.widgetWithText(BreadcrumbCapsule, '手机存储'), findsOneWidget);
       expect(find.text('blog'), findsOneWidget);
     });
+
+    // A Windows host (#1309): its drive paths go as typed, the root keeps its slash.
+    for (final path in ['C:/Users/me/project', 'C:/']) {
+      testWidgets('a Windows host path goes to the host as typed: $path', (tester) async {
+        final host = sampleWorkspaceHost();
+        await _pump(
+          tester,
+          Builder(
+            builder: (context) => TextButton(onPressed: () => showDirectoryPicker(context), child: const Text('open')),
+          ),
+          _live(host),
+        );
+        await tester.tap(find.text('open'));
+        await _settle(tester);
+        await tester.tap(find.text('输入路径'));
+        await _settle(tester);
+        await tester.enterText(find.byType(TextField), path);
+        await tester.tap(find.text('前往'));
+        await _settle(tester);
+        expect(host.argsOf('directoryPicker/list').last, {'path': path});
+      });
+    }
   });
 
   group('管理工作区', () {
@@ -313,6 +356,99 @@ void main() {
       await _pump(tester, const DirectoryBrowserPage(), workspaceOverrides(native));
       expect(find.text('这台主机不能在这里浏览文件夹'), findsOneWidget);
       expect(find.text('重试'), findsNothing);
+    });
+  });
+
+  group('a new conversation with no workspace selected', () {
+    Future<ProviderContainer> pumpOn(
+      WidgetTester tester,
+      FakeWorkspaceHost host,
+      HostConnection connection, [
+      List<Override> more = const [],
+    ]) async {
+      final container = await _pump(
+        tester,
+        HomeShell(chatBuilder: (_) => const SizedBox.expand(), initiallyOpen: true),
+        [
+          ...workspaceOverrides(host, livePrefs: true, connection: connection),
+          if (!connection.isLocal) activeHostProvider.overrideWith(() => _RemoteHost(connection.hostId!)),
+          ...more,
+        ],
+      );
+      await container.read(sessionsProvider.future);
+      await _settle(tester);
+      return container;
+    }
+
+    testWidgets('a remote host without a directory uses the workspace used last', (tester) async {
+      final host = sampleWorkspaceHost();
+      final container = await pumpOn(tester, host, workspaceHost(host, local: false));
+      expect(container.read(newChatInHostDefaultProvider), isFalse);
+
+      await container.read(sessionsProvider.notifier).create();
+      expect(host.argsOf('session/create').last, {
+        'request': {'workspaceId': 'ws-3'},
+      });
+    });
+
+    testWidgets('a send that beats the lists waits for them', (tester) async {
+      final host = sampleWorkspaceHost();
+      final late = _LateWorkspaces();
+      final container = await pumpOn(tester, host, workspaceHost(host, local: false), [
+        workspacesProvider.overrideWith(() => late),
+      ]);
+
+      final created = container.read(sessionsProvider.notifier).create();
+      await _settle(tester);
+      expect(host.argsOf('session/create'), isEmpty);
+
+      late.arrive(host);
+      await _settle(tester);
+      await created;
+      expect(host.argsOf('session/create').last, {
+        'request': {'workspaceId': 'ws-3'},
+      });
+    });
+
+    testWidgets('lists that never arrive still let the conversation start', (tester) async {
+      final host = sampleWorkspaceHost();
+      final container = await pumpOn(tester, host, workspaceHost(host, local: false), [
+        workspacesProvider.overrideWith(_LateWorkspaces.new),
+      ]);
+
+      final created = container.read(sessionsProvider.notifier).create();
+      await tester.pump(const Duration(seconds: 3));
+      await _settle(tester);
+      await created;
+      expect(host.argsOf('session/create').last, {'request': <String, Object?>{}});
+    });
+
+    testWidgets('a remote host with its own directory keeps it', (tester) async {
+      final host = sampleWorkspaceHost();
+      final container = await pumpOn(tester, host, workspaceHost(host, local: false, workingDirectory: '/srv/work'));
+      expect(container.read(recentWorkspaceForNewChatProvider), isNull);
+
+      await container.read(sessionsProvider.notifier).create();
+      expect(host.argsOf('session/create').last, {
+        'request': {'cwd': '/srv/work'},
+      });
+    });
+
+    testWidgets('this phone keeps its own default directory', (tester) async {
+      final host = sampleWorkspaceHost();
+      final container = await pumpOn(tester, host, workspaceHost(host));
+      expect(container.read(recentWorkspaceForNewChatProvider), isNull);
+      expect(container.read(newChatInHostDefaultProvider), isFalse);
+    });
+
+    testWidgets('a remote host with no workspace at all runs it in the host default, and says so', (tester) async {
+      final host = FakeWorkspaceHost();
+      final container = await pumpOn(tester, host, workspaceHost(host, local: false));
+      expect(container.read(recentWorkspaceForNewChatProvider), isNull);
+      expect(container.read(newChatInHostDefaultProvider), isTrue);
+
+      await container.read(sessionsProvider.notifier).create();
+      expect(host.argsOf('session/create').last, {'request': <String, Object?>{}});
     });
   });
 

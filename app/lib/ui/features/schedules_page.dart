@@ -12,10 +12,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../l10n/l10n.dart';
+import '../../state/android_features.dart';
 import '../../state/connection_state.dart';
 import '../../state/features_state.dart';
+import '../../state/hosts_state.dart';
 import '../../state/schedule_editor_state.dart';
 import '../../state/sessions_state.dart';
+import '../common/app_dialog.dart';
 import '../common/feature_tile.dart';
 import '../common/list_page_row.dart';
 import '../common/page_hero.dart';
@@ -140,6 +143,12 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
         ),
       ],
       children: [
+        // The on-device engine is suspended with the app: a remote host's tasks don't care.
+        if (!ref.watch(androidSystemFeaturesProvider) && ref.watch(activeHostProvider).isLocal)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+            child: Text(l10n.harmonySchedulesLocal, style: Theme.of(context).textTheme.bodySmall),
+          ),
         if (list != null && list.isNotEmpty) ...[
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
@@ -272,7 +281,7 @@ class _ScheduleDetailPageState extends ConsumerState<ScheduleDetailPage> {
   }
 
   Future<void> _delete() async {
-    final ok = await showDialog<bool>(
+    final ok = await showAppDialog<bool>(
       context: context,
       builder: (dialog) => AlertDialog(
         title: Text(context.l10n.featuresScheduleDeleteTitle),

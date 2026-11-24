@@ -3,7 +3,6 @@ import 'dart:typed_data';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../state/hosts_state.dart';
-import 'browser_policy.dart';
 import 'browser_workspace.dart';
 
 /// A way back to the quoted page in its original host/conversation. In memory
@@ -47,12 +46,29 @@ class BrowserReturnController extends Notifier<BrowserReturnState> {
     ref.listen(browserWorkspaceProvider, (_, next) {
       if (!next.loaded || state.items.isEmpty) return;
       final keep = <String, BrowserReturnItem>{};
-      for (final entry in state.items.entries) {
-        if (next.tabs.any((tab) => tab.id == entry.value.tabId && tab.scope == entry.value.scope)) {
-          keep[entry.key] = entry.value;
+      var changed = false;
+      for (final item in state.items.values) {
+        final tab = next.tabs.where((tab) => tab.id == item.tabId).firstOrNull;
+        if (tab == null || tab.scope.hostKey != item.scope.hostKey) {
+          changed = true;
+          continue;
+        }
+        if (tab.scope == item.scope) {
+          keep[item.tabId] = item;
+        } else {
+          // The same tab now belongs to the session created from its draft.
+          changed = true;
+          keep[item.tabId] = BrowserReturnItem(
+            host: item.host,
+            scope: tab.scope,
+            tabId: item.tabId,
+            url: item.url,
+            title: item.title,
+            preview: item.preview,
+          );
         }
       }
-      if (keep.length != state.items.length) state = BrowserReturnState(Map.unmodifiable(keep));
+      if (changed) state = BrowserReturnState(Map.unmodifiable(keep));
     });
     return const BrowserReturnState();
   }
@@ -68,8 +84,7 @@ class BrowserReturnController extends Notifier<BrowserReturnState> {
     final scope = BrowserScope(hostKey: '${host.kind.name}:${host.id}', sessionId: sessionId);
     final workspace = ref.read(browserWorkspaceProvider);
     if (!workspace.loaded ||
-        !BrowserPolicy.allows(url) ||
-        !workspace.tabs.any((tab) => tab.id == tabId && tab.scope == scope && tab.url == url)) {
+        !workspace.tabs.any((tab) => tab.id == tabId && tab.scope == scope && tab.url == url && tab.allows(url))) {
       return false;
     }
     // Check the PNG signature, and bound the aggregate retained bytes to 4MiB.

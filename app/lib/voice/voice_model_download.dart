@@ -25,7 +25,8 @@ class VoiceDownloadException implements Exception {
   final String? file;
 
   @override
-  String toString() => 'VoiceDownloadException(${kind.name}${status == null ? '' : ' $status'}${file == null ? '' : ' $file'})';
+  String toString() =>
+      'VoiceDownloadException(${kind.name}${status == null ? '' : ' $status'}${file == null ? '' : ' $file'})';
 }
 
 /// One file: where it goes, what it must be, where to get it (tried in order).
@@ -161,22 +162,18 @@ Future<void> _fetch(
         throw VoiceDownloadException(VoiceDownloadError.http, status: response.statusCode, file: name);
       }
       var received = offset;
-      var unflushed = 0;
       report(received, force: true);
-      await for (final chunk in response.timeout(stall)) {
-        if (stop()) throw VoiceDownloadException(VoiceDownloadError.cancelled, file: name);
-        received += chunk.length;
-        if (received > job.bytes) throw VoiceDownloadException(VoiceDownloadError.integrity, file: name);
-        sink.add(chunk);
-        hasher.add(chunk);
-        unflushed += chunk.length;
-        if (unflushed >= 4 << 20) {
-          await sink.flush();
-          unflushed = 0;
-        }
-        report(received);
-      }
-      await sink.flush();
+      // Await the file consumer so an asynchronous write failure reaches this catch.
+      await sink.addStream(
+        response.timeout(stall).map((chunk) {
+          if (stop()) throw VoiceDownloadException(VoiceDownloadError.cancelled, file: name);
+          received += chunk.length;
+          if (received > job.bytes) throw VoiceDownloadException(VoiceDownloadError.integrity, file: name);
+          hasher.add(chunk);
+          report(received);
+          return chunk;
+        }),
+      );
       await sink.close();
       sink = null;
     }
@@ -199,7 +196,10 @@ Future<void> _fetch(
   } on FileSystemException catch (e) {
     // ENOSPC (28) and EDQUOT (122): out of room.
     final code = e.osError?.errorCode;
-    throw VoiceDownloadException(code == 28 || code == 122 ? VoiceDownloadError.storage : VoiceDownloadError.unknown, file: name);
+    throw VoiceDownloadException(
+      code == 28 || code == 122 ? VoiceDownloadError.storage : VoiceDownloadError.unknown,
+      file: name,
+    );
   } on SocketException {
     throw VoiceDownloadException(VoiceDownloadError.network, file: name);
   } on HttpException {
@@ -246,7 +246,10 @@ class VoiceDownloadTask {
         if (message[0] == 'ok') {
           if (!done.isCompleted) done.complete();
         } else if (!done.isCompleted) {
-          final kind = VoiceDownloadError.values.firstWhere((k) => k.name == message[1], orElse: () => VoiceDownloadError.unknown);
+          final kind = VoiceDownloadError.values.firstWhere(
+            (k) => k.name == message[1],
+            orElse: () => VoiceDownloadError.unknown,
+          );
           done.completeError(VoiceDownloadException(kind, status: message[2] as int?, file: message[3] as String?));
         }
         port.close();

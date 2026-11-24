@@ -12,21 +12,24 @@
 //   ━━━━━━━━━●──────────────────────────────       │ only while the custom one is in use
 //   提亮 (light) / 压暗 (dark)              20%     │
 //   ━━━━━━●─────────────────────────────────       │
+//   自动保证文字清晰                          ◉     │
+//   播放动图 (an animated picture only)       ◉     │
 //   更换图片                                 ›     ┘
 //   预览                                     ›
 //
 // The custom phone shows the real bake (small), redone as a slider moves; the backdrop behind
-// the app is baked again once the slider is let go.
+// the app is baked again once the slider is let go. An animated picture's phone stays on its
+// first frame.
 
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../l10n/l10n.dart';
+import '../../../performance/performance_state.dart';
 import '../../../state/wallpaper_state.dart';
 import '../../../wallpaper/custom_wallpaper.dart';
 import '../../../wallpaper/wallpaper_look.dart';
@@ -85,10 +88,16 @@ class _WallpaperSectionState extends ConsumerState<WallpaperSection> {
     unawaited(_bake(key));
   }
 
+  /// [frame] with the performance profile in it, as the backdrop's own bake has it.
+  WallpaperFrame _onDevice(WallpaperFrame frame) =>
+      frame.copyWith(lightweight: ref.read(performanceDefaultsProvider).lightweight);
+
   Future<void> _bake((CustomWallpaper, WallpaperFrame) key) async {
     _baking = true;
     final density = _density(context);
-    final image = await ref.read(wallpaperRendererProvider).bake(key.$1, key.$2, density: density);
+    final image = await ref
+        .read(wallpaperRendererProvider)
+        .bake(key.$1, key.$2, density: density, moving: _onDevice(key.$2).plays(key.$1));
     _baking = false;
     if (!mounted) {
       image?.dispose();
@@ -138,6 +147,8 @@ class _WallpaperSectionState extends ConsumerState<WallpaperSection> {
     final brightness = Theme.of(context).brightness;
     final frame = WallpaperBackdrop.frameOf(context);
     if (wallpaper != null) _want(wallpaper, frame);
+    final lightweight = ref.watch(performanceDefaultsProvider.select((p) => p.lightweight));
+    final onDevice = frame.copyWith(lightweight: lightweight);
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -182,6 +193,24 @@ class _WallpaperSectionState extends ConsumerState<WallpaperSection> {
                   unawaited(notifier.setTone(brightness, v));
                 },
               ),
+              SettingsSwitchTile(
+                key: const ValueKey('wallpaper-guard'),
+                title: l10n.wallpaperGuard,
+                // A playing picture gets no veil, only its text colours; unguarded, not those either.
+                subtitle: stored != null && stored.guard && onDevice.plays(stored)
+                    ? l10n.wallpaperGuardMotionHint
+                    : l10n.wallpaperGuardHint,
+                value: stored?.guard ?? true,
+                onChanged: (v) => unawaited(notifier.setGuard(v)),
+              ),
+              if (stored != null && onDevice.playable(stored))
+                SettingsSwitchTile(
+                  key: const ValueKey('wallpaper-play'),
+                  title: l10n.wallpaperPlay,
+                  subtitle: l10n.wallpaperPlayHint,
+                  value: stored.play,
+                  onChanged: (v) => unawaited(notifier.setPlay(v)),
+                ),
               SettingsTile(
                 key: const ValueKey('wallpaper-replace'),
                 title: l10n.wallpaperReplace,
@@ -200,76 +229,8 @@ class _WallpaperSectionState extends ConsumerState<WallpaperSection> {
   }
 }
 
-/// A title with its percent, the slider under it (16 from the card on both sides). Neutral, like
-/// every slider in settings: the page's accent stays with the switches.
-class WallpaperSliderRow extends StatelessWidget {
-  const WallpaperSliderRow({
-    super.key,
-    required this.title,
-    required this.value,
-    required this.onChanged,
-    required this.onChangeEnd,
-  });
-
-  final String title;
-
-  /// 0–1.
-  final double value;
-  final ValueChanged<double> onChanged;
-  final ValueChanged<double> onChangeEnd;
-
-  /// Values land on 5% steps (no tick marks on the track: it stays one quiet line).
-  static const steps = 20;
-
-  static double snap(double v) => (v * steps).round() / steps;
-
-  static String label(double v) => '${(v * 100).round()}%';
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    final v = value.clamp(0.0, 1.0);
-    return MergeSemantics(
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(SettingsMetrics.inset, 14, SettingsMetrics.inset, 14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ExcludeSemantics(
-              child: Row(
-                children: [
-                  Expanded(child: Text(title, style: settingsTitleStyle(context))),
-                  const SizedBox(width: 12),
-                  Text(label(v), style: theme.textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant)),
-                ],
-              ),
-            ),
-            const SizedBox(height: 10),
-            Semantics(
-              label: title,
-              child: Slider(
-                value: v,
-                padding: EdgeInsets.zero,
-                activeColor: scheme.onSurfaceVariant,
-                inactiveColor: scheme.onSurface.withValues(alpha: 0.1),
-                semanticFormatterCallback: (v) => label(snap(v)),
-                onChanged: (raw) {
-                  final next = snap(raw);
-                  if (next == snap(v)) return;
-                  HapticFeedback.selectionClick();
-                  onChanged(next);
-                },
-                onChangeEnd: (raw) => onChangeEnd(snap(raw)),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
+/// The blur / tone rows: [SettingsSliderTile] with its defaults (5% steps, read as a percent).
+typedef WallpaperSliderRow = SettingsSliderTile;
 
 /// 默认 and 自定义 as two small phones, centred as a pair: the launch screen card's geometry
 /// ([LaunchScreenPicker]'s ring, radius and shape).
@@ -477,7 +438,7 @@ class _Screen extends StatelessWidget {
 }
 
 /// No picture yet: a quiet phone with the add mark. A picture: its small bake under the sketch,
-/// the guarded colours on it, as the chat will show it.
+/// the guarded colours on it (when it is guarded), as the chat will show it.
 class _CustomMini extends StatelessWidget {
   const _CustomMini({required this.custom, required this.thumb, required this.broken, required this.busy});
 
@@ -520,7 +481,7 @@ class _CustomMini extends StatelessWidget {
       final theme = Theme.of(context);
       body = _Screen(
         child: Theme(
-          data: WallpaperLook.of(context).guardTheme(theme),
+          data: custom.guard ? WallpaperLook.of(context).guardTheme(theme) : theme,
           child: Stack(
             fit: StackFit.expand,
             children: [

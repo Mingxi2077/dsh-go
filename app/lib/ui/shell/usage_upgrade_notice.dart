@@ -1,8 +1,9 @@
 // An install from before anonymous usage statistics never saw the welcome
 // page's switch. The first time it reaches the home (not during first run,
 // on this phone or a remote host), a toast tells it, once: 了解 opens
-// 设置 › 隐私与分享 at the switch, 关闭 turns the statistics off. Having shown
-// it counts as told (lib/usage/usage_stats.dart): counting starts then.
+// 设置 › 隐私与分享 at the switch, 关闭 turns the full statistics off. Counting
+// is on by default: showing it only records that the person was told
+// (lib/usage/usage_stats.dart).
 
 import 'dart:async';
 
@@ -10,6 +11,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../l10n/l10n.dart';
+import '../../state/android_features.dart';
 import '../../state/notify_state.dart' show launchNoticeShownProvider;
 import '../../usage/usage_net.dart' show UsageBuild;
 import '../../usage/usage_stats.dart';
@@ -29,7 +31,12 @@ const _keyPad = 8.0;
 ///   │                     了解    关闭  │
 ///   ╰──────────────────────────────────╯
 /// ```
-SnackBar usageNoticeBar(BuildContext context, {required VoidCallback onLearn, required VoidCallback onOff}) {
+SnackBar usageNoticeBar(
+  BuildContext context, {
+  required VoidCallback onLearn,
+  required VoidCallback onOff,
+  bool v4 = false,
+}) {
   final l10n = context.l10n;
   final scheme = Theme.of(context).colorScheme;
   final style = TextButton.styleFrom(
@@ -50,7 +57,7 @@ SnackBar usageNoticeBar(BuildContext context, {required VoidCallback onLearn, re
       children: [
         Padding(
           padding: const EdgeInsetsDirectional.only(end: _keyPad),
-          child: Text(l10n.usageUpgradeNotice, key: const ValueKey('usage-upgrade-text')),
+          child: Text(v4 ? l10n.usageV4Notice : l10n.usageUpgradeNotice, key: const ValueKey('usage-upgrade-text')),
         ),
         const SizedBox(height: 2),
         Row(
@@ -95,8 +102,8 @@ class _UsageUpgradeNoticeState extends ConsumerState<UsageUpgradeNotice> {
   @override
   void initState() {
     super.initState();
-    // Builds that count nothing have nothing to tell.
-    if (!UsageBuild.active) return;
+    // Builds that count nothing have nothing to tell, nor has one that sends nothing.
+    if (!UsageBuild.active || ref.read(operatingSystemProvider) == 'ohos') return;
     ref.listenManual(usageStatsProvider, (_, s) => _schedule(s), fireImmediately: true);
   }
 
@@ -106,7 +113,8 @@ class _UsageUpgradeNoticeState extends ConsumerState<UsageUpgradeNotice> {
     super.dispose();
   }
 
-  bool _owed(UsageStatsState s) => s.loaded && s.enabled && !s.noticed;
+  bool _owed(UsageStatsState s) =>
+      s.loaded && s.enabled && (!s.noticed || (ref.read(operatingSystemProvider) == 'android' && !s.v4Noticed));
 
   void _schedule(UsageStatsState s) {
     if (_shown || _timer != null || !_owed(s)) return;
@@ -128,10 +136,10 @@ class _UsageUpgradeNoticeState extends ConsumerState<UsageUpgradeNotice> {
     _shown = true;
     ref.read(launchNoticeShownProvider.notifier).set(true);
     final usage = ref.read(usageStatsProvider.notifier);
-    unawaited(usage.markNoticed());
     messenger.showSnackBar(
       usageNoticeBar(
         context,
+        v4: ref.read(operatingSystemProvider) == 'android',
         onLearn: () {
           messenger.hideCurrentSnackBar();
           if (mounted) unawaited(openSpot(context, Spots.usageStats));
@@ -142,6 +150,7 @@ class _UsageUpgradeNoticeState extends ConsumerState<UsageUpgradeNotice> {
         },
       ),
     );
+    unawaited(usage.markNoticed());
   }
 
   @override

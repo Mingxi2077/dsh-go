@@ -18,7 +18,9 @@ import 'package:dsh_app/ui/engine_settings/subagent_settings_page.dart';
 import 'package:dsh_app/ui/engine_settings/web_search_page.dart';
 import 'package:dsh_app/ui/features/permission_page.dart';
 import 'package:dsh_app/ui/pets/pet_settings_page.dart';
+import 'package:dsh_app/ui/common/list_page_row.dart';
 import 'package:dsh_app/ui/phone/phone_control_screen.dart';
+import 'package:dsh_app/ui/phone/phone_widgets.dart';
 import 'package:dsh_app/ui/providers/providers_page.dart';
 import 'package:dsh_app/ui/remote/remote_screen.dart';
 import 'package:dsh_app/ui/settings/appearance/appearance_page.dart';
@@ -30,6 +32,7 @@ import 'package:dsh_app/ui/settings/performance_page.dart';
 import 'package:dsh_app/ui/settings/personalization_page.dart';
 import 'package:dsh_app/ui/settings/privacy_page.dart';
 import 'package:dsh_app/ui/settings/settings_screen.dart';
+import 'package:dsh_app/state/app_info.dart';
 import 'package:dsh_app/ui/settings/index/spots.dart';
 import 'package:dsh_app/ui/settings/settings_widgets.dart';
 import 'package:dsh_client/dsh_client.dart';
@@ -49,6 +52,8 @@ import '../../shell/golden_harness.dart';
 /// Rows that carry no spot on purpose, by page: a choice in a list (the
 /// list's spot covers it) or a row that only shows for a moment.
 final Map<SettingsPageId, List<String Function(L10n)>> _unlisted = {
+  // The author's profiles are links, not settings to look up.
+  SettingsPageId.about: [(_) => AppInfo.author, (l) => l.hubAboutBilibili, (l) => l.hubAboutX, (l) => l.hubAboutGithub],
   SettingsPageId.performance: [
     (l) => l.performanceAuto,
     (l) => l.performanceFull,
@@ -75,6 +80,7 @@ const _sections = {
   'permission-current',
   'permission-default',
   'ui-mode',
+  'quick-panel',
   'table-tint',
   'web-app',
 };
@@ -98,7 +104,24 @@ Future<void> _check(
     AppLocale.use(locale);
     await tester.pumpWidget(const SizedBox());
     await pump();
+    await _expandFolds(tester);
     _verify(tester, page, appL10n, absent: absent);
+  }
+}
+
+/// Folded rows are still real entries; open them before asserting reachability.
+Future<void> _expandFolds(WidgetTester tester) async {
+  for (var i = 0; i < find.byType(PhoneOptionsFold, skipOffstage: false).evaluate().length; i++) {
+    final header = find
+        .descendant(
+          of: find.byType(PhoneOptionsFold, skipOffstage: false).at(i),
+          matching: find.byType(ListPageRow, skipOffstage: false),
+        )
+        .first;
+    await tester.ensureVisible(header);
+    await tester.pumpAndSettle();
+    await tester.tap(header, warnIfMissed: false);
+    await tester.pumpAndSettle();
   }
 }
 
@@ -195,6 +218,8 @@ void main() {
           ),
         ],
       ),
+      // HarmonyOS's own pages: 系统操作 stands in for 手机操控, Linux 环境 is extra.
+      absent: {'page:systemActions', 'page:linuxEnvironment'},
     );
   });
 
@@ -222,12 +247,18 @@ void main() {
       SettingsPageId.pets,
       () => _app(tester, const PetSettingsPage(), _running()),
       // Once 「App 外显示」 is on.
-      absent: {'pet-display-when'},
+      absent: {'pet-display-when', 'pet-overlay-shows', 'pet-overlay-framing'},
     );
   });
 
   testWidgets('性能', (tester) async {
-    await _check(tester, SettingsPageId.performance, () => _app(tester, const PerformancePage(), _running()));
+    await _check(
+      tester,
+      SettingsPageId.performance,
+      () => _app(tester, const PerformancePage(), _running()),
+      // Only with animations on, which tests run without.
+      absent: {'fluid-motion'},
+    );
   });
 
   testWidgets('通知', (tester) async {
@@ -248,7 +279,7 @@ void main() {
 
   testWidgets('手机操控', (tester) async {
     await _check(tester, SettingsPageId.phone, () async {
-      await pumpPhone(tester, const PhoneControlScreen(), size: const Size(390, 3200));
+      await pumpPhone(tester, const PhoneControlScreen(), size: const Size(390, 4400));
     });
   });
 

@@ -5,10 +5,13 @@ import 'dart:async';
 import 'package:dsh_app/state/connection_state.dart';
 import 'package:dsh_app/state/drawer_view_state.dart';
 import 'package:dsh_app/state/hosts_state.dart';
+import 'package:dsh_app/state/image_snapshots.dart';
 import 'package:dsh_app/state/session_deletion_state.dart';
 import 'package:dsh_app/state/sessions_state.dart';
 import 'package:dsh_app/state/workspaces_state.dart';
+import 'package:dsh_app/ui/chat/composer.dart';
 import 'package:dsh_app/ui/shell/drawer/selection_bars.dart';
+import 'package:dsh_app/ui/shell/drawer/session_deletion.dart';
 import 'package:dsh_app/ui/shell/drawer/session_tile.dart';
 import 'package:dsh_app/ui/shell/home_shell.dart';
 import 'package:dsh_client/dsh_client.dart';
@@ -21,6 +24,11 @@ import '../drawer/support.dart';
 import '../shell/golden_harness.dart';
 import '../workspace/support.dart';
 import 'read_list_refresh_test.dart' show SwitchConnection, switchConnectionProvider;
+
+class _NoSnapshots extends ImageSnapshots {
+  @override
+  Future<void> removeSession(String host, String sessionId) async {}
+}
 
 class _DeletionBackend implements SessionDeletionBackend {
   final hosts = <DshClient, DrawerHost>{};
@@ -71,6 +79,7 @@ DrawerHost _host(String name) {
 Future<({DrawerHost host, HostConnection connection, ProviderContainer container, _DeletionBackend backend})> _start(
   WidgetTester tester, {
   _DeletionBackend? backend,
+  bool showChat = false,
 }) async {
   SharedPreferences.setMockInitialValues({});
   final host = _host('A');
@@ -82,12 +91,13 @@ Future<({DrawerHost host, HostConnection connection, ProviderContainer container
   await tester.pumpWidget(
     goldenApp(
       brightness: Brightness.light,
-      home: HomeShell(chatBuilder: (_) => const SizedBox.expand(), initiallyOpen: true),
+      home: HomeShell(chatBuilder: showChat ? null : (_) => const SizedBox.expand(), initiallyOpen: true),
       overrides: [
         ...workspaceOverrides(host, current: 's1', prefs: const WorkspacePrefs(loaded: true)).skip(1),
         switchConnectionProvider.overrideWith(() => SwitchConnection(connection)),
         activeConnectionProvider.overrideWith((ref) => ref.watch(switchConnectionProvider)),
         sessionDeletionBackendProvider.overrideWithValue(fake),
+        imageSnapshotsProvider.overrideWithValue(_NoSnapshots()),
       ],
     ),
   );
@@ -166,6 +176,73 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('deletion receipt leaves the real composer visible and tappable after closing the drawer', (
+    tester,
+  ) async {
+    await _start(tester, showChat: true);
+    await _singleConfirmation(tester);
+    await tester.tap(_confirm);
+    await _settle(tester);
+    expect(find.text('已永久删除 1 个对话'), findsOneWidget);
+
+    // The drawer's scrim closes it while the receipt is still on screen.
+    final size = tester.view.physicalSize / tester.view.devicePixelRatio;
+    await tester.tapAt(Offset(size.width - 20, size.height / 2));
+    await _settle(tester);
+    final input = find.descendant(of: find.byType(Composer), matching: find.byType(EditableText));
+    expect(input, findsOneWidget);
+    final receipt = find.text('已永久删除 1 个对话');
+    final receiptCard = find.ancestor(of: receipt, matching: find.byType(Material)).first;
+    expect(tester.getRect(receiptCard).bottom, lessThan(tester.getRect(input).top));
+    await tester.tap(input);
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(tester.widget<EditableText>(input).focusNode.hasFocus, isTrue);
+    await tester.enterText(input, '继续输入');
+    expect(tester.widget<EditableText>(input).controller.text, '继续输入');
+
+    tester.view.viewInsets = FakeViewPadding(bottom: 300 * tester.view.devicePixelRatio);
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.text('已永久删除 1 个对话'), findsOneWidget);
+    expect(tester.getRect(receiptCard).bottom, lessThan(tester.getRect(input).top));
+    expect(tester.widget<EditableText>(input).focusNode.hasFocus, isTrue);
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.byType(MaterialBanner), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('deletion receipt can be dismissed without dismissing the conversation', (tester) async {
+    await _start(tester);
+    await _singleConfirmation(tester);
+    await tester.tap(_confirm);
+    await _settle(tester);
+    await tester.tap(find.descendant(of: find.byType(MaterialBanner), matching: find.text('关闭')));
+    await _settle(tester);
+    expect(find.byType(MaterialBanner), findsNothing);
+    expect(find.byType(HomeShell), findsOneWidget);
+    await tester.pump(const Duration(seconds: 4));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('a retired deletion receipt cannot dismiss the next banner', (tester) async {
+    await _start(tester);
+    await _singleConfirmation(tester);
+    await tester.tap(_confirm);
+    await _settle(tester);
+    final messenger = ScaffoldMessenger.of(tester.element(find.byType(HomeShell)));
+    messenger.removeCurrentMaterialBanner();
+    messenger.showMaterialBanner(
+      MaterialBanner(
+        content: const Text('Another notice'),
+        actions: [TextButton(onPressed: () {}, child: const Text('OK'))],
+      ),
+    );
+    await _settle(tester);
+    await tester.pump(const Duration(seconds: 5));
+    expect(find.text('Another notice'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('unsupported host explains disabled delete without archive fallback', (tester) async {
     final fixture = await _start(tester, backend: _DeletionBackend()..available = false);
     await tester.longPress(_tile('A first'));
@@ -204,6 +281,34 @@ void main() {
     await _settle(tester);
     expect(tester.widget<ListTile>(_deleteAction).onTap, isNotNull);
     expect(fixture.backend.calls, isEmpty);
+  });
+
+  testWidgets('capability states map to three different explanations, never a false refusal', (tester) async {
+    late BuildContext context;
+    await tester.pumpWidget(
+      goldenApp(
+        brightness: Brightness.light,
+        home: Builder(
+          builder: (inner) {
+            context = inner;
+            return const SizedBox.expand();
+          },
+        ),
+      ),
+    );
+    String? reason(SessionDeletionSupport support, {List<String> ids = const ['s1']}) =>
+        sessionDeletionDisabledReason(
+          context,
+          available: AsyncData(support),
+          busy: false,
+          sessions: const [],
+          ids: ids,
+        );
+    // Not asked yet (no live connection / no ready mux generation) is a
+    // "temporarily unavailable", never "this host does not support it".
+    expect(reason(SessionDeletionSupport.unknown), '安全永久删除暂不可用，请重连或更新此主机；不会改为归档。');
+    expect(reason(SessionDeletionSupport.unsupported), '此主机不支持安全永久删除，仍可使用归档。');
+    expect(reason(SessionDeletionSupport.supported, ids: const []), isNull);
   });
 
   testWidgets('running single and mixed bulk selection cannot request deletion', (tester) async {
@@ -337,14 +442,19 @@ void main() {
     });
   }
 
-  testWidgets('same-client mux reconnect invalidates open confirmation', (tester) async {
+  testWidgets('a same-client mux reconnect keeps the open confirmation valid', (tester) async {
     final fixture = await _start(tester);
     await _singleConfirmation(tester);
     final ready = fixture.connection.client.mux.lastReadyGenerationNumber;
     fixture.connection.client.mux.reconnect();
     await _settle(tester);
     expect(fixture.connection.client.mux.lastReadyGenerationNumber, greaterThan(ready));
-    expect(tester.widget<FilledButton>(_confirm).onPressed, isNull);
+    // Deleting is one HTTP request, not an event-stream operation: the same
+    // client reconnected to the same host is still the same authority, so the
+    // confirmation is not thrown away (nor shown as "the host changed").
+    expect(find.text('主机或连接已变化。请取消后重新发起删除，原确认不再有效。'), findsNothing);
+    await _settle(tester);
+    expect(tester.widget<FilledButton>(_confirm).onPressed, isNotNull);
     expect(fixture.backend.calls, isEmpty);
     expect(tester.takeException(), isNull);
   });

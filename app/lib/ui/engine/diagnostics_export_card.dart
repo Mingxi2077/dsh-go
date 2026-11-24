@@ -8,6 +8,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../l10n/l10n.dart';
 import '../../diagnostics/diagnostics_export.dart';
+import '../../state/android_features.dart';
+import '../../state/artifacts.dart' show saveWindowDismissed;
 import '../common/app_sheet.dart';
 import '../common/list_page_row.dart';
 import '../theme/app_icons.dart';
@@ -17,11 +19,16 @@ import '../common/brief_notice.dart';
 enum _Action { share, save }
 
 /// The step an export is on, as a row subtitle.
-String diagnosticsStepText(DiagnosticsStep step) => switch (step) {
+String diagnosticsStepText(DiagnosticsStep step, {required bool harmony}) => switch (step) {
   DiagnosticsStep.collecting => appL10n.phoneDiagnosticsCollecting,
   DiagnosticsStep.packing => appL10n.phoneDiagnosticsPacking,
   DiagnosticsStep.sharing => appL10n.phoneDiagnosticsSharing,
-  DiagnosticsStep.saving => appL10n.phoneDiagnosticsSaving,
+  DiagnosticsStep.saving =>
+    harmony
+        ? appL10n.harmonySaving
+        : wordsForIos
+        ? appL10n.iosSavingToFiles
+        : appL10n.phoneDiagnosticsSaving,
 };
 
 /// The two ways out for a diagnostics bundle — 「分享诊断包」 and
@@ -85,8 +92,10 @@ class _DiagnosticsExportCardState extends ConsumerState<DiagnosticsExportCard> {
           }
       }
     } catch (error) {
-      debugPrint('Diagnostics export failed: $error');
-      if (mounted) _toast(diagnosticsErrorText(error));
+      if (!saveWindowDismissed(error)) {
+        debugPrint('Diagnostics export failed: $error');
+        if (mounted) _toast(diagnosticsErrorText(error));
+      }
     } finally {
       if (mounted) {
         setState(() {
@@ -108,8 +117,10 @@ class _DiagnosticsExportCardState extends ConsumerState<DiagnosticsExportCard> {
         )
       : null;
 
+  bool get _harmony => ref.watch(operatingSystemProvider) == 'ohos';
+
   String _subtitle(_Action action, String idle) =>
-      _busy == action && _step != null ? diagnosticsStepText(_step!) : idle;
+      _busy == action && _step != null ? diagnosticsStepText(_step!, harmony: _harmony) : idle;
 
   @override
   Widget build(BuildContext context) {
@@ -129,8 +140,19 @@ class _DiagnosticsExportCardState extends ConsumerState<DiagnosticsExportCard> {
         ),
         ListPageRow(
           icon: AppIcons.download,
-          title: l10n.phoneDiagnosticsSave,
-          subtitle: _subtitle(_Action.save, l10n.phoneDiagnosticsSaveHint),
+          title: _harmony
+              ? l10n.harmonySaveToFile
+              : wordsForIos
+              ? l10n.iosSaveToFiles
+              : l10n.phoneDiagnosticsSave,
+          subtitle: _subtitle(
+            _Action.save,
+            _harmony
+                ? l10n.harmonySaveChooseLocation
+                : wordsForIos
+                ? l10n.iosFilesFolderHint
+                : l10n.phoneDiagnosticsSaveHint,
+          ),
           trailing: _ring(_Action.save),
           chevron: _busy != _Action.save,
           onTap: idle ? () => unawaited(_run(_Action.save)) : null,
@@ -149,6 +171,12 @@ String get diagnosticsBundleNote => appL10n.phoneDiagnosticsNote;
 /// so the toast isn't left under the sheet.
 Future<void> showDiagnosticsExportSheet(BuildContext context) {
   final messenger = ScaffoldMessenger.maybeOf(context);
+  // The export can outlive the sheet (swiped away mid-export): close it only
+  // while it is still the top route, and keep the saved notice either way.
+  void close(BuildContext sheet) {
+    if (sheet.mounted && (ModalRoute.of(sheet)?.isCurrent ?? false)) Navigator.of(sheet).pop();
+  }
+
   return showAppSheet<void>(
     context,
     builder: (sheet) => SafeArea(
@@ -161,10 +189,10 @@ Future<void> showDiagnosticsExportSheet(BuildContext context) {
           DiagnosticsExportCard(
             margin: const EdgeInsets.symmetric(horizontal: kSheetGutter),
             onSaved: (where) {
-              Navigator.of(sheet).pop();
-              messenger?.showBriefNotice(diagnosticsSavedText(where));
+              close(sheet);
+              if (messenger?.mounted ?? false) messenger!.showBriefNotice(diagnosticsSavedText(where));
             },
-            onShared: () => Navigator.of(sheet).pop(),
+            onShared: () => close(sheet),
           ),
           const DiagnosticsBundleNote(inset: kSheetGutter + 8),
           const SizedBox(height: 16),

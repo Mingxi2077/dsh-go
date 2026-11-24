@@ -3,7 +3,7 @@
 /// Flow (the Host owns PKCE, state, the code exchange and the stored grant):
 /// ```text
 /// signIn() ─► engine running? ─► account/startSignIn(callbackOrigin = http://127.0.0.1:<port>, web)
-///          ─► account/watch: initializing → waiting-browser(authorizeUrl) ─► temporary in-app page
+///          ─► account/watch: initializing → waiting-browser(authorizeUrl) ─► open Custom Tab
 ///             user approves on platform.deepseek.com ─► 302 to 127.0.0.1:<port>/oauth/callback
 ///          ─► exchanging → committing → succeeded + credential-stored ─► profile, default model
 /// ```
@@ -11,13 +11,13 @@
 library;
 
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:ui' show Brightness;
 
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import '../browser/browser_links.dart';
 import '../l10n/l10n.dart';
 import '../runtime/local_footprint.dart';
 import '../runtime/runtime_bridge.dart';
@@ -42,19 +42,25 @@ final accountApiProvider = Provider<AccountApi?>((ref) {
   return DshAccountApi(conn.client, callbackOrigin: origin);
 });
 
-/// Opens Platform pages; test implementations may record these requests.
+/// Opens Platform pages (authorization, top-up) outside the app's WebView.
 abstract interface class AccountBrowser {
   /// True when something was launched.
   Future<bool> open(Uri url);
 }
 
-/// Explicit fallback for providers that require a system browser.
+/// Chrome Custom Tab first (shares the browser's DeepSeek login cookies and
+/// keeps the user next to the app), the default browser as a fallback. OAuth
+/// stays out of embedded WebViews (RFC 8252).
 class SystemAccountBrowser implements AccountBrowser {
   const SystemAccountBrowser();
 
   @override
   Future<bool> open(Uri url) async {
-    for (final mode in const [LaunchMode.inAppBrowserView, LaunchMode.externalApplication]) {
+    // HarmonyOS's url_launcher answers the in-app mode with a developer's toast.
+    final modes = Platform.operatingSystem == 'ohos'
+        ? const [LaunchMode.externalApplication]
+        : const [LaunchMode.inAppBrowserView, LaunchMode.externalApplication];
+    for (final mode in modes) {
       try {
         if (await launchUrl(url, mode: mode)) return true;
       } catch (_) {
@@ -65,23 +71,7 @@ class SystemAccountBrowser implements AccountBrowser {
   }
 }
 
-class EmbeddedAccountBrowser implements AccountBrowser {
-  const EmbeddedAccountBrowser();
-
-  @override
-  Future<bool> open(Uri url) => BrowserLinks.open(url);
-
-  Future<bool> authorize(BrowserAuthorization request) => BrowserLinks.authorize(request);
-}
-
-final accountBrowserProvider = Provider<AccountBrowser>((ref) => const EmbeddedAccountBrowser());
-
-/// The temporary WebView can forward only this exact loopback spelling. Other
-/// engine-supported origins (localhost / IPv6) keep using the system browser.
-bool _embeddedCallbackOrigin(String raw) {
-  final match = RegExp(r'^http://127\.0\.0\.1:([1-9][0-9]{0,4})/?$').firstMatch(raw);
-  return match != null && match.end == raw.length && int.parse(match.group(1)!) <= 65535;
-}
+final accountBrowserProvider = Provider<AccountBrowser>((ref) => const SystemAccountBrowser());
 
 /// Starts the local engine when it is installed but stopped (onboarding can
 /// reach the sign-in step on a relaunch before anything started it).
@@ -280,17 +270,7 @@ class _Run {
   String? attemptId;
   SignInPhase? phase;
   String? openedUrl;
-  Completer<void>? authorizationDone;
   Timer? deadline;
-
-  /// A browser surface can end while signIn() continues following a successor
-  /// Host attempt. Its identity and completion must not belong to the whole run.
-  void retireAuthorization() {
-    final done = authorizationDone;
-    authorizationDone = null;
-    openedUrl = null;
-    if (done != null && !done.isCompleted) done.complete();
-  }
 }
 
 class AccountController extends Notifier<AccountState> {
@@ -389,7 +369,6 @@ class AccountController extends Notifier<AccountState> {
     final run = _run;
     if (run == null) return;
     run.cancelled = true;
-    run.retireAuthorization();
     if (_apiWaiter case final waiter? when !waiter.isCompleted) {
       _apiWaiter = null;
       waiter.completeError(const _Cancelled());
@@ -400,11 +379,11 @@ class AccountController extends Notifier<AccountState> {
     if (api != null && id != null && _scopeCurrent(api, generation)) {
       try {
         final view = await api.cancelSignIn(id);
-        if (identical(_run, run) && run.attemptId == id) _onView(view, api, generation);
+        if (identical(_run, run)) _onView(view, api, generation);
       } catch (_) {
         // Engine unreachable: the attempt dies with it; settle locally.
       }
-      if (!_scopeCurrent(api, generation) || run.attemptId != id) return;
+      if (!_scopeCurrent(api, generation)) return;
     }
     // Still starting (no attempt id yet): settle now; _start cancels the attempt when it appears.
     if (identical(_run, run)) _settle(run, SignInResult.cancelled);
@@ -485,7 +464,6 @@ class AccountController extends Notifier<AccountState> {
 
   void _attach(AccountApi? api) {
     if (identical(api, _api)) return;
-    _run?.retireAuthorization();
     final previous = _api;
     if (api == null &&
         previous is DshAccountApi &&
@@ -559,7 +537,6 @@ class AccountController extends Notifier<AccountState> {
     // connected event runs. Its unknown account still retires the old proof.
     final lostReady = readyEvent && current == null;
     if (!lostReady && identical(current, _muxGeneration)) return;
-    _run?.retireAuthorization();
     _sub?.cancel();
     _sub = null;
     _retry?.cancel();
@@ -710,16 +687,11 @@ class AccountController extends Notifier<AccountState> {
     final prev = state;
     final run = _run;
     final attempt = view.attempt;
-    final changedAttempt = run != null && attempt != null && attempt.phase.isActive && run.attemptId != attempt.id;
-    if (changedAttempt) {
+    if (run != null && attempt != null && attempt.phase.isActive && run.attemptId != attempt.id) {
       // startSignIn joins a running attempt instead of starting another: follow it.
-      run.retireAuthorization();
-      _returnTimer?.cancel();
       run
         ..attemptId = attempt.id
-        ..cancelled = false
         ..phase = null;
-      _armDeadline(run, attempt.expiresAt);
     }
     final own = run != null && attempt != null && attempt.id == run.attemptId;
     if (own && !view.signedIn && run.phase != null && attempt.phase.index < run.phase!.index) {
@@ -759,10 +731,9 @@ class AccountController extends Notifier<AccountState> {
           phase: AccountPhase.signingIn,
           stage: stage,
           attemptId: attempt.id,
-          authorizeUrl: attempt.authorizeUrl ?? (changedAttempt ? null : prev.authorizeUrl),
+          authorizeUrl: attempt.authorizeUrl ?? prev.authorizeUrl,
           expiresAt: attempt.expiresAt,
           browserHint: waiting ? null : BrowserHint.none,
-          clearAttempt: changedAttempt,
           clearProfile: true,
         ),
       );
@@ -795,33 +766,9 @@ class AccountController extends Notifier<AccountState> {
   }
 
   Future<void> _openBrowser(_Run run, String url) async {
-    final api = _api;
-    final generation = _apiGeneration;
-    final attemptId = run.attemptId;
-    if (!ref.mounted ||
-        !identical(_run, run) ||
-        run.cancelled ||
-        api == null ||
-        attemptId == null ||
-        !_scopeCurrent(api, generation) ||
-        _viewGeneration != generation ||
-        state.attemptId != attemptId ||
-        state.stage != SignInStage.waitingBrowser ||
-        state.authorizeUrl != url) {
-      return;
-    }
+    run.openedUrl = url;
     var uri = Uri.tryParse(url);
     if (uri == null) return;
-    if (run.openedUrl != url) run.retireAuthorization();
-    run.openedUrl = url;
-    final done = run.authorizationDone ??= Completer<void>();
-    bool current() =>
-        _scopeCurrent(api, generation) &&
-        identical(_run, run) &&
-        run.attemptId == attemptId &&
-        !run.cancelled &&
-        identical(run.authorizationDone, done) &&
-        !done.isCompleted;
     if (_theme case final theme?) {
       // As DSH's own client does: Platform renders its login page in the app's palette.
       uri = uri.replace(
@@ -830,26 +777,11 @@ class AccountController extends Notifier<AccountState> {
     }
     bool opened;
     try {
-      final browser = ref.read(accountBrowserProvider);
-      opened = browser is EmbeddedAccountBrowser
-          ? await browser.authorize(
-              BrowserAuthorization(
-                id: done,
-                url: uri,
-                callbackOrigin: Uri.tryParse(api.callbackOrigin),
-                preferSystem: !_embeddedCallbackOrigin(api.callbackOrigin),
-                completed: done.future,
-                isCurrent: current,
-                cancel: () async {
-                  if (current()) await cancel();
-                },
-              ),
-            )
-          : await browser.open(uri);
+      opened = await ref.read(accountBrowserProvider).open(uri);
     } catch (_) {
       opened = false;
     }
-    if (!current() || !state.signingIn) return;
+    if (!ref.mounted || !identical(_run, run) || !state.signingIn) return;
     _set(state.copyWith(browserHint: opened ? BrowserHint.none : BrowserHint.notOpened));
   }
 
@@ -920,7 +852,6 @@ class AccountController extends Notifier<AccountState> {
   }
 
   void _finish(_Run run, SignInResult result) {
-    run.retireAuthorization();
     run.deadline?.cancel();
     _returnTimer?.cancel();
     if (identical(_run, run)) _run = null;
@@ -956,7 +887,6 @@ class AccountController extends Notifier<AccountState> {
     final run = _run;
     _run = null;
     if (run != null) {
-      run.retireAuthorization();
       run.deadline?.cancel();
       if (!run.completer.isCompleted) run.completer.complete(SignInResult.cancelled);
     }

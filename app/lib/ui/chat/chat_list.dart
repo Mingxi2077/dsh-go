@@ -1,4 +1,6 @@
-// Portions derived from PiPilot (https://github.com/CikeSeven/pi_pilot), MIT, Copyright (c) 2026 CikeSeven. See THIRD_PARTY_NOTICES.md.
+// SPDX-FileCopyrightText: 2026 CikeSeven
+// SPDX-License-Identifier: MIT
+// See THIRD_PARTY_NOTICES.md.
 // Local changes: rewritten around a centre-anchored CustomScrollView (see
 // [ChatList]); the jump-to-bottom control is a chrome-glass circle.
 
@@ -14,16 +16,21 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../l10n/l10n.dart';
 import '../../pets/pet_signals.dart' show petHeadroomProvider;
+import '../../plugins/native/native_surface.dart' show nativeTurnNoteProvider;
 import '../../state/agents_state.dart' show hostSessionsProvider, selectConversation;
+import '../../state/app_notes.dart';
 import '../../state/artifacts.dart';
 import '../../state/attachments.dart' show DraftAttachment;
 import '../../state/chat_reveal.dart';
 import '../../state/chat_state.dart';
 import '../../state/connection_state.dart';
+import '../../companion/companion_reply.dart' show companionHasMarks, companionWithoutMarks;
+import '../../companion/companion_state.dart' show companionSessionFilterProvider;
 import '../../state/hosts_state.dart' show HostKind, activeHostProvider;
 import '../../state/regenerate.dart';
 import '../../state/sessions_state.dart';
 import '../../state/settings_state.dart';
+import '../common/app_dialog.dart';
 import '../common/bleed.dart';
 import '../common/ui_trace.dart';
 import '../pets/pet_perch.dart';
@@ -37,6 +44,7 @@ import 'composer_toast.dart';
 import 'dsh_ui/dsh_ui.dart';
 import 'render/markdown_image.dart';
 import 'trajectory_sheet.dart';
+import 'turn_summary.dart' show forgetToolSummaries;
 import 'widgets/approval_card.dart';
 import 'widgets/artifact_card.dart';
 import 'widgets/assistant_message.dart';
@@ -94,9 +102,13 @@ class ChatList extends ConsumerStatefulWidget {
     this.onQuote,
     this.onToast,
     this.onSwitchModel,
+    this.toTop,
   });
 
   final String sessionId;
+
+  /// Where the status bar's tap arrives (iOS).
+  final StatusBarTop? toTop;
 
   /// 顶栏占的高度(含状态栏)。
   final double topInset;
@@ -144,9 +156,9 @@ class ChatList extends ConsumerStatefulWidget {
   ConsumerState<ChatList> createState() => _ChatListState();
 }
 
-class _ChatListState extends ConsumerState<ChatList> {
-  late final _scroll = _TopBoundedScrollController(_leadingBoundary);
-  final _centerKey = UniqueKey();
+class _ChatListState extends ConsumerState<ChatList> with SingleTickerProviderStateMixin {
+  late final _scroll = _TopBoundedScrollController(_leadingBoundary, _prependCorrection);
+  final _centerKey = GlobalKey();
   final _beforeKey = GlobalKey();
   final _historyKey = GlobalKey();
   double _anchorPixels = 0;
@@ -166,6 +178,40 @@ class _ChatListState extends ConsumerState<ChatList> {
     return _anchorPixels - rows - history - widget.topInset - AppSpace.sm;
   }
 
+  /// EditableText's reveal request includes its caret padding. The centered
+  /// viewport's getOffsetToReveal omits the anchor, so use the actual rectangle
+  /// in this viewport instead. Other reveal requests keep Flutter's behavior.
+  bool _revealInlineEditor(RenderObject target, Rect? rect, Duration duration, Curve curve) {
+    final focus = FocusManager.instance.primaryFocus?.context;
+    if (focus == null || !focus.mounted || focus.findAncestorStateOfType<_ChatListState>() != this) return false;
+    final editor = focus.findAncestorStateOfType<EditableTextState>();
+    if (editor == null || editor.widget.readOnly) return false;
+    RenderObject? ancestor = editor.renderEditable;
+    while (ancestor != null && ancestor != target) {
+      ancestor = ancestor.parent;
+    }
+    if (ancestor == null || !_scroll.hasClients) return false;
+    final viewport = _centerKey.currentContext?.findRenderObject()?.parent;
+    if (viewport is! RenderViewport || !viewport.hasSize) return false;
+    final position = _scroll.position;
+    // Do not interrupt a finger or the fling it started. A previous implicit
+    // caret animation has an idle user direction and may be superseded.
+    if (_fingers > 0 || position.userScrollDirection != ScrollDirection.idle || !position.allowImplicitScrolling) {
+      return true;
+    }
+    final revealed = MatrixUtils.transformRect(target.getTransformTo(viewport), rect ?? target.paintBounds);
+    final leading = revealed.top - widget.topInset;
+    final trailing = revealed.bottom - _anchorPixels;
+    // When the requested area is taller than the viewport and already spans
+    // it, neither edge is preferable (the same rule as showInViewport).
+    if (leading < 0 && trailing > 0) return true;
+    final shift = trailing > 0 ? trailing : math.min(0.0, leading);
+    if (shift.abs() > precisionErrorTolerance) {
+      unawaited(position.moveTo(position.pixels + shift, duration: duration, curve: curve));
+    }
+    return true;
+  }
+
   /// 视口贴在底部(决定流式时是否跟随)。
   bool _pinned = true;
 
@@ -174,16 +220,124 @@ class _ChatListState extends ConsumerState<ChatList> {
   /// 解除。
   bool _held = false;
 
-  late final _physics = _FollowPhysics(() => _pinned && !_held);
+  late final _physics = _FollowPhysics(() => _pinned && !_held && _fingers == 0, glides: () => _glidable);
+
+  /// Fingers on the list. Any `jumpTo` ends the drag under them for good (it goes idle,
+  /// and the rest of that gesture moves nothing), so while one rests here or the list is
+  /// moving on its own, following waits: the list is the user's.
+  int _fingers = 0;
+
+  bool get _userHasList => _fingers > 0 || (_scroll.hasClients && _scroll.position.isScrollingNotifier.value);
+
+  /// Heading up, by finger or fling: however near the bottom, that is not "at the bottom".
+  bool _goingUp = false;
+
+  /// Following waited for the user; it picks up when they let go.
+  bool _followWaiting = false;
+
+  /// The next follow overrides the user: they asked for the bottom, or just sent something.
+  bool _followNow = false;
+
+  /// The fluid tier: following glides to a new line instead of snapping to it. Real
+  /// scrolling, so everything else about the list is as it was; the new line only starts
+  /// a little lower, behind the composer.
+  bool _fluid = false;
+
+  /// The glide is ours: its scroll updates say nothing about what the user wants.
+  bool _gliding = false;
+  bool _snapNext = false;
+  late final Ticker _glide = createTicker(_onGlide);
+  Duration _glideLast = Duration.zero;
+
+  /// Time constant of the glide: a line (about 28) lands in some 150ms, and lines
+  /// arriving faster than that blend into one steady motion.
+  static const _glideSeconds = 0.07;
+
+  /// Further than this is not a next line: a jump, as before.
+  static const _glideReach = 240.0;
+
+  bool get _glidable => _fluid && !_snapNext;
+
+  void _startGlide() {
+    _gliding = true;
+    if (_glide.isActive) return;
+    _glideLast = Duration.zero;
+    _glide.start();
+  }
+
+  void _goToTop() => unawaited(_runToTop());
+
+  /// The rows above are measured as they come into view, so the top can turn out nearer or further
+  /// than it first looked: stop on arriving, and go on if it's further. A finger takes over.
+  Future<void> _runToTop() async {
+    if (!_scroll.hasClients) return;
+    _stopGlide();
+    _pinned = false;
+    final position = _scroll.position;
+    final duration = AppMotion.of(context, const Duration(milliseconds: 600));
+    void stopAtTop() {
+      if (position.pixels < position.minScrollExtent) position.jumpTo(position.minScrollExtent);
+    }
+
+    _scroll.addListener(stopAtTop);
+    for (
+      var tries = 0;
+      tries < 3 && mounted && _fingers == 0 && position.pixels > position.minScrollExtent + 1;
+      tries++
+    ) {
+      if (duration == Duration.zero) {
+        position.jumpTo(position.minScrollExtent);
+      } else {
+        await position.animateTo(position.minScrollExtent, duration: duration, curve: AppMotion.glide);
+      }
+    }
+    if (mounted) _scroll.removeListener(stopAtTop);
+  }
+
+  void _stopGlide() {
+    _gliding = false;
+    if (_glide.isActive) _glide.stop();
+  }
+
+  void _onGlide(Duration elapsed) {
+    if (!mounted || !_scroll.hasClients || !_pinned || _held) return _stopGlide();
+    if (_userHasList) {
+      _followWaiting = true;
+      return _stopGlide();
+    }
+    final seconds = (elapsed - _glideLast).inMicroseconds / Duration.microsecondsPerSecond;
+    _glideLast = elapsed;
+    final p = _scroll.position;
+    final gap = p.maxScrollExtent - p.pixels;
+    if (gap <= 0.5 || gap > _glideReach) {
+      if (gap != 0) p.jumpTo(p.maxScrollExtent);
+      return _stopGlide();
+    }
+    p.jumpTo(p.pixels + gap * (1 - math.exp(-seconds / _glideSeconds)));
+  }
 
   /// 回到底部按钮 / 新内容角标。用 notifier 而不是 setState:
   /// 显隐翻转不该重建整个列表。
   final _showJump = ValueNotifier<bool>(false);
   final _hasNew = ValueNotifier<bool>(false);
 
+  _JumpToBottom? _jump;
+
+  /// Streaming changes the rows but not the floating button's pending count.
+  _JumpToBottom _jumpButton(ChatState state) {
+    final waiting =
+        state.questions.length + state.approvals.where((a) => !state.autoAnswered.contains(a.eventId)).length;
+    final button = _jump;
+    if (button != null && button.waiting == waiting) return button;
+    return _jump = _JumpToBottom(visible: _showJump, hasNew: _hasNew, waiting: waiting, onTap: jumpToBottom);
+  }
+
   /// before 段最后一行的主键;null = before 段为空。首次加载完成时确定。
   String? _splitKey;
   bool _splitChosen = false;
+  int? _oldestRowSeq;
+  ({String key, double offset})? _prependAnchor;
+  String? _snapPaddingKey;
 
   // 行派生缓存:输入不变就不重算。
   List<ChatRow> _rows = const [];
@@ -191,6 +345,36 @@ class _ChatListState extends ConsumerState<ChatList> {
   Map<String, int> _index = const {};
   Object? _rowsInputs;
   Set<String> _autoAnswered = const {};
+
+  /// Row widgets as last built, by row key. A row whose [ChatRow] object, gap
+  /// and motion are unchanged gets the same widget back, so Flutter skips it:
+  /// a text delta rebuilds only the reply it grows. Cleared whenever rows are
+  /// derived afresh, and when anything else a row reads changes (see
+  /// [_clearBuiltRows]).
+  ///
+  /// The rule this rests on: whatever the row-building layer ([_rowFrame] and
+  /// the methods it calls) reads that does not come with the row object (the
+  /// chat state, the list's context, the language, the list's own fields,
+  /// other providers) must either clear this map when it changes, or be read
+  /// in the row widget's own build instead. Today that is: the chat state
+  /// ([_deriveRows]), the motion duration and the language ([build]), the
+  /// fork / regenerate marks ([_clearBuiltRows]) and which callbacks are given
+  /// ([didUpdateWidget]).
+  final Map<String, ({ChatRow row, double gap, bool divided, Widget widget})> _built = {};
+  SliverList? _historySliver;
+  Duration? _builtMotion;
+  Locale? _builtLocale;
+  ThemeShapeSpec _builtShapes = const ThemeShapeSpec();
+
+  /// The pack's mark between turns and its colour (null without one), which
+  /// [_rowFrame] paints into the gap above a turn's first message.
+  ThemeTurnDivider _builtDivider = ThemeTurnDivider.none;
+  Color? _builtDividerColor;
+  ChatState? _builtState;
+
+  /// A streaming draft has words, not only thinking: earlier rows read that
+  /// (whether a visual block was answered by a later reply).
+  bool _draftSays = false;
 
   double? _lastViewport;
   int _lastPendingCount = 0;
@@ -204,11 +388,6 @@ class _ChatListState extends ConsumerState<ChatList> {
 
   /// 正在准备重新回答的那条回复(读原图、分叉;挡连点)。
   String? _regeneratingId;
-
-  // 一轮在眼前结束时怎么收起过程(开着「收起过程」时):贴底看着的,先按原样
-  // 画一帧再平滑收起;往上翻着看的,下一次派生里直接收掉,不保留展开。
-  // 冷打开、重新加载时已结束的轮照旧直接收着。
-  Set<int> _runningTurns = const {};
 
   /// 要播收起动画的过程行;第一次建出来就拿掉(同 [_fresh])。
   final Set<String> _settling = {};
@@ -231,7 +410,20 @@ class _ChatListState extends ConsumerState<ChatList> {
       ref.read(chatProvider(widget.sessionId).notifier).rejectQuestion(request);
 
   @override
+  void initState() {
+    super.initState();
+    widget.toTop?.onTap = _goToTop;
+  }
+
+  @override
   void dispose() {
+    if (widget.toTop?.onTap == _goToTop) widget.toTop?.onTap = null;
+    // This conversation's calls leave the tool summary caches with it.
+    forgetToolSummaries({
+      for (final item in _builtState?.items ?? const <ChatItem>[])
+        if (item is ToolChatItem) item.callId,
+    });
+    _glide.dispose();
     _scroll.dispose();
     _showJump.dispose();
     _hasNew.dispose();
@@ -241,8 +433,38 @@ class _ChatListState extends ConsumerState<ChatList> {
   @override
   void didUpdateWidget(ChatList oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.toTop != widget.toTop) {
+      if (oldWidget.toTop?.onTap == _goToTop) oldWidget.toTop?.onTap = null;
+      widget.toTop?.onTap = _goToTop;
+    }
     if (oldWidget.bottomInset != widget.bottomInset && _pinned) _follow();
+    // Rows call the callbacks through `widget` when tapped; only whether
+    // each is there shapes what they show.
+    bool same(Object? a, Object? b) => (a == null) == (b == null);
+    if (oldWidget.sessionId != widget.sessionId ||
+        !same(oldWidget.onWithdraw, widget.onWithdraw) ||
+        !same(oldWidget.onSendNow, widget.onSendNow) ||
+        !same(oldWidget.onEditPrompt, widget.onEditPrompt) ||
+        !same(oldWidget.onResend, widget.onResend) ||
+        !same(oldWidget.onQuote, widget.onQuote) ||
+        !same(oldWidget.onSwitchModel, widget.onSwitchModel)) {
+      _forgetBuiltRows();
+    }
   }
+
+  void _forgetBuiltRows() {
+    _built.clear();
+    _historySliver = null;
+  }
+
+  void _clearBuiltRows(VoidCallback change) => setState(() {
+    change();
+    _forgetBuiltRows();
+  });
+
+  void _quote(String passage) => widget.onQuote?.call(passage);
+
+  void _switchModel() => widget.onSwitchModel?.call();
 
   // ---------------------------------------------------------------------------
   // 跟随与贴底
@@ -264,9 +486,25 @@ class _ChatListState extends ConsumerState<ChatList> {
         return;
       }
       final p = _scroll.position;
+      if (_followNow) {
+        _followNow = false;
+        // Ends a fling or a drag in progress.
+        p.jumpTo(p.pixels);
+      } else if (_userHasList) {
+        _followScheduled = false;
+        _followWaiting = true;
+        return;
+      }
       if (uiTraceEnabled && p.pixels != p.maxScrollExtent) {
         uiTrace('chat-list', 'follow', {'from': p.pixels, 'to': p.maxScrollExtent, 'held': _held, 'attempt': attempts});
       }
+      final gap = p.maxScrollExtent - p.pixels;
+      if (_glidable && gap > 0 && gap <= _glideReach) {
+        _followScheduled = false;
+        _startGlide();
+        return;
+      }
+      _snapNext = false;
       if (p.pixels != p.maxScrollExtent) p.jumpTo(p.maxScrollExtent);
       attempts++;
       if (attempts < 4 && _scroll.position.pixels < p.maxScrollExtent - 0.5) {
@@ -277,10 +515,28 @@ class _ChatListState extends ConsumerState<ChatList> {
     }
 
     WidgetsBinding.instance.addPostFrameCallback(step);
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  void _resumeFollow() {
+    if (!_followWaiting || _userHasList) return;
+    _followWaiting = false;
+    if (!_pinned) return;
+    _held = false;
+    _follow();
+  }
+
+  void _onFingerUp() {
+    if (_fingers > 0) _fingers--;
+    _resumeFollow();
   }
 
   void jumpToBottom() {
     _pinned = true;
+    _goingUp = false;
+    _followNow = true;
+    _snapNext = true;
+    _stopGlide();
     _hasNew.value = false;
     _showJump.value = false;
     _follow();
@@ -317,6 +573,21 @@ class _ChatListState extends ConsumerState<ChatList> {
 
   void _applyMetrics(ScrollMetrics metrics) {
     _reportScrolledUnder(metrics);
+    // The reveal grows the reply between state updates.
+    if (_glidable && _pinned && !_held && _scroll.hasClients && !_atBottom(0.5) && _atBottom(_glideReach)) {
+      if (_userHasList) {
+        _followWaiting = true;
+      } else {
+        _startGlide();
+      }
+    } else if (_glidable && _pinned && !_held && _scroll.hasClients && !_atBottom(_glideReach)) {
+      // Too far to glide, with no new state to set off a follow: the jump it would do.
+      if (_userHasList) {
+        _followWaiting = true;
+      } else {
+        _follow();
+      }
+    }
     // 点开的内容往下长出了视口:不再算贴底,之后的新内容不把它顶走。
     if (_held && _pinned && !_atBottom()) {
       _pinned = false;
@@ -326,6 +597,12 @@ class _ChatListState extends ConsumerState<ChatList> {
 
   bool _onScroll(ScrollNotification n) {
     if (n.depth != 0) return false;
+    // Only this list's drag dismisses the keyboard. A code well's inner
+    // horizontal drag must keep its SelectionArea focused.
+    if (n is ScrollUpdateNotification && n.dragDetails != null) {
+      final scope = FocusScope.of(context);
+      if (scope.hasFocus && !scope.hasPrimaryFocus) FocusManager.instance.primaryFocus?.unfocus();
+    }
     _consumeScrollMetrics(n.metrics, (metrics) => _applyScroll(n, metrics));
     return false;
   }
@@ -336,7 +613,20 @@ class _ChatListState extends ConsumerState<ChatList> {
     if (n is UserScrollNotification && n.direction == ScrollDirection.forward) {
       // 手指往下拖 = 往回看:立刻停止跟随,别和用户抢。
       _pinned = false;
-    } else if (n is ScrollUpdateNotification || n is ScrollEndNotification) {
+      _goingUp = true;
+    } else if (n is UserScrollNotification && n.direction == ScrollDirection.reverse) {
+      _goingUp = false;
+    } else if (_gliding) {
+      // Our own motion: still following, however far behind it is for now.
+    } else if (n is ScrollEndNotification) {
+      _goingUp = false;
+      // Behind only because following waited: that isn't the user leaving.
+      if (!_followWaiting || !_pinned) _pinned = _atBottom();
+      // The activity that ended is still being replaced.
+      scheduleMicrotask(() {
+        if (mounted) _resumeFollow();
+      });
+    } else if (n is ScrollUpdateNotification && !_goingUp && !_followWaiting) {
       _pinned = _atBottom();
     }
     // Show only after leaving the bottom area; once shown, keep it until
@@ -359,26 +649,32 @@ class _ChatListState extends ConsumerState<ChatList> {
   // ---------------------------------------------------------------------------
   // 行与分界
 
-  void _deriveRows(ChatState s, {required bool foldTurns, List<TurnArtifacts> artifacts = const []}) {
+  void _deriveRows(
+    ChatState s, {
+    required bool foldTurns,
+    List<TurnArtifacts> artifacts = const [],
+    bool compactTools = false,
+  }) {
+    final previous = _builtState;
     if (s.loading || !foldTurns) {
       _settling.clear();
-    } else {
+    } else if (_pinned && previous != null && !previous.loading && !identical(previous.turns, s.turns)) {
+      // 只在眼前这一轮结束时平滑收起；冷打开、加载历史和往上翻时直接收起。
+      final runningTurns = {
+        for (final turn in previous.turns)
+          if (turn.running) turn.startSeq,
+      };
       for (final turn in s.turns) {
-        if (turn.running || !_runningTurns.contains(turn.startSeq) || !(turn.endReason?.isCompleted ?? false)) {
-          continue;
+        if (!turn.running && runningTurns.contains(turn.startSeq) && (turn.endReason?.isCompleted ?? false)) {
+          _settling.add('tp${turn.startSeq}');
         }
-        // 贴底看着的一轮:先按原样画一帧,再平滑收成摘要。往上翻着看的
-        // 不播动画,直接收 —— 过程一律收起来,不再有"读过就不收"。
-        if (_pinned) _settling.add('tp${turn.startSeq}');
       }
     }
-    _runningTurns = {
-      if (!s.loading)
-        for (final turn in s.turns)
-          if (turn.running) turn.startSeq,
-    };
+    final changed = !identical(s, previous);
+    _builtState = s;
     final inputs = (
       foldTurns,
+      compactTools,
       artifacts,
       s.items,
       s.approvals,
@@ -389,39 +685,96 @@ class _ChatListState extends ConsumerState<ChatList> {
       s.commands,
       s.turns,
     );
-    if (_rowsInputs == inputs) return;
+    if (_rowsInputs == inputs) {
+      // Nothing the rows are made of changed, but what they read from the
+      // controller (branch points, reply ids) may have.
+      if (changed) _forgetBuiltRows();
+      return;
+    }
     _rowsInputs = inputs;
     _held = false;
     final previousLength = _rows.length;
+    final previousRows = _rows;
     final previousKeys = _index;
-    final hadPending = _rows.any((r) => r is PendingRow);
-    _rows = _rowCache.update(
-      s,
-      foldTurns: foldTurns,
-      artifacts: artifacts,
-    );
+    final previousSplit = _split;
+    final previousOldest = _oldestRowSeq;
+    _oldestRowSeq = s.items
+        .map(
+          (item) => switch (item) {
+            UserChatItem(:final seq) => seq,
+            AssistantChatItem(:final seq) => seq,
+            ToolChatItem(:final seq) => seq,
+            NoticeChatItem(:final seq) => seq,
+          },
+        )
+        .whereType<int>()
+        .firstOrNull;
+    final oldestCommand = s.commands.map((command) => command.seq).whereType<int>().firstOrNull;
+    if (oldestCommand != null) _oldestRowSeq = math.min(_oldestRowSeq ?? oldestCommand, oldestCommand);
+    // A page can restore an older turn boundary and fold existing items
+    // without adding a message or command of its own.
+    final oldestTurn = s.turns.firstOrNull?.startSeq;
+    if (oldestTurn != null) _oldestRowSeq = math.min(_oldestRowSeq ?? oldestTurn, oldestTurn);
+    final prepended = previousOldest != null && _oldestRowSeq != null && _oldestRowSeq! < previousOldest;
+    _rows = _rowCache.update(s, foldTurns: foldTurns, artifacts: artifacts, compactTools: compactTools);
     _index = _rowCache.index;
+    // Only a draft streaming on keeps the other rows' widgets: anything else
+    // may change what a row shows beyond its own item (running, pending,
+    // later items, controller lookups).
+    final draftSays = _draftHasWords(s.items);
+    final unchanged = _rowCache.unchangedPrefix;
+    if (unchanged == null || draftSays != _draftSays) {
+      _forgetBuiltRows();
+    } else if (unchanged < previousSplit) {
+      _historySliver = null;
+    }
+    _draftSays = draftSays;
     // 被插话切开的轮:前几片的摘要行(`tp<轮起点>@<插话>`)跟最后一片一起收。
     // 这一帧没建出来的(在屏幕外)不留到以后:翻回去时不该再播一遍。
-    for (final row in _rows) {
-      if (row is TurnProcessRow &&
-          row.cut != null &&
-          _settling.contains('tp${row.trace.startSeq}') &&
-          _settling.add(row.key)) {
-        final key = row.key;
-        _afterFrame(() => _settling.remove(key));
+    if (_settling.isNotEmpty) {
+      for (final row in _rows) {
+        if (row is TurnProcessRow &&
+            row.cut != null &&
+            _settling.contains('tp${row.trace.startSeq}') &&
+            _settling.add(row.key)) {
+          final key = row.key;
+          _afterFrame(() => _settling.remove(key));
+        }
       }
+      _settling.removeWhere((key) => !_index.containsKey(key));
     }
-    _settling.removeWhere((key) => !_index.containsKey(key));
     _autoAnswered = s.autoAnswered;
-    _markFresh(previousKeys, hadPending: hadPending, loading: s.loading);
+    if (!identical(previousKeys, _index)) {
+      _markFresh(previousKeys, hadPending: previousRows.any((row) => row is PendingRow), loading: s.loading);
+    }
 
     if (s.pending.length > _lastPendingCount) {
       // 自己刚发了消息:无论之前翻到哪,都回到底部。
       _pinned = true;
+      _goingUp = false;
+      _followNow = true;
       _afterFrame(() => _hasNew.value = false);
     }
     _lastPendingCount = s.pending.length;
+
+    if (!s.loading && _splitChosen && prepended) {
+      // Restoring turn metadata can also change rows after a valid center.
+      // Capture them using the previous split; keep that center if it survives.
+      if (!_pinned) _rememberPrependAnchor(previousRows, previousSplit);
+      for (final row in _rows.whereType<TurnFootnoteRow>()) {
+        // This restored footnote is history, not a new row that should grow in.
+        if (row.trace.startSeq < previousOldest) _fresh.remove(row.key);
+      }
+      final first = previousRows.skip(previousSplit).where((row) => _index.containsKey(row.key)).firstOrNull;
+      if (first case AssistantRow(:final key)) {
+        // Prepending can change the gap before the first surviving forward
+        // row. Lay out that history change with the prepend correction.
+        _snapPaddingKey = key;
+        _afterFrame(() {
+          if (_snapPaddingKey == key) _snapPaddingKey = null;
+        });
+      }
+    }
 
     if (s.loading) {
       // (重新)加载中:等首个快照到了再定分界,别把整段历史放进 after 段。
@@ -429,12 +782,23 @@ class _ChatListState extends ConsumerState<ChatList> {
       _splitKey = null;
     } else if (!_splitChosen) {
       _splitChosen = true;
-      _splitKey = _lastStableKey();
+      _splitKey = _lastStableKey(beforeSeq: s.runningTurn?.startSeq);
+      _snapNext = true;
+    } else if (_splitKey == null && prepended) {
+      // A partial window can have no stable row before its running turn.
+      // Reselect only from newly loaded history, never from the old forward
+      // segment when completion removes the running-turn cutoff.
+      _splitKey = _lastStableKey(beforeSeq: math.min(previousOldest, s.runningTurn?.startSeq ?? previousOldest));
+      for (var i = 0; i < _split; i++) {
+        _fresh.remove(_rows[i].key);
+      }
     } else if (_splitKey != null && !_index.containsKey(_splitKey)) {
       // 锚点行被替换(重新同步后结构变了):重新分界,贴底时跟上。
       final folded = _rows.whereType<TurnProcessRow>().where((row) => row.rows.any((child) => child.key == _splitKey));
-      _splitKey = folded.isEmpty ? _lastStableKey() : folded.first.key;
+      _splitKey = folded.isEmpty ? _lastStableKey(beforeSeq: s.runningTurn?.startSeq) : folded.first.key;
     }
+
+    if (_split != previousSplit) _historySliver = null;
 
     if (uiTraceEnabled) {
       uiTrace('chat-list', 'rows', {
@@ -457,6 +821,21 @@ class _ChatListState extends ConsumerState<ChatList> {
     } else if (_rows.length != previousLength || s.running) {
       _afterFrame(() => _hasNew.value = true);
     }
+  }
+
+  /// Drafts trail the list (no seq yet).
+  static bool _draftHasWords(List<ChatItem> items) {
+    for (var i = items.length - 1; i >= 0; i--) {
+      switch (items[i]) {
+        case AssistantChatItem(seq: null, :final text) when text.trimLeft().isNotEmpty:
+          return true;
+        case AssistantChatItem(seq: null) || ToolChatItem(seq: null):
+          continue;
+        default:
+          return false;
+      }
+    }
+    return false;
   }
 
   /// 这次派生里新出现的行,哪些要淡入上移。
@@ -497,9 +876,26 @@ class _ChatListState extends ConsumerState<ChatList> {
     });
   }
 
-  String? _lastStableKey() {
+  String? _lastStableKey({int? beforeSeq}) {
     for (var i = _rows.length - 1; i >= 0; i--) {
-      if (_rows[i].stable) return _rows[i].key;
+      final row = _rows[i];
+      if (!row.stable) continue;
+      // A durable message in the running turn can still be folded away.
+      // Keep the whole turn after the center, including steering pieces,
+      // so its completion cannot move the history the person is reading.
+      if (beforeSeq != null) {
+        final seq = switch (row) {
+          UserRow(:final item) => item.seq,
+          AssistantRow(:final item) => item.seq,
+          NoticeRowData(:final item) => item.seq,
+          TurnProcessRow(:final trace) => trace.endSeq,
+          TurnFootnoteRow(:final trace) => trace.endSeq,
+          CommandNoticeRow(:final notice) => notice.seq,
+          _ => null,
+        };
+        if (seq == null || seq >= beforeSeq) continue;
+      }
+      return row.key;
     }
     return null;
   }
@@ -511,19 +907,94 @@ class _ChatListState extends ConsumerState<ChatList> {
     return i == null ? 0 : i + 1;
   }
 
+  Iterable<({String key, RenderBox body, double offset})> _laidOutForwardRows(List<ChatRow> rows, int split) sync* {
+    final sliver = _centerKey.currentContext?.findRenderObject();
+    if (sliver is! RenderSliverMultiBoxAdaptor) return;
+    for (RenderBox? child = sliver.firstChild; child != null; child = sliver.childAfter(child)) {
+      final data = child.parentData! as SliverMultiBoxAdaptorParentData;
+      final index = data.index;
+      if (index == null || data.layoutOffset == null) continue;
+      final at = split + index;
+      if (at < 0 || at >= rows.length) continue;
+      // _buildRow's outer Padding owns the inter-message gap. Anchor its
+      // child so a newly inserted leading gap cannot move the read text.
+      RenderBox? box = child;
+      while (box != null && box is! RenderPadding) {
+        box = switch (box) {
+          RenderProxyBox(:final child) || RenderShiftedBox(:final child) => child,
+          _ => null,
+        };
+      }
+      if (box case RenderPadding(child: final body?) when body.hasSize) {
+        // A sliver coordinate excludes scroll motion and viewport resizing.
+        // It remains valid when a prepend arrives during a drag or fling.
+        yield (
+          key: rows[at].key,
+          body: body,
+          offset: data.layoutOffset! + body.localToGlobal(Offset.zero, ancestor: child).dy,
+        );
+      }
+    }
+  }
+
+  void _rememberPrependAnchor(List<ChatRow> previousRows, int previousSplit) {
+    for (final row in _laidOutForwardRows(previousRows, previousSplit)) {
+      if (!_index.containsKey(row.key)) continue;
+      final viewport = RenderAbstractViewport.of(row.body);
+      final top = row.body.localToGlobal(Offset.zero, ancestor: viewport).dy;
+      if (top + row.body.size.height <= widget.topInset || top >= (_lastViewport ?? 0) - widget.bottomInset) continue;
+      _prependAnchor = (key: row.key, offset: row.offset);
+      return;
+    }
+  }
+
+  double _prependCorrection() {
+    final anchor = _prependAnchor;
+    _prependAnchor = null;
+    if (anchor == null) return 0;
+    for (final row in _laidOutForwardRows(_rows, _split)) {
+      if (row.key == anchor.key) return row.offset - anchor.offset;
+    }
+    return 0;
+  }
+
   // ---------------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
     final s = ref.watch(chatProvider(widget.sessionId));
     _running = s.running;
+    // Her conversation reads as talk: marks out, what she used folded away.
+    _hers = ref.watch(companionSessionFilterProvider)(ref.watch(activeHostProvider), widget.sessionId);
     _deriveRows(
       s,
-      foldTurns: ref.watch(settingsProvider.select((s) => s.foldCompletedTurns)),
+      foldTurns: _hers || ref.watch(settingsProvider.select((s) => s.foldCompletedTurns)),
       artifacts: ref.watch(sessionArtifactsProvider(widget.sessionId)),
+      compactTools: _hers,
     );
     final rows = _rows;
     final split = _split;
+    _fluid = AppMotion.fluid(context);
+    final motion = AppMotion.of(context, AppMotion.quick);
+    // A language switch rebuilds every element (app.dart) without an
+    // inherited change; rows hold [appL10n] strings in their arguments.
+    final locale = AppLocale.current;
+    final themeStyle = DshThemeStyle.of(context);
+    final shapes = themeStyle.shapes;
+    final divider = themeStyle.components.turnDivider;
+    final dividerColor = divider == ThemeTurnDivider.none ? null : Theme.of(context).colorScheme.outlineVariant;
+    if (motion != _builtMotion ||
+        locale != _builtLocale ||
+        shapes != _builtShapes ||
+        divider != _builtDivider ||
+        dividerColor != _builtDividerColor) {
+      _builtMotion = motion;
+      _builtLocale = locale;
+      _builtShapes = shapes;
+      _builtDivider = divider;
+      _builtDividerColor = dividerColor;
+      _forgetBuiltRows();
+    }
 
     // Images in replies read this conversation's workspace.
     final headroom = ref.watch(petHeadroomProvider);
@@ -542,17 +1013,35 @@ class _ChatListState extends ConsumerState<ChatList> {
           if (_lastViewport != null && _lastViewport != viewport && _pinned) {
             _follow();
           }
-          _lastViewport = viewport;
           // The chat page's pet stands over the composer: the last line
           // stops clear of it (0 without a pet).
           final bottomPad = widget.bottomInset + AppSpace.sm + headroom;
           final anchor = viewport <= 0 ? 1.0 : ((viewport - bottomPad) / viewport).clamp(0.0, 1.0);
-          _anchorPixels = viewport * anchor;
+          final anchorPixels = viewport * anchor;
+          if (_lastViewport != null && !_pinned && _scroll.hasClients) {
+            // The composer can shrink when a turn ends. Preserve the same
+            // visible history as its bottom-anchored viewport grows, without
+            // ending a drag or fling with jumpTo.
+            final shift = anchorPixels - _anchorPixels;
+            if (shift != 0) _scroll.position.correctBy(shift);
+          }
+          _lastViewport = viewport;
+          _anchorPixels = anchorPixels;
 
           return Stack(
             children: [
               Listener(
-                onPointerDown: (_) => _held = true,
+                onPointerDown: (_) {
+                  _fingers++;
+                  // The list stops where it is, under the finger.
+                  if (_gliding) {
+                    _stopGlide();
+                    _followWaiting = true;
+                  }
+                  _held = true;
+                },
+                onPointerUp: (_) => _onFingerUp(),
+                onPointerCancel: (_) => _onFingerUp(),
                 child: NotificationListener<ScrollMetricsNotification>(
                   onNotification: _onMetrics,
                   child: NotificationListener<ScrollNotification>(
@@ -565,7 +1054,7 @@ class _ChatListState extends ConsumerState<ChatList> {
                       scrollBehavior: ScrollConfiguration.of(context).copyWith(overscroll: false),
                       center: _centerKey,
                       anchor: anchor,
-                      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.manual,
                       slivers: [
                         SliverToBoxAdapter(child: SizedBox(height: widget.topInset + AppSpace.sm)),
                         SliverToBoxAdapter(
@@ -575,7 +1064,7 @@ class _ChatListState extends ConsumerState<ChatList> {
                             hasMore: s.hasMoreHistory,
                           ),
                         ),
-                        SliverList(
+                        _historySliver ??= SliverList(
                           key: _beforeKey,
                           delegate: SliverChildBuilderDelegate(
                             (context, i) => _buildRow(split - 1 - i),
@@ -608,17 +1097,7 @@ class _ChatListState extends ConsumerState<ChatList> {
               Positioned(
                 right: math.max(0.0, (constraints.maxWidth - AppSpace.readingWidth) / 2) + AppSpace.floatInset,
                 bottom: widget.bottomInset + 12,
-                // The pet keeps out of the key's way while it shows.
-                child: ValueListenableBuilder<bool>(
-                  valueListenable: _showJump,
-                  builder: (context, visible, child) => PetAvoid(active: visible, child: child!),
-                  child: _JumpToBottom(
-                    visible: _showJump,
-                    hasNew: _hasNew,
-                    waiting: s.questions.length + s.approvals.where((a) => !s.autoAnswered.contains(a.eventId)).length,
-                    onTap: jumpToBottom,
-                  ),
-                ),
+                child: _jumpButton(s),
               ),
             ],
           );
@@ -630,28 +1109,68 @@ class _ChatListState extends ConsumerState<ChatList> {
   Widget _buildRow(int index) {
     final row = _rows[index];
     final previous = index > 0 ? _rows[index - 1] : null;
+    final gap = _gapBefore(row, previous, _builtShapes);
+    final divided = _builtDivider != ThemeTurnDivider.none && previous != null && _isUser(row) && !_isUser(previous);
     final fresh = _fresh.remove(row.key);
+    // A row's first appearance (fade in, settle) plays once: that build is
+    // not kept, or scrolling back to the row would play it again.
+    if (fresh != null || _settling.contains(row.key)) {
+      if (index < _split) _historySliver = null;
+      _built.remove(row.key);
+      return _rowFrame(row, gap, fresh, divided);
+    }
+    final built = _built[row.key];
+    if (built != null && identical(built.row, row) && built.gap == gap && built.divided == divided) {
+      return built.widget;
+    }
+    final frame = _rowFrame(row, gap, null, divided);
+    _built[row.key] = (row: row, gap: gap, divided: divided, widget: frame);
+    return frame;
+  }
+
+  Widget _rowFrame(ChatRow row, double gap, int? fresh, [bool divided = false]) {
+    final gutter = _builtShapes.gutter;
+    final padding = EdgeInsets.fromLTRB(gutter, gap, gutter, 0);
+    final body = StreamFadeIn(
+      enabled: fresh != null,
+      index: fresh ?? 0,
+      rise: row is UserRow || row is PendingRow,
+      child: _rowWidget(row),
+    );
     return KeyedSubtree(
       key: ValueKey<String>(row.key),
       child: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: AppSpace.readingWidth),
           // 撑满阅读宽度:否则短行(用户气泡、提示行)会被 Center 居中。
-          child: Container(
-            width: double.infinity,
-            padding: EdgeInsets.fromLTRB(AppSpace.gutter, _gapBefore(row, previous), AppSpace.gutter, 0),
-            child: StreamFadeIn(enabled: fresh != null, index: fresh ?? 0, child: _rowWidget(row)),
-          ),
+          child: row is AssistantRow
+              // 等待和思考算过程行,正文不算:接上正文时间距缓缓让开,回复不跳。
+              ? AnimatedPadding(
+                  duration: row.key == _snapPaddingKey ? Duration.zero : AppMotion.of(context, AppMotion.quick),
+                  curve: AppMotion.std,
+                  padding: padding,
+                  child: SizedBox(width: double.infinity, child: body),
+                )
+              : Container(
+                  width: double.infinity,
+                  padding: padding,
+                  // Painted over the gap this row already has: its height stays.
+                  foregroundDecoration: divided
+                      ? _TurnDividerDecoration(_builtDivider, _builtDividerColor!, gap, gutter)
+                      : null,
+                  child: body,
+                ),
         ),
       ),
     );
   }
 
-  /// 过程行:工具、工具组、只有思考的回复、斜杠指令、非错误提示。
+  /// 过程行:工具、工具组、只有思考的回复(或还在等第一个字:接上来多半是思考,
+  /// 间距先按它算,交接时不跳)、斜杠指令、非错误提示。
   /// 它们自带上下 4 的留白,彼此之间不再加间距(图形块之间正好 8)。
   static bool _isProcess(ChatRow? row) => switch (row) {
     ToolCallRow() || ToolGroupRow() || CommandNoticeRow() => true,
-    AssistantRow(:final item) => item.text.trim().isEmpty && item.reasoning.trim().isNotEmpty,
+    AssistantRow(:final item) => item.text.trimLeft().isEmpty && (item.reasoning.trim().isNotEmpty || item.streaming),
     NoticeRowData(:final item) => item.kind != 'error',
     _ => false,
   };
@@ -661,23 +1180,24 @@ class _ChatListState extends ConsumerState<ChatList> {
     _ => false,
   };
 
-  /// 换轮 24、同一轮 8、相邻过程行 0、卡片 12、脚注 4(全是 4 的倍数)。
-  static double _gapBefore(ChatRow row, ChatRow? previous) {
+  /// 换轮 24、同一轮 8、相邻过程行 0、卡片 12、脚注 4(全是 4 的倍数),
+  /// 启用主题包时遵循主题声明的 [ThemeShapeSpec.turnGap] 与 [ThemeShapeSpec.inTurnGap]。
+  static double _gapBefore(ChatRow row, ChatRow? previous, [ThemeShapeSpec shapes = const ThemeShapeSpec()]) {
     if (previous == null) return 0;
-    if (_isUser(row)) return _isUser(previous) ? AppSpace.sm : AppSpace.xxl;
+    if (_isUser(row)) return _isUser(previous) ? shapes.inTurnGap : shapes.turnGap;
     if (_isProcess(row) && _isProcess(previous)) return 0;
     if (row is ApprovalRow || row is QuestionRow || row is ChangeCardRow || row is ArtifactCardRow) {
       return AppSpace.md;
     }
     if (row is TurnFootnoteRow) return AppSpace.xs;
-    return AppSpace.sm;
+    return shapes.inTurnGap;
   }
 
   Widget _pendingBubble(PendingPrompt prompt) {
     if (prompt.isBackgroundTask) {
       return BackgroundTaskNotice(key: ValueKey((widget.sessionId, prompt.requestId, prompt.inboxId)), prompt: prompt);
     }
-    if (dshUiReplyChip(prompt.text) case final label?) {
+    if (dshUiReplyChip(prompt.text) case final label? when !prompt.failed) {
       return DshUiReplyChip(label: label, pending: true);
     }
     final chat = ref.read(chatProvider(widget.sessionId).notifier);
@@ -694,11 +1214,12 @@ class _ChatListState extends ConsumerState<ChatList> {
     };
     final canAct = prompt.inboxId != null;
     return UserBubble(
-      text: prompt.text,
+      text: withoutAppNotes(prompt.text),
       attachments: prompt.attachments.isEmpty ? null : SentAttachments.pending(prompt.attachments),
-      pendingLabel: label,
-      pendingIcon: icon,
+      pendingLabel: prompt.failed ? appL10n.chatFailedSubmission : label,
+      pendingIcon: prompt.failed ? AppIcons.error : icon,
       pendingActions: [
+        if (prompt.failed && prompt.resendable) (appL10n.chatEditFailedSubmission, () => _editFailedSubmission(prompt)),
         if (canAct && prompt.resendable && widget.onSendNow != null)
           (_running ? appL10n.chatSendNow : appL10n.commonSend, () => widget.onSendNow!(prompt)),
         if (canAct && _running && prompt.slot == InboxSlot.nextTurn)
@@ -708,13 +1229,76 @@ class _ChatListState extends ConsumerState<ChatList> {
     );
   }
 
+  Future<void> _editFailedSubmission(PendingPrompt prompt) async {
+    final sessionId = widget.sessionId;
+    final client = ref.read(activeConnectionProvider).value?.client;
+    final generation = client?.mux.generation;
+    final readyNumber = client?.mux.lastReadyGenerationNumber;
+    var retired = false;
+    final connection = ref.listenManual(activeConnectionProvider.select((c) => c.value?.client), (_, next) {
+      if (!identical(next, client)) retired = true;
+    });
+    var text = withoutAppNotes(prompt.text);
+    try {
+      final edited = await showAppDialog<String>(
+        context: context,
+        builder: (dialog) => AlertDialog(
+          title: Text(appL10n.chatEditFailedSubmission),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextFormField(
+                  initialValue: text,
+                  onChanged: (value) => text = value,
+                  autofocus: true,
+                  minLines: 2,
+                  maxLines: 8,
+                ),
+                if (prompt.attachments.isNotEmpty) SentAttachments.pending(prompt.attachments),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(dialog), child: Text(appL10n.commonCancel)),
+            TextButton(onPressed: () => Navigator.pop(dialog, text), child: Text(appL10n.commonSend)),
+          ],
+        ),
+      );
+      if (edited == null ||
+          !mounted ||
+          retired ||
+          widget.sessionId != sessionId ||
+          !identical(ref.read(activeConnectionProvider).value?.client, client) ||
+          !identical(client?.mux.generation, generation) ||
+          client?.mux.lastReadyGenerationNumber != readyNumber) {
+        return;
+      }
+      // Emptied: as before, nothing to send (the notes alone are not a message).
+      final retry = edited.trim().isEmpty ? edited : withAppNotesOf(prompt.text, edited);
+      await ref.read(chatProvider(sessionId).notifier).retryFailed(prompt, retry);
+    } finally {
+      connection.close();
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // 消息操作:分叉打开的是一个新对话,原对话不动。
 
+  /// This is the companion's conversation (伙伴小屋).
+  bool _hers = false;
+
   Widget _reply(AssistantChatItem item, bool showActions, TurnTrace? footnote) {
+    // Her expression and action marks move her in the room; here they are not words.
+    if (_hers && companionHasMarks(item.text, streaming: item.streaming)) {
+      item = replyWithText(item, companionWithoutMarks(item.text, streaming: item.streaming));
+    }
     // A picture a media card shows is not drawn again in the reply.
-    if (withoutShownImages(item.text, ref.read(sessionMediaPathsProvider(widget.sessionId))) case final text?) {
-      item = replyWithText(item, text);
+    if (item.text.contains('![')) {
+      if (withoutShownImages(item.text, ref.read(sessionMediaPathsProvider(widget.sessionId))) case final text?) {
+        item = replyWithText(item, text);
+      }
     }
     final chat = ref.read(chatProvider(widget.sessionId).notifier);
     final branchable = chat.branchPointAfter(item) != null;
@@ -729,7 +1313,7 @@ class _ChatListState extends ConsumerState<ChatList> {
       branching: _forkingId == item.id,
       onRegenerate: prompt == null ? null : () => _regenerate(item, prompt),
       regenerating: _regeneratingId == item.id,
-      onQuote: widget.onQuote,
+      onQuote: widget.onQuote == null ? null : _quote,
       footnote: footnote == null ? null : _footnote(footnote),
     );
     // Always in a scope, so a reply that grows a visual block keeps its
@@ -739,7 +1323,7 @@ class _ChatListState extends ConsumerState<ChatList> {
     return DshUiScope(
       sessionId: widget.sessionId,
       messageId: item.id,
-      state: !item.text.contains('dsh-ui')
+      state: !item.text.contains('dsh-ui') && !item.text.contains('{')
           ? DshUiState.expired
           : dshUiStateFor(
               items: s.items,
@@ -753,21 +1337,24 @@ class _ChatListState extends ConsumerState<ChatList> {
     );
   }
 
-  Widget _footnote(TurnTrace trace) => TurnFootnote(
-    trace: trace,
-    onTap: () => showTrajectorySheet(context, sessionId: widget.sessionId, turn: trace.turn),
+  Widget _footnote(TurnTrace trace) => Consumer(
+    builder: (context, ref, _) => TurnFootnote(
+      trace: trace,
+      notes: ref.watch(nativeTurnNoteProvider((widget.sessionId, trace.turn))),
+      onTap: () => showTrajectorySheet(context, sessionId: widget.sessionId, turn: trace.turn),
+    ),
   );
 
   Future<void> _branch(AssistantChatItem item) async {
     if (_forkingId != null || _regeneratingId != null) return;
-    setState(() => _forkingId = item.id);
+    _clearBuiltRows(() => _forkingId = item.id);
     try {
       final messenger = ScaffoldMessenger.maybeOf(context);
       final outcome = await ref.read(chatProvider(widget.sessionId).notifier).branchAfter(item);
       if (outcome == null || !mounted) return;
       _openFork(outcome, messenger, appL10n.chatContinuedInNewChat);
     } finally {
-      if (mounted) setState(() => _forkingId = null);
+      if (mounted) _clearBuiltRows(() => _forkingId = null);
     }
   }
 
@@ -796,7 +1383,7 @@ class _ChatListState extends ConsumerState<ChatList> {
         identical(ref.read(activeConnectionProvider).value?.client, client) &&
         identical(client?.mux.generation, generation) &&
         client?.mux.lastReadyGenerationNumber == readyGeneration;
-    setState(() => _regeneratingId = item.id);
+    _clearBuiltRows(() => _regeneratingId = item.id);
     try {
       final messenger = ScaffoldMessenger.maybeOf(context);
       final chat = ref.read(chatProvider(sessionId).notifier);
@@ -815,7 +1402,7 @@ class _ChatListState extends ConsumerState<ChatList> {
       unawaited(resend(outcome.sessionId, prompt.text, images));
     } finally {
       connection.close();
-      if (mounted) setState(() => _regeneratingId = null);
+      if (mounted) _clearBuiltRows(() => _regeneratingId = null);
     }
   }
 
@@ -826,7 +1413,7 @@ class _ChatListState extends ConsumerState<ChatList> {
     if (outcome == null || !mounted) return;
     final attached = item.images.isNotEmpty || item.files.isNotEmpty;
     _openFork(outcome, messenger, attached ? appL10n.chatOpenedInNewChatReattach : appL10n.chatOpenedInNewChat);
-    compose?.call(item.text);
+    compose?.call(withoutAppNotes(item.text));
   }
 
   /// Switches to the fork; the toast offers the way back.
@@ -861,12 +1448,12 @@ class _ChatListState extends ConsumerState<ChatList> {
   /// 对话停在出错、被打断或输出到上限的一轮上:提示行尾给一个「重试」
   /// (这一轮什么都还没做、问的是纯文字,原样再发)或「继续」。
   /// 引擎拒绝这个模型时给去处:本机引擎太旧就「检查更新」(引擎随 App
-  /// 更新),其余「换模型」。
+  /// 更新),其余「换模型」。上下文超限也先换模型,不原样重发。
   NoticeAction? _noticeAction(NoticeChatItem notice) {
     final s = ref.read(chatProvider(widget.sessionId));
-    if (s.running || s.pending.isNotEmpty) return null;
+    if (s.running) return null;
     final code = notice.failure?.code ?? '';
-    final refused = notice.kind == 'error' && modelRefusalCodes.contains(code);
+    final refused = notice.kind == 'error' && (modelRefusalCodes.contains(code) || code == 'CONTEXT_WINDOW_EXCEEDED');
     final repeatable = switch (notice.kind) {
       // 换个说法、再发一次都没用的:Key、余额、账号额度、模型本身用不了。
       'error' =>
@@ -880,16 +1467,21 @@ class _ChatListState extends ConsumerState<ChatList> {
       return null;
     }
     if (refused) {
-      if (code == 'CLIENT_UPGRADE_REQUIRED' && ref.read(activeHostProvider).kind == HostKind.local) {
+      if (code == 'CLIENT_UPGRADE_REQUIRED' && !wordsForIos && ref.read(activeHostProvider).kind == HostKind.local) {
         return (label: appL10n.updateCheck, onPressed: () => checkForUpdates(context, ref));
       }
-      final switchModel = widget.onSwitchModel;
-      return switchModel == null ? null : (label: appL10n.chatSwitchModel, onPressed: switchModel);
+      return widget.onSwitchModel == null ? null : (label: appL10n.chatSwitchModel, onPressed: _switchModel);
     }
+    if (s.pending.isNotEmpty) return null;
+    final turn = s.turns.where((turn) => turn.endSeq == notice.seq).firstOrNull;
+    if (turn == null) return null;
     UserChatItem? prompt;
     var worked = false;
     for (var i = at - 1; i >= 0 && prompt == null; i--) {
-      switch (s.items[i]) {
+      final item = s.items[i];
+      if (item is NoticeChatItem && item.kind != 'retry') break;
+      if (item is UserChatItem && item.seq < turn.startSeq) break;
+      switch (item) {
         case final UserChatItem item:
           prompt = item;
         case ToolChatItem():
@@ -900,10 +1492,10 @@ class _ChatListState extends ConsumerState<ChatList> {
           break;
       }
     }
+    if (prompt == null) return null;
     final chat = ref.read(chatProvider(widget.sessionId).notifier);
     if (notice.kind == 'error' &&
         !worked &&
-        prompt != null &&
         prompt.images.isEmpty &&
         prompt.files.isEmpty &&
         prompt.text.trim().isNotEmpty) {
@@ -914,14 +1506,43 @@ class _ChatListState extends ConsumerState<ChatList> {
   }
 
   Widget _rowWidget(ChatRow row) {
+    final (seq, messageKey) = switch (row) {
+      AssistantRow(:final item) => (item.seq, item.rowKey),
+      ToolCallRow(:final item) => (item.seq, null),
+      ToolGroupRow(:final tools) => (tools.first.seq, null),
+      _ => (null, null),
+    };
+    // The stable message key carries its turn even in a partial history page.
+    final match = messageKey == null ? null : RegExp(r'^m([0-9]+)[.]').firstMatch(messageKey);
+    int? turn = match == null ? null : int.tryParse(match.group(1)!);
+    if (turn == null && seq != null) {
+      for (final trace in ref.read(chatProvider(widget.sessionId)).turns.reversed) {
+        if (seq > trace.startSeq && (trace.endSeq == null || seq < trace.endSeq!)) {
+          turn = trace.turn;
+          break;
+        }
+      }
+    }
+    final body = _rowContent(row);
+    if (turn == null) return body;
+    // A row must not start the global sessions watcher just to supply an image base.
+    final knownSessions = ref.exists(sessionsProvider) ? ref.read(sessionsProvider).value : null;
+    final cwd =
+        ref.read(chatProvider(widget.sessionId).notifier).header?.cwd ??
+        knownSessions?.where((session) => session.sessionId == widget.sessionId).firstOrNull?.cwd;
+    return MarkdownImageScope(sessionId: widget.sessionId, baseDir: cwd, turn: turn, child: body);
+  }
+
+  Widget _rowContent(ChatRow row) {
     return switch (row) {
       UserRow(:final item) when dshUiReplyChip(item.text) != null => DshUiReplyChip(label: dshUiReplyChip(item.text)!),
       UserRow(:final item) => UserBubble(
-        text: item.text,
+        text: withoutAppNotes(item.text),
         attachments: item.images.isEmpty && item.files.isEmpty
             ? null
             : SentAttachments.echoed(sessionId: widget.sessionId, images: item.images, files: item.files),
         onEdit: widget.onEditPrompt == null ? null : () => _editPrompt(item),
+        onQuote: widget.onQuote == null ? null : _quote,
       ),
       PendingRow(:final prompt) => _pendingBubble(prompt),
       AssistantRow(:final item, :final showActions, :final footnote) => _reply(item, showActions, footnote),
@@ -949,15 +1570,51 @@ class _ChatListState extends ConsumerState<ChatList> {
         row: row,
         settle: _settling.remove(row.key),
         buildRow: _rowWidget,
-        gapBefore: _gapBefore,
+        gapBefore: (r, prev) => _gapBefore(r, prev, _builtShapes),
       ),
       NoticeRowData(:final item) => NoticeRow(item: item, action: _noticeAction(item)),
       ChangeCardRow(:final files) => ChangeCard(files: files),
       ArtifactCardRow(:final group) => ArtifactCard(sessionId: widget.sessionId, group: group),
       CommandNoticeRow(:final notice) => CommandRow(notice: notice),
       ApprovalRow(:final request) => ApprovalCard(request: request, onRespond: _respond, onAllowAll: _allowAll),
-      QuestionRow(:final request) => QuestionCard(request: request, onAnswer: _answer, onReject: _rejectQuestion),
+      QuestionRow(:final request) => _InlineEditorReveal(
+        onShow: _revealInlineEditor,
+        child: QuestionCard(request: request, onAnswer: _answer, onReject: _rejectQuestion),
+      ),
     };
+  }
+}
+
+/// Intercept only the focused question editor's original reveal request,
+/// before the centered scroll view can misclassify it as already visible.
+class _InlineEditorReveal extends SingleChildRenderObjectWidget {
+  const _InlineEditorReveal({required this.onShow, required super.child});
+
+  final bool Function(RenderObject, Rect?, Duration, Curve) onShow;
+
+  @override
+  RenderObject createRenderObject(BuildContext context) => _RenderInlineEditorReveal(onShow);
+
+  @override
+  void updateRenderObject(BuildContext context, _RenderInlineEditorReveal renderObject) {
+    renderObject.onShow = onShow;
+  }
+}
+
+class _RenderInlineEditorReveal extends RenderProxyBox {
+  _RenderInlineEditorReveal(this.onShow);
+
+  bool Function(RenderObject, Rect?, Duration, Curve) onShow;
+
+  @override
+  void showOnScreen({
+    RenderObject? descendant,
+    Rect? rect,
+    Duration duration = Duration.zero,
+    Curve curve = Curves.ease,
+  }) {
+    if (descendant != null && onShow(descendant, rect, duration, curve)) return;
+    super.showOnScreen(descendant: descendant, rect: rect, duration: duration, curve: curve);
   }
 }
 
@@ -1005,6 +1662,7 @@ class _JumpToBottom extends StatelessWidget {
     final colors = theme.colorScheme;
     final dsh = DshColors.of(context);
     final quick = AppMotion.of(context, AppMotion.quick);
+    final fluid = AppMotion.fluid(context);
 
     final pill = GlassSurface(
       key: const ValueKey('waiting'),
@@ -1054,8 +1712,8 @@ class _JumpToBottom extends StatelessWidget {
               valueListenable: hasNew,
               builder: (context, fresh, _) => AnimatedScale(
                 scale: fresh ? 1 : 0,
-                duration: quick,
-                curve: AppMotion.std,
+                duration: fluid && fresh ? AppMotion.popCurve.duration : quick,
+                curve: fluid && fresh ? AppMotion.popCurve : AppMotion.std,
                 child: Container(
                   width: 9,
                   height: 9,
@@ -1074,25 +1732,28 @@ class _JumpToBottom extends StatelessWidget {
 
     return ValueListenableBuilder<bool>(
       valueListenable: visible,
-      builder: (context, show, _) => IgnorePointer(
-        ignoring: !show,
-        child: AnimatedScale(
-          scale: show ? 1 : 0.8,
-          duration: quick,
-          curve: AppMotion.enter,
-          child: AnimatedOpacity(
-            opacity: show ? 1 : 0,
-            duration: quick,
-            child: Semantics(
-              button: true,
-              label: waiting > 0 ? l10n.chatWaitingBackToBottom(waiting) : l10n.chatBackToBottom,
-              excludeSemantics: true,
-              onTap: onTap,
-              child: AnimatedSwitcher(
-                duration: quick,
-                layoutBuilder: (current, previous) =>
-                    Stack(alignment: Alignment.centerRight, children: [...previous, ?current]),
-                child: waiting > 0 ? pill : circle,
+      builder: (context, show, _) => PetAvoid(
+        active: show,
+        child: IgnorePointer(
+          ignoring: !show,
+          child: AnimatedScale(
+            scale: show ? 1 : (fluid ? 0.6 : 0.8),
+            duration: fluid && show ? AppMotion.popCurve.duration : quick,
+            curve: fluid && show ? AppMotion.popCurve : AppMotion.enter,
+            child: AnimatedOpacity(
+              opacity: show ? 1 : 0,
+              duration: quick,
+              child: Semantics(
+                button: true,
+                label: waiting > 0 ? l10n.chatWaitingBackToBottom(waiting) : l10n.chatBackToBottom,
+                excludeSemantics: true,
+                onTap: onTap,
+                child: AnimatedSwitcher(
+                  duration: quick,
+                  layoutBuilder: (current, previous) =>
+                      Stack(alignment: Alignment.centerRight, children: [...previous, ?current]),
+                  child: waiting > 0 ? pill : circle,
+                ),
               ),
             ),
           ),
@@ -1109,12 +1770,17 @@ class _JumpToBottom extends StatelessWidget {
 /// 且上一帧刚 `jumpTo` 过就不夹:那一帧末尾露出一道缝,再由回弹动画收回,
 /// 看起来像被往上推了一下。
 class _FollowPhysics extends ScrollPhysics {
-  const _FollowPhysics(this.follows, {super.parent});
+  const _FollowPhysics(this.follows, {required this.glides, super.parent});
 
   final bool Function() follows;
 
+  /// A taller list is left for the glide to catch up with. Shorter still lands at once:
+  /// a gap at the bottom can't wait.
+  final bool Function() glides;
+
   @override
-  _FollowPhysics applyTo(ScrollPhysics? ancestor) => _FollowPhysics(follows, parent: buildParent(ancestor));
+  _FollowPhysics applyTo(ScrollPhysics? ancestor) =>
+      _FollowPhysics(follows, glides: glides, parent: buildParent(ancestor));
 
   @override
   double adjustPositionForNewDimensions({
@@ -1132,7 +1798,8 @@ class _FollowPhysics extends ScrollPhysics {
     if (isScrolling || velocity != 0 || !follows()) return adjusted;
     // 上一帧之后可能刚追过底(帧后 jumpTo):看当前位置,也看上次记下的。
     final at = newPosition.pixels > oldPosition.pixels ? newPosition.pixels : oldPosition.pixels;
-    if (oldPosition.maxScrollExtent - at > 1) return adjusted;
+    if (oldPosition.maxScrollExtent - at > 1 && !glides()) return adjusted;
+    if (glides() && newPosition.maxScrollExtent >= at) return adjusted;
     return newPosition.maxScrollExtent;
   }
 }
@@ -1144,14 +1811,16 @@ class _FollowPhysics extends ScrollPhysics {
 /// If all content fits, the bounds coincide and dragging cannot move it away
 /// from the top.
 class _TopBoundedScrollController extends ScrollController {
-  _TopBoundedScrollController(this.leadingBoundary);
+  _TopBoundedScrollController(this.leadingBoundary, this.prependCorrection);
 
   final double? Function() leadingBoundary;
+  final double Function() prependCorrection;
 
   @override
   ScrollPosition createScrollPosition(ScrollPhysics physics, ScrollContext context, ScrollPosition? oldPosition) =>
       _TopBoundedScrollPosition(
         leadingBoundary: leadingBoundary,
+        prependCorrection: prependCorrection,
         physics: physics,
         context: context,
         initialPixels: initialScrollOffset,
@@ -1164,6 +1833,7 @@ class _TopBoundedScrollController extends ScrollController {
 class _TopBoundedScrollPosition extends ScrollPositionWithSingleContext {
   _TopBoundedScrollPosition({
     required this.leadingBoundary,
+    required this.prependCorrection,
     required super.physics,
     required super.context,
     super.initialPixels,
@@ -1173,9 +1843,17 @@ class _TopBoundedScrollPosition extends ScrollPositionWithSingleContext {
   });
 
   final double? Function() leadingBoundary;
+  final double Function() prependCorrection;
 
   @override
   bool applyContentDimensions(double minScrollExtent, double maxScrollExtent) {
+    // The slivers now have actual geometry. Retry this layout at the same
+    // readable row, without estimating heights or ending a drag/fling.
+    final correction = prependCorrection();
+    if (correction.abs() > precisionErrorTolerance) {
+      correctBy(correction);
+      return false;
+    }
     if (minScrollExtent == 0) {
       final leading = leadingBoundary();
       if (leading != null && leading.isFinite && leading > 0) {
@@ -1190,12 +1868,82 @@ class _TopBoundedScrollPosition extends ScrollPositionWithSingleContext {
     // RangeMaintainingScrollPhysics otherwise retains an out-of-range offset
     // at nonzero velocity and springs a now-short chat back over later frames.
     if (!hasContentDimensions || minScrollExtent == maxScrollExtent) {
-      final initial = pixels.clamp(minScrollExtent, maxScrollExtent);
+      // The initial running turn can fill the forward segment: land at its
+      // end in this layout, without painting the center for one frame first.
+      final initial = hasContentDimensions ? pixels.clamp(minScrollExtent, maxScrollExtent) : maxScrollExtent;
       if (initial != pixels) {
         correctPixels(initial);
         return false;
       }
     }
     return super.applyContentDimensions(minScrollExtent, maxScrollExtent);
+  }
+}
+
+/// A tap on iOS's status bar: the framework's Scaffold asks the nearest primary scroll controller to
+/// go to 0, and this one hands that to the conversation, whose list has its own top.
+class StatusBarTop extends ScrollController {
+  VoidCallback? onTap;
+
+  @override
+  bool get hasClients => true;
+
+  @override
+  Future<void> animateTo(double offset, {required Duration duration, required Curve curve}) async => onTap?.call();
+}
+
+/// A theme pack's mark between two turns, in the middle of the gap above the
+/// turn's first message and as wide as the reading column's text.
+class _TurnDividerDecoration extends Decoration {
+  const _TurnDividerDecoration(this.style, this.color, this.gap, this.gutter);
+
+  final ThemeTurnDivider style;
+  final Color color;
+  final double gap;
+  final double gutter;
+
+  @override
+  BoxPainter createBoxPainter([VoidCallback? onChanged]) => _TurnDividerPainter(this);
+
+  @override
+  bool operator ==(Object other) =>
+      other is _TurnDividerDecoration &&
+      other.style == style &&
+      other.color == color &&
+      other.gap == gap &&
+      other.gutter == gutter;
+
+  @override
+  int get hashCode => Object.hash(style, color, gap, gutter);
+}
+
+class _TurnDividerPainter extends BoxPainter {
+  _TurnDividerPainter(this._mark);
+
+  final _TurnDividerDecoration _mark;
+
+  @override
+  void paint(Canvas canvas, Offset offset, ImageConfiguration configuration) {
+    final y = offset.dy + _mark.gap / 2;
+    final left = offset.dx + _mark.gutter;
+    final right = offset.dx + configuration.size!.width - _mark.gutter;
+    final paint = Paint()
+      ..color = _mark.color
+      ..strokeWidth = 1;
+    switch (_mark.style) {
+      case ThemeTurnDivider.none:
+        break;
+      case ThemeTurnDivider.hairline:
+        canvas.drawLine(Offset(left, y), Offset(right, y), paint);
+      case ThemeTurnDivider.dashed:
+        for (var x = left; x < right; x += 8) {
+          canvas.drawLine(Offset(x, y), Offset(math.min(x + 4, right), y), paint);
+        }
+      case ThemeTurnDivider.dots:
+        final centre = (left + right) / 2;
+        for (final dx in const [-8.0, 0.0, 8.0]) {
+          canvas.drawCircle(Offset(centre + dx, y), 1.5, paint);
+        }
+    }
   }
 }

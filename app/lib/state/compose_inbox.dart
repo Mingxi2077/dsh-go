@@ -6,6 +6,7 @@
 // ([readyComposeProvider]), switches to 新对话 and fills the composer with
 // [mergeIntoDraft]. Nothing is sent: the person reads it and adds a question.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -59,41 +60,95 @@ class ComposeRequest {
 
   /// Reads a share's files (copied into the app cache by the native side)
   /// into attachments, then deletes the copies: the bytes live in the draft.
-  static Future<ComposeRequest> fromShare(IncomingShare share, {Future<Uint8List> Function(String path)? read}) async {
-    final load = read ?? (path) => File(path).readAsBytes();
-    final attachments = <DraftAttachment>[];
-    final problems = [for (final s in share.skipped) skippedText(s)];
-    for (final file in share.files) {
-      final Uint8List bytes;
-      try {
-        bytes = await load(file.path);
-      } catch (_) {
-        problems.add(appL10n.stateShareReadFailed(file.name));
-        continue;
-      } finally {
-        if (read == null) _discard(file.path);
+  ///
+  /// [heldBytes] is what the target draft already holds and [maxBytes] is the
+  /// budget of the composer it lands in (the web page takes far less than a
+  /// chat message): both are checked before a file is read, so a share cannot
+  /// buffer bytes that the merge below would refuse anyway.
+  static Future<ComposeRequest> fromShare(
+    IncomingShare share, {
+    Future<Uint8List> Function(String path)? read,
+    int heldBytes = 0,
+    int maxBytes = maxMessageBytes,
+  }) async {
+    try {
+      final load = read ?? (path) => File(path).readAsBytes();
+      final attachments = <DraftAttachment>[];
+      final problems = [for (final s in share.skipped) skippedText(s)];
+      var used = heldBytes;
+      for (final file in share.files) {
+        // Metadata can refuse a file before it is read; content providers may
+        // omit it, so the post-read check below still applies.
+        final length = read == null ? _fileLength(file.path) : null;
+        if (length != null && used + length > maxBytes) {
+          problems.add(appL10n.stateAttachmentTotalLimit);
+          if (read == null && share.consumption == null) _discard(file.path);
+          continue;
+        }
+        final Uint8List bytes;
+        try {
+          bytes = await load(file.path);
+        } catch (_) {
+          problems.add(appL10n.stateShareReadFailed(file.name));
+          continue;
+        } finally {
+          if (read == null && share.consumption == null) _discard(file.path);
+        }
+        final attachment = DraftAttachment.sniff(file.name, bytes);
+        final problem = attachmentProblem(attachment) ?? attachmentBudgetProblem(used, attachment, limit: maxBytes);
+        if (problem != null) {
+          problems.add(problem);
+        } else {
+          attachments.add(attachment);
+          used += attachment.size;
+        }
       }
-      final attachment = DraftAttachment.sniff(file.name, bytes);
-      final problem = attachmentProblem(attachment);
-      if (problem != null) {
-        problems.add(problem);
-      } else {
-        attachments.add(attachment);
-      }
+      return ComposeRequest(text: share.composedText, attachments: attachments, problems: problems);
+    } finally {
+      final consumption = share.consumption;
+      if (consumption != null) unawaited(consumption.finish());
     }
-    return ComposeRequest(text: share.composedText, attachments: attachments, problems: problems);
+  }
+
+  /// Deletes a share's cached copies unread, when nothing will take them.
+  static void discardShare(IncomingShare share) {
+    final consumption = share.consumption;
+    if (consumption != null) {
+      unawaited(consumption.finish());
+      return;
+    }
+    for (final file in share.files) {
+      _discard(file.path);
+    }
   }
 
   /// A file opened with the app (not a share code), already in the cache.
-  static Future<ComposeRequest> fromFile(String path, {Future<Uint8List> Function(String path)? read}) async {
+  static Future<ComposeRequest> fromFile(
+    String path, {
+    Future<Uint8List> Function(String path)? read,
+    int heldBytes = 0,
+    int maxBytes = maxMessageBytes,
+  }) async {
     final name = path.split('/').last;
+    final length = read == null ? _fileLength(path) : null;
+    if (length != null && heldBytes + length > maxBytes) {
+      return ComposeRequest(problems: [appL10n.stateAttachmentTotalLimit]);
+    }
     try {
       final bytes = await (read ?? (p) => File(p).readAsBytes())(path);
       final attachment = DraftAttachment.sniff(name, bytes);
-      final problem = attachmentProblem(attachment);
+      final problem = attachmentProblem(attachment) ?? attachmentBudgetProblem(heldBytes, attachment, limit: maxBytes);
       return problem == null ? ComposeRequest(attachments: [attachment]) : ComposeRequest(problems: [problem]);
     } catch (_) {
       return ComposeRequest(problems: [appL10n.stateShareReadFailed(name)]);
+    }
+  }
+
+  static int? _fileLength(String path) {
+    try {
+      return File(path).lengthSync();
+    } catch (_) {
+      return null;
     }
   }
 
@@ -146,10 +201,10 @@ final readyComposeProvider = Provider<ComposeRequest?>((ref) {
   return ref.watch(composeInboxProvider).firstOrNull;
 });
 
-/// The active host takes files other than inline images (`fileUploads/*`);
-/// DSH Remote doesn't. Before the connection is up, judged by the host kind.
+/// The active host can stage attachments or publish into its workspace.
+/// Remote workspace uploads require a capability from the live connection.
 bool canStageFiles(HostConnection? connection, HostRef host) =>
-    connection?.client.supportsEndpoint('fileUploads/upload') ?? host.kind != HostKind.relay;
+    connection?.client.supportsFileUpload ?? host.kind != HostKind.relay;
 
 /// The composer after a fill.
 class MergedDraft {
@@ -180,11 +235,33 @@ MergedDraft mergeIntoDraft({
     problems.add(appL10n.stateShareImagesOnly);
   }
 
+  // The tray keeps every attachment's bytes until send; do not let shares pile
+  // one message past its byte budget.
+  var held = totalAttachmentBytes(attachments);
+  final budgeted = <DraftAttachment>[];
+  for (final a in incoming) {
+    final over = attachmentBudgetProblem(held, a);
+    if (over != null) {
+      problems.add(over);
+      continue;
+    }
+    held += a.size;
+    budgeted.add(a);
+  }
+  incoming = budgeted;
+
   var shared = request.text.trim();
   if (shared.length > maxComposerShareChars) {
     if (filesAllowed && attachments.length + incoming.length < maxAttachments) {
-      incoming = [DraftAttachment.sniff(sharedTextFileName, Uint8List.fromList(utf8.encode(shared))), ...incoming];
-      shared = '';
+      final textFile = DraftAttachment.sniff(sharedTextFileName, Uint8List.fromList(utf8.encode(shared)));
+      if (attachmentBudgetProblem(held, textFile) == null) {
+        incoming = [textFile, ...incoming];
+        held += textFile.size;
+        shared = '';
+      } else {
+        shared = _cut(shared, maxComposerShareChars);
+        problems.add(appL10n.stateShareTextTruncated(maxComposerShareChars));
+      }
     } else {
       shared = _cut(shared, maxComposerShareChars);
       problems.add(appL10n.stateShareTextTruncated(maxComposerShareChars));

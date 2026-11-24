@@ -14,6 +14,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../l10n/l10n.dart';
 import '../../state/agents_state.dart';
 import '../../state/sessions_state.dart';
+import '../common/fluid_bits.dart';
 import '../common/status_dot.dart';
 import '../theme/app_icons.dart';
 import '../theme/theme.dart';
@@ -54,16 +55,20 @@ class HeaderTitleText extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final parent = ref.watch(_currentAgentsProvider)?.$2.parent;
     final shown = parent?.label ?? title;
-    return Text(shown, maxLines: 1, overflow: TextOverflow.ellipsis, style: style);
+    return FluidTextSwap(
+      value: shown,
+      child: Text(shown, maxLines: 1, overflow: TextOverflow.ellipsis, style: style),
+    );
   }
 }
 
 /// The right side: the agents capsule (when there is one), then [trailing]
 /// (the model chip) except in a subagent conversation.
 class HeaderTrailingSlot extends ConsumerWidget {
-  const HeaderTrailingSlot({super.key, required this.trailing});
+  const HeaderTrailingSlot({super.key, this.trailing});
 
-  final Widget trailing;
+  /// Null on a phone, where the model chip gives its room to the title.
+  final Widget? trailing;
 
   /// Between the header's pieces.
   static const gap = 8.0;
@@ -78,7 +83,7 @@ class HeaderTrailingSlot extends ConsumerWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         if (showsKey) ...[const SizedBox(width: gap), key!],
-        if (!(agents?.isChild ?? false)) ...[const SizedBox(width: gap), trailing],
+        if (trailing case final trailing? when !(agents?.isChild ?? false)) ...[const SizedBox(width: gap), trailing],
       ],
     );
   }
@@ -104,6 +109,7 @@ class HeaderBackKey extends ConsumerWidget {
       excludeSemantics: true,
       child: GlassSurface(
         tier: GlassTier.chrome,
+        style: DshThemeStyle.of(context).headerGlass(Theme.of(context).colorScheme),
         stadium: true,
         grouped: true,
         onTap: () => selectConversation(ref, parent.address.parentSessionId),
@@ -177,7 +183,12 @@ class HeaderAgentsKey extends StatelessWidget {
             child: AnimatedOpacity(
               opacity: running ? 1 : 0,
               duration: AppMotion.of(context, AppMotion.quick),
-              child: const StatusDot(tone: StatusTone.busy, size: 7),
+              // Hidden is not enough: the dot's pulse would keep asking for
+              // frames while nothing runs (#1094).
+              child: TickerMode(
+                enabled: running,
+                child: const StatusDot(tone: StatusTone.busy, size: 7),
+              ),
             ),
           ),
         ],
@@ -202,6 +213,7 @@ class HeaderAgentsKey extends StatelessWidget {
                 dimension: height,
                 child: GlassSurface(
                   tier: GlassTier.chrome,
+                  style: DshThemeStyle.of(context).headerGlass(Theme.of(context).colorScheme),
                   circle: true,
                   grouped: true,
                   onTap: open,
@@ -210,6 +222,7 @@ class HeaderAgentsKey extends StatelessWidget {
               )
             : GlassSurface(
                 tier: GlassTier.chrome,
+                style: DshThemeStyle.of(context).headerGlass(Theme.of(context).colorScheme),
                 stadium: true,
                 grouped: true,
                 onTap: open,

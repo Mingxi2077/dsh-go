@@ -39,6 +39,7 @@ final _quoteLine = RegExp(r'^ {0,3}> ?');
 /// A message split into the blockquote it opens with and the rest; [quote]
 /// is null when it does not open with one.
 ({String? quote, String body}) splitQuote(String text) {
+  if (!_quoteLine.hasMatch(text)) return (quote: null, body: text);
   final lines = text.replaceAll('\r\n', '\n').split('\n');
   var i = 0;
   final quoted = <String>[];
@@ -64,10 +65,9 @@ String quoteLine(String quote) => quote
     .replaceAll(RegExp(r'\s+'), ' ')
     .trim();
 
-/// The passage waiting above each conversation's composer, keyed by
-/// `draftStorageKey(hostKey: ..., sessionId: ...)` from draft_store.dart, just like drafts.
-/// Callers use the same scoped key for reads, set, clear and both ends of move.
-/// Kept for the app run, like draft attachments; bare session ids are not scoped.
+/// The passage waiting above each conversation's composer, keyed by the
+/// host-scoped draft key so same-named sessions on different Hosts stay separate.
+/// Kept for the app run, like draft attachments.
 class ComposerQuotes extends Notifier<Map<String, String>> {
   @override
   Map<String, String> build() => const {};

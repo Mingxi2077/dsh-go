@@ -30,7 +30,7 @@ void main() {
       observeLifecycle: false,
     );
     ProviderContainer? container;
-    void saveDraft() => container!.read(draftStoreProvider.notifier).save('current', input.text, const []);
+    void saveDraft() => container!.read(draftStoreProvider.notifier).save(localDraft('current'), input.text, const []);
     addTearDown(() async {
       input.removeListener(saveDraft);
       await tester.pumpWidget(const SizedBox.shrink());
@@ -72,7 +72,7 @@ void main() {
     bridge.emit(const VoicePartial('independent draft fixture'));
     await tester.pump();
     expect(voice.phase, VoicePhase.listening);
-    expect(container!.read(draftStoreProvider).drafts['current']?.text, 'independent draft fixture');
+    expect(container!.read(draftStoreProvider).drafts[localDraft('current')]?.text, 'independent draft fixture');
     host.value = replacement;
     await tester.pump();
     final failure = tester.takeException();
@@ -81,7 +81,7 @@ void main() {
     expect(failure, isNull, reason: 'Restoring the draft must not write provider state during Composer.build.');
     expect(voice.phase, VoicePhase.idle);
     expect(input.text, isEmpty);
-    expect(container!.read(draftStoreProvider).drafts['current'], isNull);
+    expect(container!.read(draftStoreProvider).drafts[localDraft('current')], isNull);
     expect(bridge.calls.last, 'cancel');
   });
 }

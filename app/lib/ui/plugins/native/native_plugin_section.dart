@@ -3,6 +3,7 @@
 // problems, the last view's size, the last tap's round trip — that opens the
 // problems with their paths. Plugins without a native part get nothing here.
 
+import 'package:dsh_client/dsh_client.dart' show DshGoPanel, PluginBundle;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -10,11 +11,13 @@ import '../../../l10n/l10n.dart';
 import '../../../plugins/native/native_capabilities.dart';
 import '../../../plugins/native/native_model.dart';
 import '../../../plugins/native/native_state.dart';
+import '../../../state/android_features.dart';
 import '../../../state/hosts_state.dart';
 import '../../common/empty_view.dart';
 import '../../common/list_page_row.dart';
 import '../../shell/page_frame.dart';
 import '../../theme/app_icons.dart';
+import 'native_panel.dart';
 
 /// `3.2 KB`, `860 B`.
 String nativeBytes(int bytes) =>
@@ -31,14 +34,56 @@ IconData _surfaceIcon(NativeSurface surface) => switch (surface) {
   NativeSurface.messageActions => AppIcons.chat,
   NativeSurface.composerStrip => AppIcons.info,
   NativeSurface.panel => AppIcons.panel,
+  NativeSurface.composerTools => AppIcons.add,
+  NativeSurface.sessionActions => AppIcons.more,
+  NativeSurface.turnNote => AppIcons.info,
 };
+
+/// The packages a bundle's native parts can sit in: its own, and each component's.
+List<String> nativePackagesOf(PluginBundle bundle) => {
+  bundle.name,
+  for (final row in bundle.rows)
+    if (row.moduleName.isNotEmpty) row.moduleName,
+}.toList();
+
+/// The panels [package] asked to show on its own detail page.
+class NativePluginPanels extends ConsumerWidget {
+  const NativePluginPanels({super.key, required this.package});
+
+  final String package;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    if (!ref.watch(nativeSurfaceOnProvider((package, NativeSurface.panel)))) return const SizedBox.shrink();
+    final panels = ref.watch(
+      nativeContributionsProvider.select(
+        (c) => c.plugin(package)?.panels.where((p) => p.placement.contains(DshGoPanel.pluginPage)).toList(),
+      ),
+    );
+    if (panels == null || panels.isEmpty) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (final panel in panels)
+          Padding(
+            key: ValueKey('plugin-page-panel|$package|${panel.id}'),
+            padding: const EdgeInsets.only(top: 12),
+            child: NativePanelView(panel: panel),
+          ),
+      ],
+    );
+  }
+}
 
 /// The rows in the plugin's sheet; nothing for a plugin without a native
 /// part.
 class NativePluginSection extends ConsumerWidget {
-  const NativePluginSection({super.key, required this.package});
+  const NativePluginSection({super.key, required this.package, this.named = false});
 
   final String package;
+
+  /// A component on its bundle's page: says whose it is, or two of these would read the same.
+  final bool named;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -78,7 +123,7 @@ class NativePluginSection extends ConsumerWidget {
                       icon: _surfaceIcon(surface),
                       title: surface.label,
                       onTap: () => set(!on),
-                      trailing: Switch(value: on, onChanged: set),
+                      trailing: Switch.adaptive(value: on, onChanged: set),
                     ),
                   );
                 },
@@ -88,14 +133,19 @@ class NativePluginSection extends ConsumerWidget {
             Builder(
               builder: (context) {
                 final on = ref.watch(nativeVoiceConsentProvider)[NativeVoiceConsents.keyOf(host, package)] == true;
+                // HarmonyOS says whether it can listen at all: no dead switch where it can't.
+                final cannot =
+                    ref.watch(operatingSystemProvider) == 'ohos' &&
+                    !(ref.watch(nativePlatformFeaturesProvider).value?.contains('voice') ?? true);
                 void set(bool value) => ref.read(nativeVoiceConsentProvider.notifier).set(host, package, value);
                 return MergeSemantics(
                   child: ListPageRow(
                     key: const ValueKey('native-switch-voice'),
                     icon: AppIcons.voice,
                     title: l10n.plugslotsVoiceSwitch,
-                    onTap: () => set(!on),
-                    trailing: Switch(value: on, onChanged: set),
+                    subtitle: cannot ? l10n.harmonyPluginVoiceUnavailable : null,
+                    onTap: cannot ? null : () => set(!on),
+                    trailing: Switch.adaptive(value: on && !cannot, onChanged: cannot ? null : set),
                   ),
                 );
               },
@@ -103,7 +153,9 @@ class NativePluginSection extends ConsumerWidget {
           ListPageRow(
             key: const ValueKey('native-status'),
             icon: AppIcons.diagnostics,
-            title: l10n.plugslotsNativeUi,
+            title: named
+                ? '${ref.watch(nativePluginTitleProvider(package))} · ${l10n.plugslotsNativeUi}'
+                : l10n.plugslotsNativeUi,
             subtitle: stats.isEmpty ? null : stats.join(' · '),
             value: status,
             chevron: true,

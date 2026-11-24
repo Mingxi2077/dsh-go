@@ -38,7 +38,8 @@
 // panel:     panels [{id, label}], active, sessions [titles] (conversation
 //            rows in the sidebar), ignoreClicks
 // settings:  sections [{id, label}] (the first shows first), ignoreClicks,
-//            sectionButtons [texts] (buttons inside the section drawn)
+//            sectionButtons [texts] (buttons inside the section drawn),
+//            webOpenOk (false: opener reports failure), webOnly (no then step)
 // rightbar:  types [{id, kind, title}], open [kind] (tabs already in the
 //            pane), split kind (another pane, before ours, showing it),
 //            expanded, bridge 'openTab' | 'openTab-fail' (else none),
@@ -264,6 +265,74 @@ const model = { shown: () => null };
 
 const windowExtra = {};
 
+// rc.1 long-tail owners: the footer renders its list directly, settings uses
+// aria-controls/selected tabs, plugin details are explicitly package-marked.
+if (target === 'footer' || target === 'overlay') {
+  const slot = outlet(target === 'footer' ? 'sidebar.footer.action' : 'shell.overlay');
+  const box = new El('div');
+  (target === 'footer' ? sidebar : body).append(box);
+  box.append(slot);
+  draw(slot, s.cell);
+  model.shown = () => s.cell;
+  windowExtra.__dshAppOpen = (web) => { if (web.sidebar) out.clicks.push('open sidebar'); };
+}
+if (target === 'settings-plugin') {
+  let active = 'other';
+  let dialog;
+  windowExtra.__dshAppOpen = (web) => {
+    if (web.settings !== 'plugins' || dialog) return;
+    out.clicks.push('open settings:plugins');
+    dialog = new El('div', { 'data-shortcut-modal': 'settings', role: 'dialog' });
+    const tabs = new El('div', { role: 'tablist' });
+    const buttons = [];
+    const panels = [];
+    function render() {
+      for (let i = 0; i < buttons.length; i++) {
+        const selected = buttons[i].cell === active;
+        buttons[i].setAttribute('aria-selected', String(selected));
+        panels[i].toggleAttribute('hidden', !selected);
+      }
+    }
+    for (const id of ['other', s.cell]) {
+      const panelId = ':r1:-panel-' + id;
+      const b = button({ role: 'tab', id: ':r1:-tab-' + id, 'aria-controls': panelId }, id, 'settings-tab:' + id, () => {
+        if (s.ignoreClicks) return;
+        active = id;
+        later(render);
+      });
+      b.cell = id;
+      buttons.push(b);
+      tabs.append(b);
+      const panel = new El('div', { id: panelId, role: 'tabpanel' });
+      const slot = outlet('settings.plugins.tab');
+      panel.append(slot);
+      draw(slot, id);
+      panels.push(panel);
+    }
+    dialog.append(tabs, ...panels);
+    body.append(dialog);
+    render();
+  };
+  model.shown = () => active;
+}
+if (target === 'plugin-detail') {
+  const main = outlet('main');
+  const card = new El('li', { 'data-plugin-package': s.package });
+  card.append(button({ 'aria-label': 'View plugin' }, s.package, 'plugin:' + s.package, () => {
+    if (s.ignoreClicks) return;
+    const detail = new El('div', { 'data-plugin-detail': s.package });
+    const slot = outlet('plugins.detail.section');
+    detail.append(slot);
+    draw(slot, s.cell);
+    main.clear();
+    main.append(detail);
+  }));
+  main.append(card);
+  body.append(main);
+  windowExtra.__dshAppOpen = (web) => { if (web.panel) out.clicks.push('open panel:' + web.panel); };
+  model.shown = () => main.querySelector('[data-plugin-detail]') ? s.package : null;
+}
+
 if (target === 'view') {
   const key = 'dsh.conversation.' + session;
   const views = s.views || [];
@@ -399,7 +468,7 @@ if (target === 'settings') {
   windowExtra.__dshAppOpen = (web) => {
     if (!web.settings || dialog) return;
     out.clicks.push('open settings:' + web.settings);
-    activeId = web.settings;
+    activeId = web.settings === true ? sections[0]?.id : web.settings;
     later(() => {
       dialog = new El('div', { 'data-shortcut-modal': 'settings', role: 'dialog', 'aria-modal': 'true' });
       const nav = new El('nav');
@@ -566,11 +635,27 @@ const window = {
   innerHeight: 760,
   devicePixelRatio: 2,
 };
-if (windowExtra.__dshAppOpen) window.__dshAppOpen = windowExtra.__dshAppOpen;
+if (windowExtra.__dshAppOpen) {
+  window.__dshAppOpen = (web) => {
+    windowExtra.__dshAppOpen(web);
+    window.__dshAppOpening = Promise.resolve(s.webOpenOk !== false);
+  };
+}
 if (s.occupants || windowExtra.openTab) {
   window.__dshGoBridge = {
     version: 1,
-    occupants: (slot) => (s.occupants && s.occupants[slot]) || [],
+    occupants: (slot) => ((s.occupants && s.occupants[slot]) || []).map((o) => {
+      const filters = (out.filters || []).filter((f) => f.slot === slot);
+      if (!filters.length) return { ...o }; // Preserve a legacy entry with no masked field.
+      return {
+        ...o,
+        masked: !!o.masked || filters.some((f) => !f.allow.some((a) => a.package === o.package && a.cell === o.cell)),
+      };
+    }),
+    ...(s.filter && s.filter !== 'missing' ? { filter: (slot, allow) => {
+      (out.filters ||= []).push({ slot, allow });
+      return s.filter === 'ok';
+    } } : {}),
     ...(windowExtra.openTab ? { openTab: windowExtra.openTab } : {}),
   };
 }
@@ -608,13 +693,19 @@ new vm.Script(fs.readFileSync(islandPath, 'utf8'), { filename: islandPath }).run
 const configs = {
   view: { slot: 'conversation.view', stretch: 'child', target: { session, then: { view: { id: s.cell, names: s.names } } } },
   panel: { slot: 'main', stretch: 'child', target: { then: { panel: s.names } } },
-  settings: { slot: 'settings.section', stretch: 'scroller', target: { web: { settings: 'general' }, then: { settings: s.names } } },
+  settings: { slot: 'settings.section', stretch: 'scroller', target: { web: { settings: true }, then: { settings: s.names } } },
   rightbar: { slot: 'sidebar.right.pane.tab', stretch: 'child', target: { session, then: { rightbar: s.names } } },
+  overlay: { slot: 'shell.overlay', stretch: 'none', mode: 'overlay', target: {} },
+  footer: { slot: 'sidebar.footer.action', stretch: 'parent', target: { web: { sidebar: true }, then: { sidebar: true } } },
+  'settings-plugin': { slot: 'settings.plugins.tab', stretch: 'parent', target: { web: { settings: 'plugins' }, then: { settingsPlugin: s.cell } } },
+  'plugin-detail': { slot: 'plugins.detail.section', stretch: 'scroller', target: { web: { panel: 'plugins' }, then: { plugin: s.package } } },
 };
 window.__dshGoIsland.init({
   ...configs[target],
+  ...(s.webOnly ? { target: { web: { settings: true } } } : {}),
   cell: s.cell,
-  mode: 'page',
+  mode: target === 'overlay' ? 'overlay' : 'page',
+  package: s.package,
   mask: false,
   pad: [16, 12],
   labels: {

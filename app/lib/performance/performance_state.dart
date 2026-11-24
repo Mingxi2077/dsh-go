@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../state/android_features.dart';
 import 'performance_policy.dart';
 
 export 'performance_policy.dart';
@@ -29,6 +30,17 @@ class PerformanceChannel {
       return map == null ? const PerformanceSnapshot(loaded: true) : PerformanceSnapshot.fromMap(map);
     } on MissingPluginException {
       return const PerformanceSnapshot(loaded: true);
+    }
+  }
+
+  /// HarmonyOS only; see [PerformancePrefs.frameCache].
+  Future<void> setFrameCache(bool enabled) async {
+    try {
+      await _methods.invokeMethod<void>('setFrameCache', {'enabled': enabled});
+    } on MissingPluginException {
+      // No handler, no cache to set.
+    } on PlatformException {
+      // The row still shows the choice, and the next launch tries again.
     }
   }
 
@@ -105,7 +117,9 @@ class PerformancePrefsController extends Notifier<PerformancePrefs> {
   static const modeKey = 'performance.mode';
   static const blurKey = 'performance.blur';
   static const animationsKey = 'performance.animations';
+  static const fluidKey = 'performance.fluid';
   static const refreshRateKey = 'performance.refresh_rate';
+  static const frameCacheKey = 'performance.frame_cache';
   late Future<void> ready;
 
   @override
@@ -122,9 +136,13 @@ class PerformancePrefsController extends Notifier<PerformancePrefs> {
         mode: PerformanceMode.values.asNameMap()[prefs.getString(modeKey)] ?? PerformanceMode.auto,
         blur: prefs.getBool(blurKey),
         animations: prefs.getBool(animationsKey),
+        fluid: prefs.getBool(fluidKey),
         refreshRate: RefreshRateMode.values.asNameMap()[prefs.getString(refreshRateKey)] ?? RefreshRateMode.auto,
+        frameCache: prefs.getBool(frameCacheKey) ?? true,
         loaded: true,
       );
+      // The engine starts with it on, so only the other answer has anything to say.
+      if (!state.frameCache) _sendFrameCache(false);
     } catch (_) {
       if (ref.mounted) state = state.copyWith(loaded: true);
     }
@@ -149,11 +167,23 @@ class PerformancePrefsController extends Notifier<PerformancePrefs> {
   Future<void> setBlur(bool value) => _save((s) => s.copyWith(blur: value), (p) => p.setBool(blurKey, value));
   Future<void> setAnimations(bool value) =>
       _save((s) => s.copyWith(animations: value), (p) => p.setBool(animationsKey, value));
+  Future<void> setFluid(bool value) => _save((s) => s.copyWith(fluid: value), (p) => p.setBool(fluidKey, value));
   Future<void> setRefreshRate(RefreshRateMode mode) =>
       _save((s) => s.copyWith(refreshRate: mode), (p) => p.setString(refreshRateKey, mode.name));
+  Future<void> setFrameCache(bool value) async {
+    await _save((s) => s.copyWith(frameCache: value), (p) => p.setBool(frameCacheKey, value));
+    if (ref.mounted) _sendFrameCache(value);
+  }
+
+  void _sendFrameCache(bool value) {
+    if (ref.read(operatingSystemProvider) != 'ohos') return;
+    unawaited(ref.read(performanceChannelProvider).setFrameCache(value));
+  }
+
   Future<void> resetEffects() => _save((s) => s.copyWith(resetEffects: true), (p) async {
     await p.remove(blurKey);
     await p.remove(animationsKey);
+    await p.remove(fluidKey);
   });
 }
 
@@ -176,7 +206,14 @@ Map<String, Object?> performanceDiagnostics(Ref ref) {
   final prefs = ref.read(performancePrefsProvider);
   return {
     ...ref.read(performanceProvider).toMap(),
-    'preferences': {'mode': prefs.mode.name, 'blurOverride': prefs.blur, 'animationsOverride': prefs.animations, 'refreshRate': prefs.refreshRate.name},
+    'preferences': {
+      'mode': prefs.mode.name,
+      'blurOverride': prefs.blur,
+      'animationsOverride': prefs.animations,
+      'fluidOverride': prefs.fluid,
+      'refreshRate': prefs.refreshRate.name,
+      if (ref.read(operatingSystemProvider) == 'ohos') 'frameCache': prefs.frameCache,
+    },
     'defaults': ref.read(performanceDefaultsProvider).toMap(),
   };
 }

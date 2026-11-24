@@ -18,8 +18,11 @@ No `error` lines means done. `--json` for machines.
 | ⬜ | `dshGo.v` is `1`; `contributes` exists | ⚙️ |
 | ⬜ | Every id unique within the plugin (across slots too) | ⚙️ |
 | ⬜ | Capsules ≤ 10, menu items ≤ 12, strip ≤ 24, panel titles ≤ 16, plugin name ≤ 24 characters, **in Chinese and English** | ⚙️ |
+| ⬜ | Plus panel tools 2, chat actions 2, turn note 1 at most | ⚙️ |
+| ⬜ | Plus panel tools ≤ 8 characters and chat actions ≤ 12, in every language | ⚙️ |
+| ⬜ | If you use a newer place, it still makes sense when the app lacks it (`hasSurface`) | |
 | ⬜ | Per slot: capsules 2, menu 2, strip 1, panels 4 | ⚙️ |
-| ⬜ | `wants` only what you read; `draft` / `clipboard` for capsules, `message` for menu items | ⚙️ |
+| ⬜ | `wants` only what you read; `draft` / `clipboard` for capsules and plus panel tools, `message` for menu items | ⚙️ |
 | ⬜ | Static `effect`s only insert / command / open / link / toast / copy | ⚙️ |
 | ⬜ | The strip's `panel` names one of your panels | ⚙️ |
 | ⬜ | Static view files inside the package, ≤ 32 KiB | ⚙️ |
@@ -42,7 +45,7 @@ No `error` lines means done. `--json` for machines.
 
 | | Item | |
 |---|---|---|
-| ⬜ | Only the 16 components; unknown ones become placeholders | ⚙️ |
+| ⬜ | Match the view root version: omitted `v` / `v: 1` uses v1; set `v: 2` for the added [components](components.md) and bounded [styles](styles.md). Keep manifest `dshGo.v` at `1`; use `caps` / `adaptView` for older apps | ⚙️ |
 | ⬜ | Tool cards ≤ 8 KiB, ≤ 40 components, ≤ 6 levels; panels ≤ 32 KiB, ≤ 120, ≤ 8 | ⚙️ |
 | ⬜ | Tool cards without bindings (no data model) and without buttons (not tappable in phase 0) | ⚙️ |
 | ⬜ | `presentationMeta` wrapped in `toolCard()`: never throws, never returns `undefined` / `NaN` | |

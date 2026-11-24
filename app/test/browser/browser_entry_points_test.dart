@@ -1,8 +1,6 @@
 import 'package:dsh_app/browser/browser_links.dart';
 import 'package:dsh_app/l10n/l10n.dart';
-import 'package:dsh_app/state/balance_state.dart' show deepSeekTopUpUrl;
 import 'package:dsh_app/state/star_prompt.dart' show starLinkOpenerProvider, starProjectPage;
-import 'package:dsh_app/ui/chat/balance_widgets.dart' show openTopUp;
 import 'package:dsh_app/ui/engine_settings/schema_documentation.dart';
 import 'package:dsh_app/ui/forum/forum_post_body.dart' show openForumLink;
 import 'package:dsh_app/ui/plugins/native/native_taps.dart' show openConfirmedLink;
@@ -70,11 +68,6 @@ void main() {
     await openForumLink(Uri.parse('dshgo://forum/auth?payload=example'));
     await openForumLink(Uri.parse('file:///private.txt'));
     expect(opened, urls);
-  });
-
-  test('top-up opens the platform page without a BuildContext', () async {
-    await openTopUp();
-    expect(opened, [Uri.parse(deepSeekTopUpUrl)]);
   });
 
   test('the default star provider uses the shared entry and reports rejected opening', () async {

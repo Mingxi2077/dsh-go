@@ -3,8 +3,8 @@ import 'dart:async';
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:url_launcher/url_launcher.dart';
 
-import '../../browser/browser_links.dart';
 import '../../l10n/l10n.dart';
 import '../../plugins/native/native_state.dart';
 import '../../plugins/seams/seams.dart' show PluginSeat, SeatPlacement, Slots, seatPlanProvider;
@@ -12,6 +12,7 @@ import '../../share_code/plugin_share.dart' show sharedPluginFromBundle;
 import '../../state/plugin_config/plugin_config_state.dart';
 import '../../links/plugin_links.dart' show marketPluginLink;
 import '../../state/plugins_state.dart';
+import '../../state/runtime_capabilities_state.dart';
 import '../../update/version.dart';
 import '../common/app_sheet.dart';
 import '../common/list_page_row.dart';
@@ -27,6 +28,7 @@ import 'native/native_plugin_section.dart';
 import 'plugin_actions.dart';
 import 'plugin_load_status.dart';
 import 'plugin_widgets.dart';
+import 'seats/plugin_seam_controls.dart';
 import 'seats/plugin_web_places.dart';
 
 /// Market entry detail and the install confirmation: what it is, where it
@@ -56,7 +58,7 @@ Future<void> _openLink(BuildContext context, String url) async {
   final l10n = context.l10n;
   final messenger = ScaffoldMessenger.maybeOf(context);
   final uri = Uri.tryParse(url);
-  final ok = uri != null && await BrowserLinks.open(uri);
+  final ok = uri != null && await launchUrl(uri, mode: LaunchMode.externalApplication);
   if (!ok) {
     messenger?.showSnackBar(SnackBar(content: Text(l10n.hubPluginBrowserFailed(uri?.host ?? url))));
   }
@@ -150,7 +152,7 @@ class MarketPluginSheet extends ConsumerWidget {
               PluginHero(
                 avatar: PluginAvatar(name: plugin.name, title: title, icon: plugin.icon, size: 64),
                 title: title,
-                subtitle: [?plugin.author, ?entry.categoryTitle].join(' · '),
+                subtitle: [?plugin.author, ?entry.categoryTitleIn(locale)].join(' · '),
                 badges: [
                   ...marketEntryBadges(context, entry),
                   if (status == MarketInstallStatus.updateAvailable)
@@ -236,7 +238,15 @@ class MarketPluginSheet extends ConsumerWidget {
           top: false,
           child: Padding(
             padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
-            child: _primaryAction(context, host, status, job, installed, needsApp),
+            child: _primaryAction(
+              context,
+              host,
+              status,
+              job,
+              installed,
+              needsApp,
+              ref.watch(marketInstallRefusedProvider),
+            ),
           ),
         ),
       ],
@@ -250,6 +260,7 @@ class MarketPluginSheet extends ConsumerWidget {
     PluginInstallJob? job,
     PluginBundle? installed,
     AppVersion? needsApp,
+    bool installRefused,
   ) {
     final l10n = context.l10n;
     final plugin = entry.plugin;
@@ -278,15 +289,20 @@ class MarketPluginSheet extends ConsumerWidget {
       child: Text(l10n.hubPluginManage),
     );
     // Nothing to install or update from here: manage what is there.
-    if (manageable && (status == MarketInstallStatus.installed || host.safeMode || !host.canInstall)) {
+    if (manageable &&
+        (status == MarketInstallStatus.installed || host.safeMode || (!host.canInstall && !installRefused))) {
       return manage();
     }
-    // Listed, but this app is too old for it: shown, not installed.
-    if (needsApp != null) {
+    // Listed, but this app is too old for it or the engine takes no market
+    // installs: shown, not installed.
+    final barred = needsApp != null
+        ? l10n.marketNeedsApp(needsApp.name)
+        : (installRefused ? l10n.marketInstallRefused : null);
+    if (barred != null) {
       final reason = FilledButton(
         style: FilledButton.styleFrom(minimumSize: size),
         onPressed: null,
-        child: Text(l10n.marketNeedsApp(needsApp.name), maxLines: 1, overflow: TextOverflow.ellipsis),
+        child: Text(barred, maxLines: 1, overflow: TextOverflow.ellipsis),
       );
       if (!manageable) return reason;
       return Row(
@@ -389,13 +405,31 @@ class BundleSheet extends ConsumerWidget {
     final summary = bundle.summary();
     final error = bundleErrorText(bundle);
     final canSwitch = bundle.readOnlyReason == null && (bundle.installed || bundle.optional) && !gone;
-    final config = ref.watch(pluginConfigProvider).value;
+    final configSource = ref.watch(pluginConfigProvider);
+    final config = configSource.value;
     final configurable = bundleSettingsRows(bundle, config);
-    // Every plugin with fields gets its native page; a third-party one
-    // without any keeps its config seat (an island page, or DSH Web).
+    // Native forms cover their own rows, not a sibling's custom config page.
+    final configuredRows = {for (final row in configurable) row.rowId};
     final configSeat = PluginSeat(slot: Slots.bundleConfig, placement: SeatPlacement.row, package: bundle.name);
-    final configSeated =
-        !bundle.official && !gone && configurable.isEmpty && !ref.watch(seatPlanProvider(configSeat.request)).isEmpty;
+    final configSeats = <PluginSeat>[];
+    if (!bundle.official && !gone && bundle.enabled) {
+      if (configurable.isEmpty && !ref.watch(seatPlanProvider(configSeat.request)).isEmpty) {
+        configSeats.add(configSeat);
+      } else {
+        for (final row in bundle.rows) {
+          if (configuredRows.contains(row.rowId)) continue;
+          final seat = PluginSeat(
+            slot: Slots.rowConfig,
+            placement: SeatPlacement.row,
+            package: bundle.name,
+            cell: '${bundle.name}#${row.rowId}',
+          );
+          if (ref.watch(seatPlanProvider(seat.request)).visible.any((item) => !item.occupant.inferred)) {
+            configSeats.add(seat);
+          }
+        }
+      }
+    }
 
     // Local installs can't be shared; a market entry adds the picture card.
     final shareable = !gone && sharedPluginFromBundle(bundle) != null;
@@ -462,7 +496,7 @@ class BundleSheet extends ConsumerWidget {
                         icon: AppIcons.power,
                         title: l10n.commonEnable,
                         onTap: () => unawaited(togglePluginBundle(context, bundle, !bundle.enabled)),
-                        trailing: Switch(
+                        trailing: Switch.adaptive(
                           value: bundle.enabled,
                           onChanged: (v) => unawaited(togglePluginBundle(context, bundle, v)),
                         ),
@@ -501,12 +535,23 @@ class BundleSheet extends ConsumerWidget {
                   ),
                 ),
               if (!gone) PluginReloadAction(bundle: bundle),
-              if (configSeated) ...[
+              if (configSeats.isNotEmpty) ...[
                 // A third-party plugin's own config page in DSH Web: its
                 // schema form, its island page, or the way to DSH Web.
                 const SizedBox(height: 16),
-                ListPageCard(margin: EdgeInsets.zero, children: [configSeat]),
-              ] else if (configurable.isNotEmpty) ...[
+                ListPageCard(
+                  margin: EdgeInsets.zero,
+                  children: [
+                    // Unknown fields are not absent fields: wait for the first
+                    // catalog before offering an alternate settings route.
+                    if (configSource.isLoading && !configSource.hasValue)
+                      ListPageRow(icon: AppIcons.configure, title: l10n.commonSettings, meta: l10n.pluginsLoading)
+                    else
+                      ...configSeats,
+                  ],
+                ),
+              ],
+              if (configurable.isNotEmpty) ...[
                 const SizedBox(height: 16),
                 ListPageCard(
                   margin: EdgeInsets.zero,
@@ -552,7 +597,12 @@ class BundleSheet extends ConsumerWidget {
               ],
               // Loader evidence, then native UI switches and diagnostics.
               if (!gone) PluginLoadStatus(bundle: bundle),
-              if (!gone) NativePluginSection(package: bundle.name),
+              if (!gone)
+                for (final package in nativePackagesOf(bundle)) ...[
+                  NativePluginSection(package: package, named: package != bundle.name),
+                  NativePluginPanels(package: package),
+                ],
+              if (!gone) PluginSeamControls(package: bundle.name),
               if (!gone) PluginWebPlacesSection(package: bundle.name, pluginNames: [...?bundle.meta?.title?.all]),
               if (job != null && job.isActive) ...[
                 const SizedBox(height: 16),
@@ -590,6 +640,13 @@ class BundleSheet extends ConsumerWidget {
           child: Text(l10n.hubPluginSafeModeInstall),
         );
       }
+      if (host.installRefused) {
+        return FilledButton(
+          style: FilledButton.styleFrom(minimumSize: size),
+          onPressed: null,
+          child: Text(l10n.marketInstallRefused, maxLines: 1, overflow: TextOverflow.ellipsis),
+        );
+      }
       if (!host.canInstall) {
         return FilledButton.icon(
           style: FilledButton.styleFrom(minimumSize: size),
@@ -621,6 +678,13 @@ class BundleSheet extends ConsumerWidget {
         style: FilledButton.styleFrom(minimumSize: size),
         onPressed: null,
         child: Text(l10n.hubPluginSafeModeRemove),
+      );
+    }
+    if (host.installRefused) {
+      return FilledButton(
+        style: FilledButton.styleFrom(minimumSize: size),
+        onPressed: null,
+        child: Text(l10n.harmonyPluginRemoveRefused, maxLines: 1, overflow: TextOverflow.ellipsis),
       );
     }
     if (!host.canInstall) {

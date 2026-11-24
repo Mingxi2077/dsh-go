@@ -13,10 +13,13 @@ class FakeRemote {
   int? pid;
   int port = 40100;
   String token = 'tok-0';
+  bool sameCommand = true;
+  bool hasLaunchLine = true;
 
   /// What `dsh` does when started.
   bool dshInstalled = true;
   final List<Object> tunnelErrors = [];
+  final webPorts = <int>{};
 
   /// Kills the managed server (reboot / crash).
   void killServer() => pid = null;
@@ -41,8 +44,9 @@ class FakeRemote {
         0,
         alive == null
             ? 'DSHAPP home /home/me\n'
-            : 'DSHAPP home /home/me\nDSHAPP alive $alive\nDSHAPP samecmd\n'
-                  'DSHAPP url dsh web: http://127.0.0.1:$port/?token=$token\n',
+            : 'DSHAPP home /home/me\nDSHAPP alive $alive\n'
+                  '${sameCommand ? 'DSHAPP samecmd\n' : ''}'
+                  '${hasLaunchLine ? 'DSHAPP url dsh web: http://127.0.0.1:$port/?token=$token\n' : ''}',
         '',
       );
     }
@@ -101,7 +105,9 @@ class FakeTransport implements SshTransport {
   Future<TunnelChannel> openTunnel(String host, int port) async {
     tunnels.add((host, port));
     if (remote.tunnelErrors.isNotEmpty) throw remote.tunnelErrors.removeAt(0);
-    if (remote.pid == null || port != remote.port) throw const TunnelRefused();
+    if (!remote.webPorts.contains(port) && (remote.pid == null || port != remote.port)) {
+      throw const TunnelRefused();
+    }
     return FakeChannel(echo: true);
   }
 

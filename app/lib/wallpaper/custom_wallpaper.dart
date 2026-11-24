@@ -2,13 +2,16 @@
 // （`<support>/wallpaper/`），设置存在 shared_preferences 的 `wallpaper_custom`（一条 JSON）。
 //
 // 取景（缩放 + 位置）按屏幕比例存成相对值，换屏幕尺寸、横竖屏都还对得上；模糊一份，
-// 提亮（浅色）和压暗（深色）各一份。
+// 提亮（浅色）和压暗（深色）各一份。「自动保证文字清晰」可以关掉，关掉后画面完全按这三个值来。
+// 动图记下是动图，可以选择播放还是只用第一帧。
 
 import 'dart:convert';
 import 'dart:io';
 import 'dart:ui';
 
 import 'package:shared_preferences/shared_preferences.dart';
+
+import '../runtime/container_paths.dart';
 
 /// The user's wallpaper and how it sits.
 class CustomWallpaper {
@@ -23,6 +26,9 @@ class CustomWallpaper {
     this.blur = defaultBlur,
     this.lighten = defaultLighten,
     this.dim = defaultDim,
+    this.guard = true,
+    this.animated = false,
+    this.play = true,
     this.on = true,
   });
 
@@ -59,9 +65,19 @@ class CustomWallpaper {
   final double blur;
 
   /// 0–1: the page's own colour laid over the picture, in light mode ([lighten]) and in dark
-  /// mode ([dim]). Text keeps its contrast whatever these say ([WallpaperLook]).
+  /// mode ([dim]). With [guard], text keeps its contrast whatever these say ([WallpaperLook]).
   final double lighten;
   final double dim;
+
+  /// The picture is calmed wherever text would lose contrast, and faint text colours move for
+  /// it. Off: [blur], [lighten] and [dim] are all that happens to it; at 0, the picture itself.
+  final bool guard;
+
+  /// More than one frame (a GIF, an animated WebP or PNG), as read on import.
+  final bool animated;
+
+  /// An [animated] picture plays; off, its first frame.
+  final bool play;
 
   /// In use. Off: the default backdrop, with this one kept to switch back to.
   final bool on;
@@ -97,6 +113,8 @@ class CustomWallpaper {
     double? blur,
     double? lighten,
     double? dim,
+    bool? guard,
+    bool? play,
     bool? on,
   }) => CustomWallpaper(
     path: path,
@@ -109,6 +127,9 @@ class CustomWallpaper {
     blur: blur ?? this.blur,
     lighten: lighten ?? this.lighten,
     dim: dim ?? this.dim,
+    guard: guard ?? this.guard,
+    animated: animated,
+    play: play ?? this.play,
     on: on ?? this.on,
   );
 
@@ -117,8 +138,24 @@ class CustomWallpaper {
       brightness == Brightness.dark ? copyWith(dim: tone) : copyWith(lighten: tone);
 
   /// A new picture in place of this one: how it sits starts over, the look is kept.
-  CustomWallpaper replacedBy({required String path, required int width, required int height, int? edge}) =>
-      CustomWallpaper(path: path, width: width, height: height, edge: edge, blur: blur, lighten: lighten, dim: dim);
+  CustomWallpaper replacedBy({
+    required String path,
+    required int width,
+    required int height,
+    int? edge,
+    bool animated = false,
+  }) => CustomWallpaper(
+    path: path,
+    width: width,
+    height: height,
+    edge: edge,
+    blur: blur,
+    lighten: lighten,
+    dim: dim,
+    guard: guard,
+    animated: animated,
+    play: play,
+  );
 
   Map<String, Object?> toJson() => {
     'path': path,
@@ -131,6 +168,9 @@ class CustomWallpaper {
     'blur': blur,
     'lighten': lighten,
     'dim': dim,
+    'guard': guard,
+    'animated': animated,
+    'play': play,
     'on': on,
   };
 
@@ -156,6 +196,9 @@ class CustomWallpaper {
       blur: unit(raw['blur'], defaultBlur),
       lighten: unit(raw['lighten'], defaultLighten),
       dim: unit(raw['dim'], defaultDim),
+      guard: raw['guard'] != false,
+      animated: raw['animated'] == true,
+      play: raw['play'] != false,
       on: raw['on'] != false,
     );
   }
@@ -166,8 +209,25 @@ class CustomWallpaper {
       final store = prefs ?? await SharedPreferences.getInstance();
       final raw = store.getString(prefsKey);
       if (raw == null) return null;
-      final wallpaper = fromJson(jsonDecode(raw));
+      var json = Map<String, Object?>.from(jsonDecode(raw) as Map);
+      final paths = ContainerPaths.enabled ? await ContainerPaths.load() : null;
+      if (paths != null) {
+        final relocated = await paths.decodeOwned(json, 'wallpaper');
+        if (relocated == null) return null;
+        json = relocated;
+      }
+      final wallpaper = fromJson(json);
       if (wallpaper == null || !File(wallpaper.path).existsSync()) return null;
+      if (paths != null) {
+        final saved = jsonEncode(await paths.encodeOwned(wallpaper.toJson(), 'wallpaper'));
+        if (saved != raw) {
+          try {
+            await store.setString(prefsKey, saved);
+          } catch (_) {
+            // A migrated in-memory value remains usable if preferences cannot be written.
+          }
+        }
+      }
       return wallpaper;
     } catch (_) {
       return null;
@@ -176,7 +236,10 @@ class CustomWallpaper {
 
   static Future<void> save(CustomWallpaper wallpaper) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(prefsKey, jsonEncode(wallpaper.toJson()));
+    final json = ContainerPaths.enabled
+        ? await (await ContainerPaths.load()).encodeOwned(wallpaper.toJson(), 'wallpaper')
+        : wallpaper.toJson();
+    await prefs.setString(prefsKey, jsonEncode(json));
   }
 
   @override
@@ -192,8 +255,12 @@ class CustomWallpaper {
       other.blur == blur &&
       other.lighten == lighten &&
       other.dim == dim &&
+      other.guard == guard &&
+      other.animated == animated &&
+      other.play == play &&
       other.on == on;
 
   @override
-  int get hashCode => Object.hash(path, width, height, edge, zoom, alignX, alignY, blur, lighten, dim, on);
+  int get hashCode =>
+      Object.hash(path, width, height, edge, zoom, alignX, alignY, blur, lighten, dim, guard, animated, play, on);
 }

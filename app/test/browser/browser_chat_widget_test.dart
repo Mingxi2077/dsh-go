@@ -12,6 +12,7 @@ import 'package:dsh_app/ui/chat/widgets/attachments.dart';
 import 'package:dsh_app/ui/chat/widgets/web_quote_card.dart';
 import 'package:dsh_app/ui/theme/app_icons.dart';
 
+import 'package:dsh_app/browser/browser_return.dart';
 import 'package:dsh_app/browser/browser_workspace.dart';
 import 'package:dsh_app/state/chat_state.dart';
 import 'package:dsh_app/state/composer_quote.dart';
@@ -72,6 +73,73 @@ Future<void> _host(WidgetTester tester, ProviderContainer c, HostRef host) async
 void main() {
   setUpAll(loadTestFonts);
   setUp(() => SharedPreferences.setMockInitialValues({}));
+
+  for (final session in ['s1', null]) {
+    testWidgets('the composer opens 网页 and quotes into its draft (session: $session)', (tester) async {
+      final pages = FakePages();
+      final h = ChatHarness(session: session, extra: pages.overrides());
+      final c = await _pump(tester, h);
+      const prompt = '这篇文章说了什么？';
+      const excerpt = '网页里的一段';
+      final url = Uri.parse('https://example.com/docs');
+      await tester.enterText(find.byType(TextField), prompt);
+      await tester.tap(find.byType(AttachButton));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('网页'));
+      await pumpFrames(tester);
+      expect(tester.widget<BrowserPage>(find.byType(BrowserPage)).sessionId, session);
+
+      await tester.tap(find.byKey(const ValueKey('browser-home-search')));
+      await pumpFrames(tester, 2);
+      await tester.enterText(find.byKey(const ValueKey('browser-address-field')), url.toString());
+      await tester.testTextInput.receiveAction(TextInputAction.go);
+      await pumpFrames(tester, 3);
+      expect(pages.last.url, url);
+      pages.last
+        ..results[false] = (() => pageContent(text: excerpt))
+        ..finish();
+      await pumpFrames(tester, 2);
+
+      await tester.tap(find.byTooltip('引用到对话'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('browser-quote-page')));
+      await tester.pumpAndSettle();
+      expect(find.text(excerpt), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('browser-quote-confirm')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byType(SnackBarAction));
+      await pumpFrames(tester);
+      expect(find.byType(BrowserPage), findsNothing);
+      expect(c.read(currentSessionProvider), session);
+      expect(_text(tester), prompt);
+      expect(_quotes(tester), [excerpt]);
+      expect(h.sessions.creates, 0);
+      expect(h.controllers.values.expand((controller) => controller.sent), isEmpty);
+
+      final scope = BrowserScope(hostKey: 'local:local', sessionId: session);
+      final before = c.read(browserWorkspaceProvider).selectedFor(scope)!;
+      expect(c.read(browserReturnProvider).itemFor(scope)?.tabId, before.id);
+      if (session == null) {
+        await tester.tap(find.byIcon(AppIcons.send));
+        await pumpFrames(tester);
+        final created = c.read(currentSessionProvider);
+        expect(created, h.sessions.created);
+        final target = BrowserScope(hostKey: scope.hostKey, sessionId: created);
+        expect(c.read(browserWorkspaceProvider).selectedFor(target)?.id, before.id);
+        final sideTag = c.read(browserReturnProvider).itemFor(target)!;
+        expect(sideTag.tabId, before.id);
+        expect(c.read(browserWorkspaceProvider).tabsFor(scope), isEmpty);
+        expect(c.read(browserReturnProvider).itemsFor(scope), isEmpty);
+        expect(h.controllers[created]!.sent.single, contains(excerpt));
+        final chat = tester.element(find.byType(ChatScreen));
+        expect(await reopenBrowserReturn(chat, sideTag), isTrue);
+        await pumpFrames(tester);
+        expect(tester.widget<BrowserPage>(find.byType(BrowserPage)).sessionId, created);
+        expect(pages.last.url, url);
+        expect(c.read(browserWorkspaceProvider).selectedFor(target)?.id, before.id);
+      }
+    });
+  }
 
   testWidgets('A and B new chats keep their own drafts', (tester) async {
     final c = await _pump(tester, ChatHarness());
@@ -488,5 +556,5 @@ class _Observer extends NavigatorObserver {
 class _HeldSessions extends FakeSessions {
   final result = Completer<String>();
   @override
-  Future<String> create() => result.future;
+  Future<String> create({bool autoApprove = true}) => result.future;
 }

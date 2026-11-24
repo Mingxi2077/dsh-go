@@ -18,6 +18,7 @@ class TerminalKeyboard extends StatefulWidget {
     super.key,
     required this.focusNode,
     required this.enabled,
+    required this.deferAfterAndroidInsetLoss,
     required this.onText,
     required this.onBackspace,
     required this.onEnter,
@@ -27,6 +28,7 @@ class TerminalKeyboard extends StatefulWidget {
 
   final FocusNode focusNode;
   final bool enabled;
+  final bool deferAfterAndroidInsetLoss;
 
   /// Committed text (Enter inside it already turned into [onEnter]).
   final ValueChanged<String> onText;
@@ -42,11 +44,13 @@ class TerminalKeyboard extends StatefulWidget {
   State<TerminalKeyboard> createState() => TerminalKeyboardState();
 }
 
-class TerminalKeyboardState extends State<TerminalKeyboard> with TextInputClient {
+class TerminalKeyboardState extends State<TerminalKeyboard> with TextInputClient, WidgetsBindingObserver {
   static const _sentinel = TextEditingValue(text: '  ', selection: TextSelection.collapsed(offset: 2));
 
   TextInputConnection? _connection;
   TextEditingValue _value = _sentinel;
+  double _imeInset = 0;
+  bool _deferAutomaticShow = false;
 
   /// The IME holds unfinished text: hardware-style key events must wait.
   bool get composing => _value.composing.isValid && !_value.composing.isCollapsed;
@@ -57,6 +61,29 @@ class TerminalKeyboardState extends State<TerminalKeyboard> with TextInputClient
   void initState() {
     super.initState();
     widget.focusNode.addListener(_sync);
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _imeInset = View.of(context).viewInsets.bottom;
+  }
+
+  @override
+  void didChangeMetrics() {
+    final inset = View.of(context).viewInsets.bottom;
+    if (widget.deferAfterAndroidInsetLoss && widget.focusNode.hasFocus) {
+      // Back and docked-to-floating both remove a bottom inset. Avoid an
+      // automatic reopen on later focus changes, but don't detach a client
+      // (and lose composition) just because its keyboard stopped resizing us.
+      if (inset > 0) {
+        _deferAutomaticShow = false;
+      } else if (_imeInset > 0) {
+        _deferAutomaticShow = true;
+      }
+    }
+    _imeInset = inset;
   }
 
   @override
@@ -71,14 +98,23 @@ class TerminalKeyboardState extends State<TerminalKeyboard> with TextInputClient
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     widget.focusNode.removeListener(_sync);
     _close();
     super.dispose();
   }
 
-  /// Brings the keyboard back (a tap on the screen after it was dismissed).
+  /// Brings the keyboard back on explicit user input. Keep a visible or
+  /// composing connection intact, even for a floating IME with no inset.
   void show() {
     if (!widget.enabled) return;
+    _deferAutomaticShow = false;
+    final existing = _connection;
+    if (widget.focusNode.hasFocus && existing != null && existing.attached && (_imeInset > 0 || composing)) {
+      existing.show();
+      return;
+    }
+    _close();
     if (!widget.focusNode.hasFocus) {
       widget.focusNode.requestFocus();
       return;
@@ -97,10 +133,10 @@ class TerminalKeyboardState extends State<TerminalKeyboard> with TextInputClient
   }
 
   void _sync() {
-    if (widget.enabled && widget.focusNode.hasFocus) {
-      _open();
-    } else {
+    if (!widget.enabled || !widget.focusNode.hasFocus) {
       _close();
+    } else if (!_deferAutomaticShow) {
+      _open();
     }
   }
 
@@ -116,7 +152,8 @@ class TerminalKeyboardState extends State<TerminalKeyboard> with TextInputClient
         inputAction: TextInputAction.newline,
         keyboardAppearance: Brightness.dark,
         autocorrect: false,
-        enableSuggestions: false,
+        // Disabling suggestions sets Android's visible-password input type.
+        enableSuggestions: true,
         enableIMEPersonalizedLearning: false,
         smartDashesType: SmartDashesType.disabled,
         smartQuotesType: SmartQuotesType.disabled,
@@ -124,9 +161,11 @@ class TerminalKeyboardState extends State<TerminalKeyboard> with TextInputClient
     );
     _connection = connection;
     _value = _sentinel;
+    // On Android, setEditingState triggers restartInput for a new client.
+    // Ask the IME to show after that request, not on the previous editor.
     connection
-      ..show()
-      ..setEditingState(_sentinel);
+      ..setEditingState(_sentinel)
+      ..show();
   }
 
   void _close() {

@@ -26,6 +26,10 @@ import io.flutter.plugin.common.PluginRegistry
 import io.github.ccch1mneyyy.dsh_app.runtime.PhoneStorage
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.StandardCopyOption.REPLACE_EXISTING
+import java.security.MessageDigest
 import kotlin.concurrent.thread
 
 /**
@@ -33,8 +37,9 @@ import kotlin.concurrent.thread
  * MethodChannel `dsh/files`.
  *
  * - `resolveGuest {path}` → host path of a local-engine file, or null.
- * - `listOutputs {depth}` → `[{path, bytes, modified}]` under `/sdcard/Download/DSH-Go`, then
- *   the old `/sdcard/Download/DSH` (guest paths; empty without phone storage).
+ * - `listOutputs {depth}` → up to 500 most recently modified `[{path, bytes, modified}]` from
+ *   `/sdcard/Download/DSH-Go` and the old `/sdcard/Download/DSH`
+ *   (guest paths; empty without phone storage).
  * - `open {path, mime, name, chooser}` → ACTION_VIEW through this app's FileProvider.
  * - `saveToDownloads {path, name, mime}` → shown location (`Download/DSH-Go/x.pdf`):
  *   MediaStore Downloads on API 29+, the public Downloads directory before
@@ -63,6 +68,7 @@ class FilesPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandle
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        onDetachedFromActivity()
         methods.setMethodCallHandler(null)
         pdfPages.run({ close() }) {}
     }
@@ -72,13 +78,16 @@ class FilesPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandle
         binding.addRequestPermissionsResultListener(this)
     }
 
-    override fun onDetachedFromActivityForConfigChanges() = onDetachedFromActivity()
+    override fun onDetachedFromActivityForConfigChanges() {
+        activity?.removeRequestPermissionsResultListener(this)
+        activity = null
+    }
 
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) = onAttachedToActivity(binding)
 
     override fun onDetachedFromActivity() {
-        activity?.removeRequestPermissionsResultListener(this)
-        activity = null
+        onDetachedFromActivityForConfigChanges()
+        finishPermission(granted = false)
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -144,9 +153,7 @@ class FilesPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandle
         return try {
             FileProvider.getUriForFile(context, authority, file)
         } catch (_: IllegalArgumentException) {
-            val dir = File(context.cacheDir, "artifacts/open").apply { mkdirs() }
-            val copy = File(dir, safeName(name))
-            file.copyTo(copy, overwrite = true)
+            val copy = copyForOpen(file, File(context.cacheDir, "artifacts/open"), name)
             FileProvider.getUriForFile(context, authority, copy)
         }
     }
@@ -187,20 +194,35 @@ class FilesPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandle
     }
 
     private fun ask(result: MethodChannel.Result, then: () -> Unit) {
+        if (pendingSave != null) return result.error("permission", "storage permission request already pending", null)
         val host = activity?.activity ?: return result.error("permission", "no activity to ask for permission", null)
+        val denied = { result.error("permission", "storage permission denied", null) }
         pendingSave = then
-        pendingDenied = { result.error("permission", "storage permission denied", null) }
-        host.requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), STORAGE_REQUEST)
+        pendingDenied = denied
+        try {
+            host.requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), STORAGE_REQUEST)
+        } catch (error: Exception) {
+            // A synchronous callback may already have consumed this request.
+            if (pendingDenied === denied) {
+                pendingSave = null
+                pendingDenied = null
+                result.error("permission", error.message, null)
+            }
+        }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray): Boolean {
         if (requestCode != STORAGE_REQUEST) return false
         val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+        finishPermission(granted)
+        return true
+    }
+
+    private fun finishPermission(granted: Boolean) {
         val next = if (granted) pendingSave else pendingDenied
         pendingSave = null
         pendingDenied = null
         next?.invoke()
-        return true
     }
 
     private fun saveNow(file: File, name: String, mime: String): String {
@@ -216,8 +238,7 @@ class FilesPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandle
         if (!canWriteShared()) throw FilesError("permission", "storage permission denied")
         val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val dir = File(downloads, SUBDIR).apply { mkdirs() }
-        val target = unique(dir, name)
-        file.copyTo(target)
+        val target = file.inputStream().use { LegacyDownloads.copy(it, dir, name) }
         MediaScannerConnection.scanFile(context, arrayOf(target.absolutePath), arrayOf(mime), null)
         return "${Environment.DIRECTORY_DOWNLOADS}/$SUBDIR/${target.name}"
     }
@@ -235,7 +256,9 @@ class FilesPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandle
         try {
             resolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out) } }
                 ?: throw IOException("cannot write $uri")
-            resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            if (resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null) <= 0) {
+                throw IOException("cannot publish file")
+            }
         } catch (e: Exception) {
             resolver.delete(uri, null, null)
             throw e
@@ -264,7 +287,6 @@ class FilesPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandle
         fun walk(dir: File, level: Int) {
             val children = dir.listFiles() ?: return
             for (child in children.sortedBy { it.name }) {
-                if (out.size >= MAX_OUTPUTS) return
                 if (child.name.startsWith(".")) continue
                 if (child.isDirectory) {
                     if (level < depth) walk(child, level + 1)
@@ -279,7 +301,7 @@ class FilesPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandle
         }
         // The old folder too: earlier chats' files, and a user's own AGENTS.md that still names it.
         for (folder in listOf(SUBDIR, LEGACY_SUBDIR)) walk(File(hostRoot, "${Environment.DIRECTORY_DOWNLOADS}/$folder"), 1)
-        return out
+        return out.sortedByDescending { it["modified"] as Long }.take(MAX_OUTPUTS)
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -335,6 +357,30 @@ class FilesPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandle
         fun safeName(name: String): String {
             val cleaned = name.substringAfterLast('/').replace(Regex("[\\u0000-\\u001f\\\\:*?\"<>|]"), "_").trim()
             return cleaned.ifEmpty { "file" }
+        }
+
+        /** Stable per-source copies: another source cannot replace an already shared URI. */
+        internal fun copyForOpen(
+            file: File,
+            root: File,
+            name: String,
+            copy: (File, File) -> Unit = { from, to -> from.copyTo(to, overwrite = true) },
+        ): File {
+            val source = file.canonicalFile
+            val key = MessageDigest.getInstance("SHA-256")
+                .digest(source.path.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+            val target = File(File(root, key), safeName(name))
+            val directory = target.parentFile!!
+            directory.mkdirs()
+            val temporary = File.createTempFile(".open-", ".part", directory)
+            try {
+                copy(source, temporary)
+                // An older URI stays readable until its complete replacement is ready.
+                Files.move(temporary.toPath(), target.toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
+                return target
+            } finally {
+                temporary.delete()
+            }
         }
 
         /** [name] in [dir], or `name (2).ext`, `name (3).ext`… when taken. */

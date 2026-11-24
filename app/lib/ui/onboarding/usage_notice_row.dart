@@ -1,7 +1,7 @@
 // First run's welcome page, over 「开始」: the switch for anonymous usage
 // statistics (lib/usage/usage_stats.dart), on, and what it leaves out. Every
-// fresh install sees it, on this phone or a remote host; seeing it is what
-// lets the app start counting.
+// fresh install sees it, on this phone or a remote host; seeing it records
+// that the person was told — counting is on from the start.
 
 import 'dart:async';
 
@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../l10n/l10n.dart';
+import '../../state/android_features.dart';
 import '../../usage/usage_stats.dart';
 import '../settings/settings_widgets.dart';
 import '../theme/theme.dart';
@@ -39,6 +40,8 @@ class _UsageNoticeRowState extends ConsumerState<UsageNoticeRow> {
 
   @override
   Widget build(BuildContext context) {
+    // Nothing goes out on HarmonyOS yet, so there is nothing to agree to.
+    if (ref.watch(operatingSystemProvider) == 'ohos') return const SizedBox.shrink();
     final l10n = context.l10n;
     final theme = Theme.of(context);
     final enabled = ref.watch(usageStatsProvider.select((s) => s.enabled));
@@ -62,7 +65,7 @@ class _UsageNoticeRowState extends ConsumerState<UsageNoticeRow> {
                     ),
                     const SizedBox(height: 1),
                     Text(
-                      l10n.usageNoticeBody,
+                      ref.watch(operatingSystemProvider) == 'android' ? l10n.usageV4Welcome : l10n.usageNoticeBody,
                       style: theme.textTheme.bodySmall?.copyWith(color: DshColors.of(context).textTertiary),
                     ),
                   ],
@@ -71,7 +74,7 @@ class _UsageNoticeRowState extends ConsumerState<UsageNoticeRow> {
               const SizedBox(width: 12),
               SwitchTheme(
                 data: SwitchTheme.of(context).copyWith(materialTapTargetSize: MaterialTapTargetSize.shrinkWrap),
-                child: Switch(key: const ValueKey('usage-notice-switch'), value: enabled, onChanged: _set),
+                child: Switch.adaptive(key: const ValueKey('usage-notice-switch'), value: enabled, onChanged: _set),
               ),
             ],
           ),

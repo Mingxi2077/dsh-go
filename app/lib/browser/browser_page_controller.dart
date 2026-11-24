@@ -5,6 +5,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import '../ui/plugins/islands/island_platform.dart';
 import '../ui/web/web_file_chooser.dart';
+import '../remote/ssh/ssh_link.dart' show SshWebPreview;
 import '../ui/web/web_view_guard.dart';
 import 'browser_content.dart';
 import 'browser_downloads.dart';
@@ -18,8 +19,8 @@ export 'browser_models.dart' show BrowserPageContent;
 /// One external web document. Never installs a JavaScript channel or the DSH
 /// web bridges. The UI removes WebViewWidget before disposing this controller.
 class BrowserPageController extends ChangeNotifier implements BrowserDocument {
-  BrowserPageController({required Uri initialUrl, required this.onPageChanged}) : _url = initialUrl {
-    if (!BrowserPolicy.allows(initialUrl)) throw const FormatException('blocked_url');
+  BrowserPageController({required Uri initialUrl, required this.onPageChanged, this.webPreview}) : _url = initialUrl {
+    if (!_allows(initialUrl)) throw const FormatException('blocked_url');
     webView = WebViewController(onPermissionRequest: (request) => unawaited(request.deny()));
     _guard = WebViewGuard(
       onGone: (_) {
@@ -35,6 +36,9 @@ class BrowserPageController extends ChangeNotifier implements BrowserDocument {
       },
     );
   }
+
+  final SshWebPreview? webPreview;
+  bool _allows(Uri url) => webPreview?.allows(url) ?? BrowserPolicy.allows(url);
 
   final void Function(Uri url, String title) onPageChanged;
   void Function(BrowserDownloadRequest request)? onDownloadRequested;
@@ -96,7 +100,7 @@ class BrowserPageController extends ChangeNotifier implements BrowserDocument {
           onNavigationRequest: (request) {
             if (_disposed || rendererGone) return NavigationDecision.prevent;
             final target = Uri.tryParse(request.url);
-            if (target == null || !BrowserPolicy.allows(target)) {
+            if (target == null || !_allows(target)) {
               if (request.isMainFrame) _failure('blocked_url');
               return NavigationDecision.prevent;
             }
@@ -110,7 +114,7 @@ class BrowserPageController extends ChangeNotifier implements BrowserDocument {
           onPageStarted: (raw) {
             if (_disposed || rendererGone) return;
             final target = Uri.tryParse(raw);
-            if (target == null || !BrowserPolicy.allows(target)) {
+            if (target == null || !_allows(target)) {
               unawaited(webView.runJavaScript('window.stop()').catchError((Object _) {}));
               _failure('blocked_url');
             } else {
@@ -126,7 +130,7 @@ class BrowserPageController extends ChangeNotifier implements BrowserDocument {
           onUrlChange: (change) {
             if (_disposed || rendererGone) return;
             final target = Uri.tryParse(change.url ?? '');
-            if (target == null || !BrowserPolicy.allows(target)) {
+            if (target == null || !_allows(target)) {
               _failure('blocked_url');
               return;
             }
@@ -161,7 +165,7 @@ class BrowserPageController extends ChangeNotifier implements BrowserDocument {
       await _guard.attach(webView, dark: dark, textZoom: textZoom);
       if (_disposed) return;
       final downloadId = WebViewGuard.identifierOf(webView);
-      if (downloadId != null) {
+      if (downloadId != null && webPreview == null) {
         _downloadViewId = downloadId;
         await _downloads.attach(downloadId, (request) => unawaited(_downloadOffered(request)));
       }
@@ -219,7 +223,7 @@ class BrowserPageController extends ChangeNotifier implements BrowserDocument {
       notifyListeners();
       try {
         final actual = Uri.tryParse(await webView.currentUrl() ?? '');
-        if (current() && actual != null && actual != request.url && BrowserPolicy.allows(actual)) {
+        if (current() && actual != null && actual != request.url && _allows(actual)) {
           final state = await webView.runJavaScriptReturningResult('document.readyState');
           if (current() && (state == 'complete' || state == '"complete"')) {
             _url = actual;
@@ -322,7 +326,7 @@ class BrowserPageController extends ChangeNotifier implements BrowserDocument {
   }
 
   Future<void> load(Uri uri) async {
-    if (!BrowserPolicy.allows(uri)) throw const FormatException('blocked_url');
+    if (!_allows(uri)) throw const FormatException('blocked_url');
     if (_disposed || rendererGone) throw StateError('renderer_gone');
     final fragmentOnly = uri.removeFragment() == _url.removeFragment() && uri.fragment != _url.fragment;
     _begin(uri, waitingForStart: true);

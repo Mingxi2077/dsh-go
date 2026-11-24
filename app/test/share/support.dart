@@ -11,6 +11,7 @@ import 'package:dsh_app/state/attachments.dart' show sessionImageProvider;
 import 'package:dsh_app/state/chat_state.dart';
 import 'package:dsh_app/ui/share/share_card.dart';
 import 'package:dsh_app/ui/share/share_content.dart';
+import 'package:dsh_app/ui/share/share_export.dart';
 import 'package:dsh_app/ui/share/share_gallery.dart';
 import 'package:dsh_app/ui/theme/theme.dart';
 import 'package:dsh_client/dsh_client.dart';
@@ -63,7 +64,7 @@ ShareContent sampleReplyContent() => ShareContent(
   process: sampleProcess,
 );
 
-/// About twice what fits on one card.
+/// A reply longer than the old one-card truncation budget.
 String longAnswer() =>
     [for (var i = 1; i <= 24; i++) '$i. 第 $i 步：检查 `step_$i.dart` 里的状态机，确认每个分支在出错时都会把按钮恢复成可点状态，并补一条对应的单元测试。']
         .join('\n\n');
@@ -144,9 +145,11 @@ Future<void> pumpShareCard(
           data: MediaQuery.of(context).copyWith(textScaler: TextScaler.linear(textScale)),
           child: child!,
         ),
-        home: Align(
-          alignment: Alignment.topLeft,
-          child: RepaintBoundary(key: boundary, child: card),
+        home: SingleChildScrollView(
+          child: Align(
+            alignment: Alignment.topLeft,
+            child: ShareCaptureBoundary(key: boundary, child: card),
+          ),
         ),
       ),
     ),
@@ -180,7 +183,8 @@ Future<List<Uint8List>> photos(WidgetTester tester) async => (await tester.runAs
 
 /// Attachments `p0`… of conversation `s1`, served from [bytes].
 Override attachmentsFrom(List<Uint8List> bytes) => sessionImageProvider.overrideWith((ref, key) async {
-  final (sessionId, id) = key;
+  final (sessionId, attachment) = key;
+  final id = attachment.attachmentId;
   if (sessionId != 's1' || !id.startsWith('p')) throw StateError('gone');
   return bytes[int.parse(id.substring(1))];
 });

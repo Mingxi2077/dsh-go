@@ -28,7 +28,7 @@ if os.geteuid() == 0:
 identity = {'user': uid, 'group': gid, 'extra_groups': []} if os.geteuid() == 0 else {}
 jar = base / 'startup.jar'
 runtime = repo / 'app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/runtime'
-sources = [runtime / name for name in ['DshProcess.kt', 'LaunchDiagnostics.kt', 'DirectLaunch.kt', 'L2sMigration.kt', 'RuntimeProcessOwnership.kt', 'SpeechGuest.kt']]
+sources = [runtime / name for name in ['DshProcess.kt', 'LogRedactor.kt', 'CrashClassifier.kt', 'ProotTempFiles.kt', 'LaunchDiagnostics.kt', 'DirectLaunch.kt', 'L2sMigration.kt', 'RuntimeProcessOwnership.kt', 'SpeechGuest.kt', 'TawcrootLaunch.kt', 'TawcrootLinks.kt']]
 sources += list((here / 'startup-probe').glob('*.kt'))
 sources += [here / 'cleanup-probe' / name for name in ['AndroidContext.kt', 'AndroidOs.kt', 'AndroidProcess.kt', 'UnusedPhoneContract.kt']]
 (out / 'inputs.json').write_text(json.dumps([{'path': str(p.relative_to(repo)), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in sources], indent=2) + '\n')
@@ -47,12 +47,20 @@ try:
         'default-owned', 'default-captured-unknown', 'default-owned-reaped',
         'fresh-default-alias', 'prior-direct-alias', 'carried-direct-alias', 'symlink-config-no-alias',
     ]]
+    cases += [('PidHintProbeKt', case) for case in ['stale-hint', 'captured-hidden', 'visible-owned']]
+    cases += [('StartupObservationProbeKt', case) for case in [
+        'direct-ambient', 'tawc-ambient', 'direct-captured', 'tawc-captured', 'proot-links-ambient',
+    ]]
     cases += [('ProcessRetryProbeKt', case) for case in ['ambient-retry', 'captured-retry']]
     cases += [('ProcessScopeProbeKt', case) for case in [
         'alias-captured', 'other-root-isolated', 'exited-retry', 'foreign-uid-retired',
     ]]
     cases += [('ProcessCaptureProbeKt', case) for case in [
         'guest-capture-retry', 'empty-cell-recapture', 'capture-serialized-with-reap',
+    ]]
+    cases += [('ProotTempCleanupProbeKt', case) for case in [
+        'stale', 'other-runtime', 'observation-gap', 'pid-denied',
+        'store-symlink', 'candidate-symlink',
     ]]
     for probe, case in cases:
         command = ['java', '-cp', str(jar), 'io.github.ccch1mneyyy.dsh_app.runtime.' + probe,
@@ -67,6 +75,9 @@ try:
         records.append(record)
         (out / 'commands.json').write_text(json.dumps(records, indent=2) + '\n')
         print(json.dumps({'case': case, 'exit': result.returncode}), flush=True)
+        if result.returncode != 0:
+            print(result.stdout, flush=True)
+            print(result.stderr, flush=True)
     summary = {'scope': 'production start/cleanup; actual non-root JVM; injected Android API faults; launcher records argv, not a complete PRoot engine',
                'passed': sum(r['exit'] == 0 for r in records), 'failed': sum(r['exit'] != 0 for r in records)}
     (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')

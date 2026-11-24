@@ -5,10 +5,12 @@
 import 'dart:async';
 
 import 'package:dsh_client/dsh_client.dart';
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../l10n/l10n.dart';
+import '../runtime/local_paths.dart';
 import 'chat_state.dart';
 import 'connection_state.dart';
 import 'settings_state.dart';
@@ -192,6 +194,7 @@ class Artifact {
     this.description,
     this.seq,
     this.bytes,
+    this.snapshotImage = false,
   });
 
   /// Absolute path in the Host's filesystem (as declared when it could not
@@ -199,6 +202,22 @@ class Artifact {
   final String path;
   final ArtifactOrigin origin;
   final int turn;
+
+  /// Chat previews keep the first successful read of this turn; workspace
+  /// previews continue following the live file.
+  final bool snapshotImage;
+
+  Artifact withImageSnapshot() => kind != ArtifactKind.image || snapshotImage
+      ? this
+      : Artifact(
+          path: path,
+          origin: origin,
+          turn: turn,
+          description: description,
+          seq: seq,
+          bytes: bytes,
+          snapshotImage: true,
+        );
 
   /// The model's description (deliverables only).
   final String? description;
@@ -262,9 +281,10 @@ final _drive = RegExp(r'^[A-Za-z]:[\\/]');
 /// Decode the URI path once; query strings and fragments are not filenames.
 String? resolveWorkspaceLink(String url, {String? baseDir}) {
   var target = url.trim();
-  if (target.startsWith('<') && target.endsWith('>')) {
-    target = target.substring(1, target.length - 1).trim();
-  }
+  final bracketed = target.startsWith('<') && target.endsWith('>');
+  if (bracketed) target = target.substring(1, target.length - 1).trim();
+  // `C:/A/b.png` would parse as a URI with the scheme `c` (#1430).
+  if (_drive.hasMatch(target)) return _drivePath(target, decode: !bracketed, cwd: baseDir);
   if (target.isEmpty || target.startsWith('#') || target.startsWith('?') || target.startsWith('//')) return null;
   final uri = Uri.tryParse(target);
   if (uri == null) return null;
@@ -293,33 +313,41 @@ String? resolveWorkspaceLink(String url, {String? baseDir}) {
   return resolveSessionPath(path, cwd: baseDir);
 }
 
-/// Local file paths a reply links to (`[a](<out/a.pdf>)`, `![b](chart.png)`),
-/// in order, resolved against [cwd]; web links and anchors dropped.
-List<String> linkedPaths(String text, {String? cwd}) {
-  final out = <String>[];
-  for (final match in _linkTarget.allMatches(text)) {
-    var target = (match.group(1) ?? match.group(2) ?? '').trim();
-    final String? path;
-    if (_drive.hasMatch(target)) {
-      // Preserve existing artifact support for remote Windows paths.
-      final hash = target.indexOf('#');
-      if (hash >= 0) target = target.substring(0, hash);
-      if (match.group(1) == null) {
-        try {
-          target = Uri.decodeFull(target);
-        } on ArgumentError {
-          // Keep it as written.
-        } on FormatException {
-          continue;
-        }
-      }
-      path = resolveSessionPath(target, cwd: cwd);
-    } else {
-      path = resolveWorkspaceLink(target, baseDir: cwd);
+/// A Windows drive path as a Markdown destination (`C:/A/b.png`): no query or fragment (a
+/// Windows name can't hold `?`), and percent escapes decoded unless it was written in `<>`.
+String? _drivePath(String target, {required bool decode, String? cwd}) {
+  final cut = target.indexOf(RegExp('[?#]'));
+  if (cut >= 0) target = target.substring(0, cut);
+  if (decode) {
+    try {
+      target = Uri.decodeFull(target);
+    } on ArgumentError {
+      // Keep it as written.
+    } on FormatException {
+      return null;
     }
-    if (path != null && !out.contains(path)) out.add(path);
   }
-  return out;
+  return resolveSessionPath(target, cwd: cwd);
+}
+
+/// Code in a reply: fenced blocks (fences start a line; closed by one at least as long, or
+/// running to the end), and inline spans.
+final _code = RegExp(r'^ {0,3}(`{3,}|~{3,})[\s\S]*?(?:^ {0,3}\1|(?![\s\S]))|`[^`\n]*`', multiLine: true);
+
+/// Local file paths a reply links to (`[a](<out/a.pdf>)`, `![b](chart.png)`),
+/// in order, resolved against [cwd]; web links and anchors dropped, and links shown as
+/// examples in code ignored (#1432).
+List<String> linkedPaths(String text, {String? cwd}) {
+  if (!text.contains('](')) return [];
+  final out = <String>{};
+  for (final match in _linkTarget.allMatches(text.replaceAll(_code, ' '))) {
+    final target = (match.group(1) ?? match.group(2) ?? '').trim();
+    final path = _drive.hasMatch(target)
+        ? _drivePath(target, decode: match.group(1) == null, cwd: cwd)
+        : resolveWorkspaceLink(target, baseDir: cwd);
+    if (path != null) out.add(path);
+  }
+  return out.toList();
 }
 
 class _TurnScan {
@@ -370,8 +398,9 @@ List<TurnArtifacts> deriveArtifacts({
         if (created != null) scan.written.add((created, event.seq));
       case AssistantMessageEvent(:final turn, :final message):
         if (!finished.containsKey(turn)) break;
-        if (message.text.trim().isNotEmpty) {
-          (scans[turn] ??= _TurnScan()).reply = message.text;
+        final text = message.text;
+        if (text.trim().isNotEmpty) {
+          (scans[turn] ??= _TurnScan()).reply = text;
         }
       default:
         break;
@@ -432,6 +461,70 @@ List<TurnArtifacts> deriveArtifacts({
   return List.unmodifiable(out);
 }
 
+/// Reuses finished turns without rejoining their replies or scanning their links.
+/// Raw event identities also invalidate late declarations and replaced history;
+/// a reused [TurnTrace] alone does not cover those changes.
+class SessionArtifactsCache {
+  var _turns = <TurnTrace, ({List<SessionLogEvent> events, TurnArtifacts? artifacts})>{};
+  String? _cwd;
+  List<PhoneOutput>? _outputs;
+
+  List<TurnArtifacts> derive({
+    required Iterable<SessionLogEvent> events,
+    required List<TurnTrace> turns,
+    String? cwd,
+    List<PhoneOutput> phoneOutputs = const [],
+  }) {
+    if (_cwd != cwd || !identical(_outputs, phoneOutputs)) _turns.clear();
+    _cwd = cwd;
+    _outputs = phoneOutputs;
+    final finished = <int, TurnTrace>{
+      for (final trace in turns)
+        if (!trace.running && trace.endSeq != null) trace.turn: trace,
+    };
+    if (finished.isEmpty) {
+      _turns.clear();
+      return const [];
+    }
+    final byTurn = {for (final turn in finished.keys) turn: <SessionLogEvent>[]};
+    for (final event in events) {
+      final turn = switch (event) {
+        ToolCallEvent(:final turn) || ToolResultEvent(:final turn) || AssistantMessageEvent(:final turn) => turn,
+        _ when event.type == presentedEventType => event.data['turn'],
+        _ => null,
+      };
+      byTurn[turn]?.add(event);
+    }
+    final next = <TurnTrace, ({List<SessionLogEvent> events, TurnArtifacts? artifacts})>{};
+    final missing = <TurnTrace>[];
+    for (final trace in finished.values) {
+      final cached = _turns[trace];
+      if (cached != null && listEquals(cached.events, byTurn[trace.turn])) {
+        next[trace] = cached;
+      } else {
+        missing.add(trace);
+      }
+    }
+    final derived = {
+      for (final group in deriveArtifacts(
+        events: missing.expand((trace) => byTurn[trace.turn]!),
+        turns: missing,
+        cwd: cwd,
+        phoneOutputs: phoneOutputs,
+      ))
+        group.turn: group,
+    };
+    for (final trace in missing) {
+      next[trace] = (events: byTurn[trace.turn]!, artifacts: derived[trace.turn]);
+    }
+    _turns = next;
+    // Labels are dynamic getters, so cached files still follow appL10n.
+    final out = <TurnArtifacts>[for (final trace in finished.values) ?next[trace]!.artifacts]
+      ..sort((a, b) => a.endSeq.compareTo(b.endSeq));
+    return List.unmodifiable(out);
+  }
+}
+
 /// The file a successful `write` / `str_replace_editor create` created
 /// (null for edits, overwrites and other tools). The result's absolute
 /// `meta.path` wins over the argument, as in the official client.
@@ -490,7 +583,9 @@ class FilesChannel {
       channel.invokeMethod<void>('open', {'path': hostPath, 'name': name, 'mime': mime, 'chooser': chooser});
 
   /// Copies an Android file into the public Downloads (`Download/DSH-Go`);
-  /// returns where it landed (`Download/DSH-Go/report.pdf`).
+  /// returns where it landed (`Download/DSH-Go/report.pdf`). On HarmonyOS the
+  /// system's save window asks where: see [savedInChosenPlace] and
+  /// [saveWindowDismissed].
   Future<String> saveToDownloads(String hostPath, {required String name, required String mime}) async =>
       await channel.invokeMethod<String>('saveToDownloads', {'path': hostPath, 'name': name, 'mime': mime}) ??
       'Download/DSH-Go/$name';
@@ -515,9 +610,20 @@ class FilesChannel {
 
 final filesChannelProvider = Provider<FilesChannel>((ref) => const FilesChannel());
 
+/// Whether [where], from [FilesChannel.saveToDownloads], is the URI the system's
+/// save window answered with (HarmonyOS): the person chose the place, and a
+/// `file://…` means nothing to read, so a note only says it's saved.
+bool savedInChosenPlace(String where) => where.contains('://');
+
+/// Whether [error], from [FilesChannel.saveToDownloads], is the person backing
+/// out of the system's save window (HarmonyOS): nothing saved and nothing wrong,
+/// so nothing to say. Android has no such window and never answers this.
+bool saveWindowDismissed(Object error) => error is PlatformException && error.code == 'cancelled';
+
 /// The local engine's output folder ([phoneOutputDir]); empty unless the
-/// engine is on this phone with "访问手机文件" on. Scanned when first needed
-/// and again whenever a turn ends ([refresh]).
+/// engine is on this phone with "访问手机文件" on (on HarmonyOS the folder is in
+/// the app's own files and needs no such access). Scanned when first needed and
+/// again whenever a turn ends ([refresh]).
 class PhoneOutputsController extends Notifier<List<PhoneOutput>> {
   bool _enabled = false;
 
@@ -525,7 +631,7 @@ class PhoneOutputsController extends Notifier<List<PhoneOutput>> {
   List<PhoneOutput> build() {
     final local = ref.watch(activeConnectionProvider.select((c) => c.value?.isLocal ?? false));
     final storage = ref.watch(settingsProvider.select((s) => s.phoneStorage));
-    _enabled = local && storage;
+    _enabled = local && (storage || LocalPaths.noGuest);
     if (_enabled) unawaited(refresh());
     return const [];
   }
@@ -555,6 +661,10 @@ class PhoneOutputsController extends Notifier<List<PhoneOutput>> {
 
 final phoneOutputsProvider = NotifierProvider<PhoneOutputsController, List<PhoneOutput>>(PhoneOutputsController.new);
 
+final _sessionArtifactsCacheProvider = Provider.autoDispose.family<SessionArtifactsCache, String>(
+  (ref, sessionId) => SessionArtifactsCache(),
+);
+
 /// Every finished turn's artifacts in one session ([deriveArtifacts]).
 final sessionArtifactsProvider = Provider.autoDispose.family<List<TurnArtifacts>, String>((ref, sessionId) {
   final turns = ref.watch(chatProvider(sessionId).select((s) => s.turns));
@@ -565,5 +675,7 @@ final sessionArtifactsProvider = Provider.autoDispose.family<List<TurnArtifacts>
   });
   final outputs = ref.watch(phoneOutputsProvider);
   final chat = ref.read(chatProvider(sessionId).notifier);
-  return deriveArtifacts(events: chat.events, turns: turns, cwd: chat.header?.cwd, phoneOutputs: outputs);
+  return ref
+      .watch(_sessionArtifactsCacheProvider(sessionId))
+      .derive(events: chat.events, turns: turns, cwd: chat.header?.cwd, phoneOutputs: outputs);
 });

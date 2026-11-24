@@ -26,7 +26,9 @@ Subscription? lapsedSubscription(LlmFailure? failure, [String text = '']) {
   for (final source in [?failure?.message, text]) {
     final m = _grantLost.firstMatch(source);
     if (m == null) continue;
-    return Subscription.fromWire(m.group(1) ?? m.group(2));
+    final subscription = Subscription.fromWire(m.group(1) ?? m.group(2));
+    // These pi-ai errors must not offer the official, local-only login.
+    return subscription == Subscription.chatgptOfficial ? null : subscription;
   }
   return null;
 }
@@ -69,7 +71,7 @@ class _NoticeRowState extends State<NoticeRow> {
           }
           return (AppIcons.noApiKey, appL10n.chatDeepSeekKeyMissing);
         }
-        return (AppIcons.error, turnFailureText(failure?.code));
+        return (AppIcons.error, turnFailureText(failure?.code, message: failure?.message));
       case 'aborted':
         return (AppIcons.stopped, appL10n.commonStopped);
       case 'max-tokens':
@@ -206,12 +208,20 @@ class _NoticeKey extends StatelessWidget {
 /// `ChatState.error` 的行内横幅:浮在输入条上方,可关闭。
 /// [info] 用于 `ChatState.notice`:提示而非失败,换成信息色和图标。
 class ErrorBanner extends StatelessWidget {
-  const ErrorBanner({super.key, required this.message, this.onDismiss, this.info = false, this.action});
+  const ErrorBanner({
+    super.key,
+    required this.message,
+    this.onDismiss,
+    this.info = false,
+    this.action,
+    this.maxLines = 3,
+  });
 
   final String message;
   final VoidCallback? onDismiss;
   final bool info;
   final NoticeAction? action;
+  final int? maxLines;
 
   @override
   Widget build(BuildContext context) {
@@ -244,8 +254,8 @@ class ErrorBanner extends StatelessWidget {
               Expanded(
                 child: Text(
                   message,
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
+                  maxLines: maxLines,
+                  overflow: maxLines == null ? TextOverflow.visible : TextOverflow.ellipsis,
                   style: theme.textTheme.bodySmall?.copyWith(color: onContainer),
                 ),
               ),

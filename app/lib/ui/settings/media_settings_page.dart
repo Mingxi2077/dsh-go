@@ -13,7 +13,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../l10n/l10n.dart';
 import '../../state/engine_settings_state.dart';
+import '../../state/connection_state.dart';
 import '../../state/media_generation.dart';
+import '../../state/hosts_state.dart';
 import '../../state/plugins_state.dart';
 import '../common/app_sheet.dart';
 import '../common/empty_view.dart';
@@ -74,8 +76,35 @@ class MediaInstallPrompt extends ConsumerWidget {
       await showMarketPluginSheet(context, entry);
       return;
     }
-    final job = await installMarketEntry(context, entry);
-    if (job?.phase == PluginInstallPhase.succeeded && context.mounted) onInstalled?.call();
+    // This consumer closes its sheet; the shared install result may still be
+    // returned after its Host or route has lost ownership.
+    final container = ProviderScope.containerOf(context, listen: false);
+    final originHost = container.read(activeHostProvider);
+    final route = ModalRoute.of(context);
+    var retired = false;
+    final hostChanges = container.listen(activeHostProvider, (_, next) {
+      if (next != originHost) retired = true;
+    });
+    // A display PluginHost can disappear/rebuild while this same client
+    // recovers a lost install response. Only a replacement client retires it.
+    final connectionChanges = container.listen(activeConnectionProvider, (_, next) {
+      final client = next.value?.client;
+      if (client != null && !identical(client, host.client)) retired = true;
+    });
+    try {
+      final job = await installMarketEntry(context, entry);
+      if (job?.phase == PluginInstallPhase.succeeded &&
+          context.mounted &&
+          !retired &&
+          container.read(activeHostProvider) == originHost &&
+          identical(container.read(activeConnectionProvider).value?.client, host.client) &&
+          route?.isCurrent == true) {
+        onInstalled?.call();
+      }
+    } finally {
+      hostChanges.close();
+      connectionChanges.close();
+    }
   }
 
   @override
@@ -83,12 +112,22 @@ class MediaInstallPrompt extends ConsumerWidget {
     final l10n = context.l10n;
     final entry = ref.watch(mediaMarketEntryProvider);
     final job = entry == null ? null : ref.watch(pluginInstallsProvider.select((jobs) => jobs[entry.name]));
+    // Installed and off still has the plugin pages to go to; otherwise this engine has no way to get it.
+    final refused =
+        (ref.watch(pluginHostProvider)?.installRefused ?? false) &&
+        !(ref
+                .watch(installedPluginsProvider)
+                .value
+                ?.any((b) => isMediaPluginName(b.name) && (b.installed || b.availability == 'profile')) ??
+            false);
     return EmptyView(
       icon: AppIcons.generateMedia,
       compact: compact,
       title: l10n.mediaInstallTitle,
-      message: l10n.mediaInstallBody,
-      action: job != null && job.isActive
+      message: refused ? l10n.marketInstallRefused : l10n.mediaInstallBody,
+      action: refused
+          ? null
+          : job != null && job.isActive
           ? ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 320),
               child: PluginInstallProgress(

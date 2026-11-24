@@ -53,8 +53,9 @@ class IslandRecipe {
 
   final Set<IslandForm> forms;
 
-  /// `settings`, `settings-general`, `plugin`, `plugin-row`, `panel`,
-  /// `rightbar`, `session-view`, `session` or `none`.
+  /// `settings`, `settings-general`, `settings-plugins`, `sidebar`,
+  /// `plugin`, `plugin-row`, `plugin-detail`, `panel`, `rightbar`,
+  /// `session-view`, `session` or `none`.
   final String open;
   final IslandStretch stretch;
   final double padX;
@@ -190,7 +191,7 @@ class IslandRecipeBook {
     final cell = spec.cell ?? '';
     final names = [
       for (final l in labels)
-        if (l.trim().isNotEmpty) l.trim(),
+        if (l.replaceAll(RegExp(r'\s+'), ' ').trim() case final clean when clean.isNotEmpty) clean,
     ];
     Map<String, Object?> at({Map<String, Object?>? web, Map<String, Object?>? then}) => {
       if (recipe.session) 'session': session,
@@ -202,7 +203,17 @@ class IslandRecipeBook {
         if (cell.isEmpty) return at(web: {'settings': 'general'});
         if (officialSettings.contains(cell)) return at(web: {'settings': cell});
         if (names.isEmpty) return null;
-        return at(web: {'settings': 'general'}, then: {'settings': names});
+        return at(web: {'settings': true}, then: {'settings': names});
+      case 'sidebar':
+        if (spec.package == null || spec.package!.isEmpty || cell.isEmpty) return null;
+        return at(web: {'sidebar': true}, then: {'sidebar': true});
+      case 'settings-plugins':
+        if (spec.package == null || spec.package!.isEmpty || cell.isEmpty) return null;
+        return at(web: {'settings': 'plugins'}, then: {'settingsPlugin': cell});
+      case 'plugin-detail':
+        final package = spec.package;
+        if (package == null || package.isEmpty || cell.isEmpty) return null;
+        return at(web: {'panel': 'plugins'}, then: {'plugin': package});
       case 'settings-general':
         return at(web: {'settings': 'general'});
       case 'plugin':

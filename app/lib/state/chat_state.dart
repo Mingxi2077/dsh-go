@@ -1,15 +1,18 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../diagnostics/app_error_log.dart';
 import '../l10n/l10n.dart';
 import '../usage/usage_stats.dart';
 import 'attachments.dart';
 import 'chat_error_text.dart';
 import 'connection_state.dart';
 import 'hosts_state.dart';
+import 'models_state.dart';
 import 'notify_state.dart' show appForegroundProvider;
 import 'run_pulse.dart';
 import 'sessions_state.dart';
@@ -93,6 +96,7 @@ class PendingPrompt {
     this.sourceKind = 'user',
     this.sourceForm,
     this.webComposition,
+    this.failureSeq,
   });
 
   final String requestId;
@@ -118,7 +122,15 @@ class PendingPrompt {
   /// retain their existing pending behavior.
   final String sourceKind;
   final String? sourceForm;
+
+  /// Original structured web references, retained locally for withdraw/retry.
+  /// The Host receives only the flattened [text].
   final WebQuoteComposition? webComposition;
+
+  /// A claimed submission ended without an echo or a restored inbox item.
+  /// Keep its local bytes editable on older Hosts instead of losing them.
+  final int? failureSeq;
+  bool get failed => failureSeq != null;
 
   bool get isBackgroundTask => sourceKind == 'tool-jobs';
 
@@ -144,7 +156,64 @@ class PendingPrompt {
     sourceKind: sourceKind,
     sourceForm: sourceForm,
     webComposition: webComposition,
+    failureSeq: failureSeq,
   );
+
+  PendingPrompt failedAt(int seq, {String? editedText}) => PendingPrompt(
+    requestId: requestId,
+    text: editedText ?? text,
+    time: time,
+    mode: mode,
+    attachments: attachments,
+    resendable: resendable,
+    sourceKind: sourceKind,
+    sourceForm: sourceForm,
+    webComposition: webComposition,
+    failureSeq: seq,
+  );
+
+  /// Equal prompts publish as equal lists, so the chat keeps its rows (see
+  /// `ChatRowsCache`) while a reply streams with messages waiting.
+  @override
+  bool operator ==(Object other) =>
+      other is PendingPrompt &&
+      other.requestId == requestId &&
+      other.text == text &&
+      other.time == time &&
+      other.mode == mode &&
+      _sameAttachments(other.attachments, attachments) &&
+      other.inboxId == inboxId &&
+      other.slot == slot &&
+      other.resendable == resendable &&
+      other.sourceKind == sourceKind &&
+      other.sourceForm == sourceForm &&
+      other.webComposition == webComposition &&
+      other.failureSeq == failureSeq;
+
+  @override
+  int get hashCode =>
+      Object.hash(
+        requestId,
+        text,
+        time,
+        mode,
+        inboxId,
+        slot,
+        resendable,
+        sourceKind,
+        sourceForm,
+        webComposition,
+        failureSeq,
+      );
+
+  static bool _sameAttachments(List<DraftAttachment> a, List<DraftAttachment> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
 
   PendingPrompt placed(String? inboxId, InboxSlot? slot, {MessageSource? source}) => PendingPrompt(
     requestId: requestId,
@@ -232,6 +301,8 @@ class ChatState {
     this.loading = true,
     this.loadingOlder = false,
     this.error,
+    this.syncError,
+    this.defaultModelSaveFailed = false,
     this.notice,
     this.connection,
     this.model,
@@ -267,6 +338,14 @@ class ChatState {
   final bool loading;
   final bool loadingOlder;
   final String? error;
+
+  /// The current history follow failure, separate from action errors.
+  final String? syncError;
+
+  /// The session model changed, but remembering it for new chats failed.
+  /// Independent of transient send/sync errors; only explicit dismissal or a
+  /// later saved/skipped acknowledgement clears it.
+  final bool defaultModelSaveFailed;
 
   /// Something worth knowing that isn't a failure (e.g. images went as files
   /// because the model reads text only). Shown like [error], in info colours.
@@ -332,6 +411,9 @@ class ChatState {
     bool? loadingOlder,
     String? error,
     bool clearError = false,
+    String? syncError,
+    bool clearSyncError = false,
+    bool? defaultModelSaveFailed,
     String? notice,
     bool clearNotice = false,
     ModelSelection? model,
@@ -353,6 +435,8 @@ class ChatState {
     loading: loading ?? this.loading,
     loadingOlder: loadingOlder ?? this.loadingOlder,
     error: clearError ? null : (error ?? this.error),
+    syncError: clearSyncError ? null : (syncError ?? this.syncError),
+    defaultModelSaveFailed: defaultModelSaveFailed ?? this.defaultModelSaveFailed,
     notice: clearNotice ? null : (notice ?? this.notice),
     connection: connection,
     model: model ?? this.model,
@@ -401,6 +485,10 @@ class ChatController extends Notifier<ChatState> {
 
   final String sessionId;
   final ChatTranscript _transcript = ChatTranscript();
+  int? _usageTurn;
+  String? _usageAttempt;
+  void Function(UsageOutcome, {UsageOperation? actual})? _usageTurnEnd;
+  void Function(UsageOutcome, {UsageOperation? actual})? _usageFirstText;
   StreamSubscription<DshEvent>? _sub;
   StreamSubscription<DshConnectionState>? _states;
   Timer? _flush;
@@ -409,8 +497,13 @@ class ChatController extends Notifier<ChatState> {
   bool _dirty = false;
   ModelSelection? _model;
   Object? _modelChange;
+  bool _defaultModelSaveFailed = false;
   Object? _historyRead;
   List<PendingPrompt> _pending = const [];
+
+  /// When this device first saw each inbox item it did not send: a waiting
+  /// prompt keeps one time across publishes (and so stays equal).
+  final _inboxSeen = <String, DateTime>{};
 
   /// Prompts removed elsewhere or consumed by a finished turn: dropped at
   /// the next publish unless they are back by then (「改为插话」 removes,
@@ -420,6 +513,12 @@ class ChatController extends Notifier<ChatState> {
   /// Observed inbox claims, keyed by request identity and durable sequence.
   /// A pre-step hook may consume input without writing a user/message echo.
   final _claimedAt = <String, int>{};
+  final _retryingFailed = <String>{};
+
+  /// Sends still waiting for the Host to answer the prompt RPC. A prompt
+  /// here may well have landed; anything else with no inbox slot after a
+  /// fresh baseline did not.
+  final _delivering = <String>{};
 
   /// Our prompts taken out of the inbox to be sent again ([_takeOut]): their
   /// bubbles stay, as 「发送中」, until they are back.
@@ -441,8 +540,9 @@ class ChatController extends Notifier<ChatState> {
   final _commands = CommandLog();
   var _localCommands = 0;
 
-  /// A send whose outcome is unknown (the connection dropped mid-call):
-  /// sending the same content again reuses its request id, which DSH dedups.
+  /// A send whose outcome is unknown (the connection dropped mid-call).
+  /// Retrying its draft reuses the request id, which DSH dedups; on iOS a
+  /// replacement attachment is a new submission even with the same name.
   ({String content, String requestId})? _unsettled;
 
   /// Device minus Host clock; null until a live event was seen (and always
@@ -498,10 +598,9 @@ class ChatController extends Notifier<ChatState> {
       // These requests belong to the previous Host, even if the new Host has
       // the same session id. A new watch replays its own mux's pending requests.
       // Retire only the local cards; do not answer or cancel the old Host's work.
-      for (final id in [..._transcript.pendingApprovals.keys, ..._transcript.pendingQuestions.keys]) {
-        _transcript.apply(HostRequestCancelledEvent(id));
-      }
+      _retireHostRequests();
       _approvalHost = host;
+      _defaultModelSaveFailed = false;
       _approvalScope = Object();
       _autoApprove = false;
       _autoAnswered = const {};
@@ -510,6 +609,7 @@ class ChatController extends Notifier<ChatState> {
     _modelChange = null;
     _historyRead = null;
     _moving.clear();
+    _delivering.clear();
     _synchronized = false;
     _syncScope = Object();
     _resyncFuture = null;
@@ -537,6 +637,7 @@ class ChatController extends Notifier<ChatState> {
       // Invalidation runs before a lazy rebuild replaces the still-mounted Ref.
       _modelChange = null;
       _listenOwner = Object();
+      _finishUsageTurn(UsageOutcome.unknown);
       _followEpoch?.retire();
       if (!_syncReady.isCompleted) _syncReady.complete(false);
       release?.cancel();
@@ -624,6 +725,7 @@ class ChatController extends Notifier<ChatState> {
     syncing: true,
     commands: _commandList(),
     model: _model,
+    defaultModelSaveFailed: _defaultModelSaveFailed,
     pending: _placePending(),
     autoApprove: _autoApprove,
     autoAnswered: _autoAnswered,
@@ -631,6 +733,7 @@ class ChatController extends Notifier<ChatState> {
   );
 
   void _markSyncing({SessionFollowEpoch? epoch, bool building = false}) {
+    _finishUsageTurn(UsageOutcome.unknown);
     _followEpoch?.retire();
     _followEpoch = epoch;
     _syncScope = Object();
@@ -639,7 +742,9 @@ class ChatController extends Notifier<ChatState> {
     if (_syncReady.isCompleted) _syncReady = Completer<bool>();
     _stopTimeout?.cancel();
     _stoppingOperation = null;
-    if (!building) state = state.copyWith(syncing: true, stopping: false, loadingOlder: false);
+    if (!building) {
+      state = state.copyWith(syncing: true, stopping: false, loadingOlder: false, clearSyncError: epoch != null);
+    }
   }
 
   /// A first prompt may arrive immediately after session/create. Wait for the
@@ -707,6 +812,12 @@ class ChatController extends Notifier<ChatState> {
     })();
   }
 
+  void _retireHostRequests() {
+    for (final id in [..._transcript.pendingApprovals.keys, ..._transcript.pendingQuestions.keys]) {
+      _transcript.apply(HostRequestCancelledEvent(id));
+    }
+  }
+
   void _listen(DshClient client, RunPulse pulse, {bool building = false}) {
     final owner = ref;
     final listener = _listenOwner = Object();
@@ -716,6 +827,10 @@ class ChatController extends Notifier<ChatState> {
     _syncReady = Completer<bool>();
     _markSyncing(building: building);
     unawaited(_sub?.cancel());
+    // A new watch replays its own mux's pending requests. It cannot retract
+    // cards forwarded only by the previous watch and settled while it was away.
+    // Retire local cards before replay; consent and in-flight answers stay intact.
+    _retireHostRequests();
     _sub = client
         .watch(
           sessionId,
@@ -732,6 +847,10 @@ class ChatController extends Notifier<ChatState> {
         .listen(
           (event) {
             if (!current()) return;
+            if (event is SessionErrorEvent) {
+              // Remote hosts have no local engine log in the diagnostics ZIP.
+              appErrorLog.record(AppErrorSource.session, event.message, StackTrace.empty);
+            }
             if (event is SessionSyncEvent) {
               _markSyncing(epoch: event.epoch);
               return;
@@ -752,10 +871,13 @@ class ChatController extends Notifier<ChatState> {
             pulse.observe(event, skew: _sameClock ? Duration.zero : _skew);
             _trackModel(event);
             _trackCommands(event);
+            _observeUsageTurn(event);
+            _countTokens(event);
             final reconcile =
                 (event is InboxSplicedEvent && event.seq > _transcript.cursor) ||
                 (event is SessionSnapshotEvent && event.isResync);
             final before = reconcile ? _inboxIds() : const <String>{};
+            if (event is SessionSnapshotEvent) _trackSnapshotClaims(event.events);
             final changed = _transcript.apply(event);
             if (_awayLong && !_quiet && _transcript.running) scheduleMicrotask(_quietIfRunning);
             if (reconcile) {
@@ -764,27 +886,39 @@ class ChatController extends Notifier<ChatState> {
                 for (final prompt in _pending) {
                   if (removed.contains(prompt.requestId)) _claimedAt[prompt.requestId] = event.seq;
                 }
-              } else {
+              } else if (event is! SessionSnapshotEvent) {
                 _withdrawn.addAll(removed);
               }
+              // A restored claim is waiting again, not a failed submission.
+              // The recovery splice can arrive before or after turn/end.
+              final inbox = {for (final q in _transcript.inbox) ?q.requestId: q};
+              _claimedAt.removeWhere((id, _) => inbox.containsKey(id));
+              _withdrawn.removeAll(inbox.keys);
+              _pending = List.unmodifiable([
+                for (final prompt in _pending)
+                  if (prompt.failed && inbox.containsKey(prompt.requestId))
+                    // Keep local prompts unplaced: _placePending derives the
+                    // current inbox slot, or hides it while a move is in flight.
+                    prompt.placed(null, null)
+                  else
+                    prompt,
+              ]);
             }
-            // Turns execute serially: a later durable end settles an observed
-            // claim even when a plugin rejects the step without a user echo.
-            // Older replayed endings must never settle a newer request.
-            final endedThrough = switch (event) {
-              TurnEndedEvent(:final seq) => seq,
-              SessionSnapshotEvent(:final events) => events.whereType<TurnEndedEvent>().fold<int>(
-                0,
-                (last, end) => end.seq > last ? end.seq : last,
-              ),
-              _ => 0,
+            // A plugin may deliberately consume input without a user echo.
+            // Only failed/cancelled claims need the older-Host recovery card.
+            final endings = switch (event) {
+              final TurnEndedEvent end => [end],
+              SessionSnapshotEvent(:final events) =>
+                events.whereType<TurnEndedEvent>().toList()..sort((a, b) => a.seq.compareTo(b.seq)),
+              _ => <TurnEndedEvent>[],
             };
-            if (endedThrough > 0) {
-              _claimedAt.removeWhere((requestId, seq) {
-                if (seq >= endedThrough) return false;
-                _withdrawn.add(requestId);
-                return true;
-              });
+            for (final end in endings) {
+              _settleClaims(end);
+            }
+            if (event is UserMessageEvent) {
+              _dropEchoed([event]);
+            } else if (event is SessionSnapshotEvent) {
+              _dropEchoed(event.events);
             }
             // The stopped turn is over, even when what waited in the inbox
             // starts the next one at once (running never reads false).
@@ -803,7 +937,7 @@ class ChatController extends Notifier<ChatState> {
               _schedule();
             }
           },
-          onError: (Object e) {
+          onError: (Object e, StackTrace stack) {
             if (!current()) return;
             _watchEnded = true;
             _markSyncing();
@@ -815,11 +949,9 @@ class ChatController extends Notifier<ChatState> {
               }
               return;
             }
-            state = state.copyWith(
-              error: chatErrorText(e, action: appL10n.stateChatSyncInterrupted),
-              streamLost: true,
-              loading: false,
-            );
+            appErrorLog.record(AppErrorSource.session, e, stack);
+            final message = chatErrorText(e, action: appL10n.stateChatSyncInterrupted);
+            state = state.copyWith(error: message, syncError: message, streamLost: true, loading: false);
           },
           onDone: () {
             if (!current()) return;
@@ -832,6 +964,70 @@ class ChatController extends Notifier<ChatState> {
   }
 
   Set<String> _inboxIds() => {for (final q in _transcript.inbox) ?q.requestId};
+
+  /// Replay only unseen queue mutations: a claim and its end can both happen
+  /// during disconnection, leaving no inbox diff in the replacement snapshot.
+  void _trackSnapshotClaims(List<SessionLogEvent> events) {
+    if (_pending.isEmpty) return;
+    final ours = {for (final prompt in _pending) prompt.requestId};
+    final positions = <String, ({String target, int index})>{};
+    final counts = <String, int>{};
+    for (final prompt in _transcript.inbox) {
+      final target = prompt.steering ? 'next-step' : 'next-turn';
+      final index = counts[target] ?? 0;
+      counts[target] = index + 1;
+      if (ours.contains(prompt.requestId)) positions[prompt.requestId!] = (target: target, index: index);
+    }
+    final unseen = events.where((event) => event.seq > _transcript.cursor).toList()
+      ..sort((a, b) => a.seq.compareTo(b.seq));
+    for (final event in unseen.whereType<InboxSplicedEvent>()) {
+      final end = event.start + event.removedCount;
+      for (final entry in positions.entries.toList()) {
+        final position = entry.value;
+        if (position.target != event.target || position.index < event.start) continue;
+        if (position.index < end) {
+          positions.remove(entry.key);
+          if (event.canceled) {
+            _claimedAt.remove(entry.key);
+            _withdrawn.add(entry.key);
+          } else {
+            _claimedAt[entry.key] = event.seq;
+          }
+        } else {
+          positions[entry.key] = (
+            target: event.target,
+            index: position.index + event.inserted.length - event.removedCount,
+          );
+        }
+      }
+      for (var i = 0; i < event.inserted.length; i++) {
+        final id = event.inserted[i].source.requestId;
+        if (id == null || !ours.contains(id)) continue;
+        positions[id] = (target: event.target, index: event.start + i);
+        _claimedAt.remove(id);
+        _withdrawn.remove(id);
+      }
+    }
+  }
+
+  void _settleClaims(TurnEndedEvent end) {
+    final recover = const {'error', 'aborted', 'interrupted'}.contains(end.reason.kind);
+    final inbox = _inboxIds();
+    final settled = <String>{};
+    _claimedAt.removeWhere((id, seq) {
+      if (seq >= end.seq || inbox.contains(id)) return false;
+      settled.add(id);
+      return true;
+    });
+    if (recover) {
+      _withdrawn.removeAll(settled);
+      _pending = List.unmodifiable([
+        for (final prompt in _pending) settled.contains(prompt.requestId) ? prompt.failedAt(end.seq) : prompt,
+      ]);
+    } else {
+      _withdrawn.addAll(settled);
+    }
+  }
 
   /// Estimates [ChatState.clockSkew] from live durable events: arrival time
   /// minus Host time is skew plus delivery delay, so the smallest sample is
@@ -1005,7 +1201,6 @@ class ChatController extends Notifier<ChatState> {
       _stopTimeout?.cancel();
       _stoppingOperation = null;
     }
-    if (_pending.isNotEmpty) _dropEchoed(items);
     if (_withdrawn.isNotEmpty) {
       final inbox = _inboxIds();
       _pending = List.unmodifiable(
@@ -1019,6 +1214,23 @@ class ChatController extends Notifier<ChatState> {
     if (_claimedAt.isNotEmpty) {
       final pendingIds = _pending.map((prompt) => prompt.requestId).toSet();
       _claimedAt.removeWhere((requestId, _) => !pendingIds.contains(requestId));
+    }
+    // A fresh baseline that carries the inbox is the Host saying what it
+    // holds. A prompt that is neither there nor echoed, and is not waiting on
+    // its own prompt answer, did not make it: stop showing it as on its way.
+    // A claimed one left the inbox for the agent; its turn end settles it.
+    if (freshSnapshot && _delivering.isEmpty && _pending.isNotEmpty && _transcript.projections.has('inbox')) {
+      final inbox = _inboxIds();
+      _pending = List.unmodifiable([
+        for (final prompt in _pending)
+          if (!prompt.failed &&
+              !_isMoving(prompt.requestId) &&
+              !inbox.contains(prompt.requestId) &&
+              !_claimedAt.containsKey(prompt.requestId))
+            prompt.failedAt(_transcript.cursor)
+          else
+            prompt,
+      ]);
     }
     final pending = _placePending();
     state = ChatState(
@@ -1035,6 +1247,8 @@ class ChatController extends Notifier<ChatState> {
       loading: false,
       loadingOlder: state.loadingOlder,
       error: freshSnapshot ? null : state.error,
+      syncError: freshSnapshot ? null : state.syncError,
+      defaultModelSaveFailed: _defaultModelSaveFailed,
       notice: freshSnapshot ? null : state.notice,
       connection: _transcript.connectionState,
       model: _model,
@@ -1056,6 +1270,8 @@ class ChatController extends Notifier<ChatState> {
   /// here may move it.
   List<PendingPrompt> _placePending() {
     final inbox = _transcript.inbox;
+    final inboxIds = {for (final q in inbox) q.id};
+    _inboxSeen.removeWhere((id, _) => !inboxIds.contains(id));
     if (inbox.isEmpty && _moving.isEmpty) return _pending;
     final byRequest = {for (final q in inbox) ?q.requestId: q};
     final ours = {for (final p in _pending) p.requestId};
@@ -1073,7 +1289,7 @@ class ChatController extends Notifier<ChatState> {
           PendingPrompt(
             requestId: q.requestId ?? q.id,
             text: q.text,
-            time: DateTime.now(),
+            time: _inboxSeen.putIfAbsent(q.id, DateTime.now),
             mode: q.steering ? SendMode.steer : SendMode.queue,
             inboxId: q.id,
             slot: slotOf(q),
@@ -1097,57 +1313,80 @@ class ChatController extends Notifier<ChatState> {
     return [for (final q in _transcript.inbox) ?placed[q.id]];
   }
 
-  /// Removes optimistic bubbles whose `user/message` has landed.
-  void _dropEchoed(List<ChatItem> items) {
-    final echoed = <String>{};
-    // Echoes are near the end; a bounded scan keeps this O(1) per frame.
-    for (var i = items.length - 1, seen = 0; i >= 0 && seen < 12; i--) {
-      final item = items[i];
-      if (item is UserChatItem) {
-        seen++;
-        if (item.requestId case final id?) echoed.add(id);
-      }
-    }
+  /// Reconcile newly received echoes, not a bounded tail of rendered history.
+  void _dropEchoed(Iterable<SessionLogEvent> events) {
+    if (_pending.isEmpty) return;
+    final echoed = {
+      for (final event in events.whereType<UserMessageEvent>())
+        if (event.isHumanPrompt) ?event.requestId,
+    };
     if (echoed.isEmpty) return;
     final rest = _pending.where((p) => !echoed.contains(p.requestId)).toList();
     if (rest.length != _pending.length) _pending = List.unmodifiable(rest);
   }
 
   /// Sends [text] with [attachments]; resolves to `false` when it could not be
-  /// delivered. Files are staged first (`fileUploads/upload`), images go inline.
+  /// delivered. Files are staged first (streamed as raw bytes on a Host with
+  /// `/api/session/uploadFileBinary`, else `fileUploads/upload`); images go
+  /// inline.
   ///
   /// While a turn runs, [mode] picks how the message reaches the agent; when
   /// idle every mode just starts a turn.
+  ///
+  /// [verbatim] sends [text] exactly as given (trimmed only to decide it is
+  /// empty): the pending bubble, the retry key and the prompt all carry it.
+  /// [beforeDeliver] runs once this send has chosen its request id (a retry of
+  /// an unsettled send keeps the old one) and before anything goes out, for a
+  /// side channel keyed by that id (伙伴小屋's context). Its failure fails the
+  /// send like any other; false drops the send quietly.
   Future<bool> send(
     String text, {
     List<DraftAttachment> attachments = const [],
     SendMode mode = SendMode.now,
     WebQuoteComposition? webComposition,
+    bool verbatim = false,
+    String? originalRequestId,
+    Future<bool> Function(String requestId)? beforeDeliver,
+    bool Function()? deliveryAllowed,
   }) async {
     final client = _client;
     final trimmed = text.trim();
     if (client == null || (trimmed.isEmpty && attachments.isEmpty)) {
       return false;
     }
+    final body = verbatim ? text : trimmed;
     if (!_canControl && (mode == SendMode.interrupt || !await waitForSync())) return false;
     if (!ref.mounted || !identical(client, _client) || !_canControl) return false;
     final operation = _ChatOperation(ref, client, _syncScope);
-    final content = _contentKey(trimmed, attachments);
-    final requestId = _unsettled?.content == content ? _unsettled!.requestId : _requestId();
+    final content = _contentKey(body, attachments);
+    final retrying = originalRequestId != null || _unsettled?.content == content;
+    final requestId = originalRequestId ?? (retrying ? _unsettled!.requestId : _requestId());
     _unsettled = null;
+    // Retired on the same Host: the text comes back. A send that may have landed (or a retry of
+    // one) keeps its request id for the next try, so the Host takes it once.
+    bool retire({bool uncertain = false}) {
+      if ((uncertain || retrying) && ref.mounted && identical(_client, operation.client)) {
+        _unsettled = (content: content, requestId: requestId);
+      }
+      return _retireSend(requestId);
+    }
+
     final running = state.running;
     final effective = running ? (mode == SendMode.now ? SendMode.steer : mode) : SendMode.now;
     _pending = List.unmodifiable([
       ..._pending,
       PendingPrompt(
         requestId: requestId,
-        text: trimmed,
+        text: body,
         time: DateTime.now(),
         mode: effective,
         attachments: List.unmodifiable(attachments),
         webComposition: webComposition,
       ),
     ]);
+    _delivering.add(requestId);
+    // A retried request can already be in the log; the Host will not echo it twice.
+    if (retrying) _dropEchoed(_transcript.events);
     state = state.copyWith(
       pending: _placePending(),
       // A lost stream keeps saying so.
@@ -1155,18 +1394,35 @@ class ChatController extends Notifier<ChatState> {
       clearNotice: true,
     );
     try {
+      if (beforeDeliver != null) {
+        final go = await beforeDeliver(requestId);
+        if (!_currentOperation(operation)) return retire();
+        if (!go) {
+          // The caller let it go (伙伴小屋 left this conversation meanwhile):
+          // nothing went out, so nothing waits and nothing failed.
+          _pending = List.unmodifiable(_pending.where((p) => p.requestId != requestId));
+          state = state.copyWith(pending: _placePending());
+          return false;
+        }
+      }
       final receipts = await _stageFiles(operation, attachments);
-      if (!_currentOperation(operation)) return false;
+      if (!_currentOperation(operation)) return retire();
       var promptMode = effective == SendMode.steer ? PromptMode.steer : PromptMode.queue;
       String? stopFailed;
       // Interrupt stops first, then sends: DSH keeps the inbox across a stop
       // but only starts the next turn for a prompt that arrives after it (one
-      // queued before the stop would wait for whatever is sent next).
+      // queued before the stop would wait for whatever is sent next). After
+      // the turn has ended, too: an accepted cancel returns while the turn is
+      // still winding down, and if it hands an unread interjection back to
+      // the inbox it drops the wake of a prompt that came in meanwhile (#1762).
       if (effective == SendMode.interrupt) {
         final stopped = await _stop(operation);
         // Retirement is not a failed cancel: it must never fall back to steer.
-        if (!_currentOperation(operation)) return false;
-        if (!stopped) {
+        if (!_currentOperation(operation)) return retire();
+        if (stopped) {
+          await _stopSettled();
+          if (!_currentOperation(operation)) return retire();
+        } else {
           // The turn goes on: the message joins it instead.
           promptMode = PromptMode.steer;
           stopFailed = appL10n.stateChatStopSteered;
@@ -1176,25 +1432,108 @@ class ChatController extends Notifier<ChatState> {
           state = state.copyWith(pending: _placePending());
         }
       }
-      final notice = await _deliver(operation, trimmed, attachments, receipts, requestId: requestId, mode: promptMode);
+      final notice = await _deliver(
+        operation,
+        body,
+        attachments,
+        receipts,
+        requestId: requestId,
+        mode: promptMode,
+        deliveryAllowed: deliveryAllowed,
+      );
       _sent();
-      if (!_currentOperation(operation)) return false;
+      // Delivered: sent, even if the watch moved on meanwhile (its echo comes on the new one).
+      if (!_currentOperation(operation)) return true;
       state = state.copyWith(error: stopFailed, notice: notice);
       return true;
     } catch (e) {
-      if (!_currentOperation(operation)) return false;
-      // Its echo already came: it got there.
-      if (!_pending.any((p) => p.requestId == requestId)) {
+      // The echo or durable inbox/claim/end feedback proves acceptance (also when a preparation
+      // failure never writes a user/message echo, and across a reconnect of the same Host).
+      if (ref.mounted &&
+          identical(_client, operation.client) &&
+          (!_pending.any((p) => p.requestId == requestId) ||
+              _pending.any((p) => p.requestId == requestId && p.failed) ||
+              _claimedAt.containsKey(requestId) ||
+              _withdrawn.contains(requestId) ||
+              _inboxIds().contains(requestId))) {
         _sent();
         return true;
       }
+      if (!_currentOperation(operation)) return retire(uncertain: _outcomeUnknown(e));
+      _recordSendFailure(operation, e);
       if (_outcomeUnknown(e)) {
         _unsettled = (content: content, requestId: requestId);
       }
       _pending = List.unmodifiable(_pending.where((p) => p.requestId != requestId));
       state = state.copyWith(pending: _placePending(), error: _sendFailure(e));
       return false;
+    } finally {
+      _delivering.remove(requestId);
     }
+  }
+
+  /// Explicit recovery for an older Host that lost a claimed input. It never
+  /// writes into the composer, and rechecks identity after the editor/sync wait.
+  Future<bool> retryFailed(PendingPrompt prompt, String text) async {
+    if (!_retryingFailed.add(prompt.requestId)) return false;
+    try {
+      final client = _client;
+      if (client == null) return false;
+      final operation = _ChatOperation(ref, client, _syncScope);
+      if (!await waitForSync() || !_currentOperation(operation)) return false;
+      final current = _pending.where((p) => p.requestId == prompt.requestId).firstOrNull;
+      if (current == null ||
+          !current.failed ||
+          current.failureSeq != prompt.failureSeq ||
+          _inboxIds().contains(prompt.requestId) ||
+          _transcript.items.whereType<UserChatItem>().any((item) => item.requestId == prompt.requestId)) {
+        return false;
+      }
+      final edited = text.trim();
+      if (edited.isEmpty && current.attachments.isEmpty) return false;
+      _pending = List.unmodifiable([
+        for (final p in _pending) p.requestId == current.requestId ? p.failedAt(p.failureSeq!, editedText: edited) : p,
+      ]);
+      state = state.copyWith(pending: _placePending());
+      final ok = await send(
+      edited,
+      attachments: current.attachments,
+      webComposition: current.webComposition,
+    );
+      if (!_currentOperation(operation)) return false;
+      if (ok) {
+        _pending = List.unmodifiable(_pending.where((p) => p.requestId != current.requestId));
+        _publish();
+      }
+      return ok;
+    } finally {
+      _retryingFailed.remove(prompt.requestId);
+    }
+  }
+
+  /// The watch this send was started against is gone (a new follow, another
+  /// Host, a later stop): its answer can no longer be matched to the bubble.
+  /// The optimistic bubble goes with it instead of waiting forever — a Host
+  /// that did take the prompt still echoes it, and a send that never went out
+  /// leaves its text to the screen (「没发出去」 hands it back to the composer).
+  bool _retireSend(String requestId) {
+    if (!ref.mounted) return false;
+    if (_pending.any((p) => p.requestId == requestId)) {
+      _pending = List.unmodifiable(_pending.where((p) => p.requestId != requestId));
+      state = state.copyWith(pending: _placePending());
+    }
+    return false;
+  }
+
+  /// Prompts taken out of the inbox will not be put back (this app stopped
+  /// owning that conversation first): their bubbles go, and the screen puts
+  /// their text back, instead of leaving them waiting forever.
+  List<PendingPrompt> _retireTaken(List<PendingPrompt> prompts) {
+    if (prompts.isEmpty || !ref.mounted) return const [];
+    final gone = {for (final prompt in prompts) prompt.requestId};
+    _pending = List.unmodifiable(_pending.where((p) => !gone.contains(p.requestId)));
+    state = state.copyWith(pending: _placePending());
+    return List.unmodifiable(prompts);
   }
 
   /// A message went out: one more turn in the usage statistics (only how
@@ -1203,62 +1542,155 @@ class ChatController extends Notifier<ChatState> {
     if (ref.mounted) ref.read(usageStatsProvider.notifier).count(UsageCount.turns);
   }
 
-  /// What a send is matched on when it is tried again ([_unsettled]).
-  static String _contentKey(String text, List<DraftAttachment> attachments) =>
-      [text, for (final a in attachments) a.name].join('\n');
+  void _finishUsageTurn(UsageOutcome outcome) {
+    _usageTurnEnd?.call(outcome);
+    _usageFirstText?.call(UsageOutcome.unknown);
+    _usageTurnEnd = null;
+    _usageFirstText = null;
+    _usageTurn = null;
+    _usageAttempt = null;
+  }
 
-  /// Stages the files among [attachments] (`fileUploads/upload`); images go
-  /// inline with the prompt instead, unless [images] asks for them.
-  Future<List<String>> _stageFiles(
+  void _observeUsageTurn(DshEvent event) {
+    if (event is SessionLogEvent && event.seq <= _transcript.cursor) return;
+    switch (event) {
+      case TurnStartedEvent(:final turn):
+        if (_usageTurn == turn) return;
+        _finishUsageTurn(UsageOutcome.unknown);
+        final stats = ref.read(usageStatsProvider.notifier);
+        _usageTurnEnd = stats.beginOperation(_sameClock ? UsageOperation.chatTurnLocal : UsageOperation.chatTurnRemote);
+        if (_usageTurnEnd == null) return;
+        _usageTurn = turn;
+        _usageFirstText = stats.beginOperation(
+          _sameClock ? UsageOperation.chatFirstTextLocal : UsageOperation.chatFirstTextRemote,
+        );
+      case AssistantStreamStarted(:final turn, :final attemptId) when turn == _usageTurn:
+        _usageAttempt = attemptId;
+      case AssistantChunkEvent(attemptId: final id, chunk: TextDeltaChunk(:final text))
+          when id == _usageAttempt && text.trim().isNotEmpty:
+        _usageFirstText?.call(UsageOutcome.ready);
+        _usageFirstText = null;
+      case TurnEndedEvent(:final turn, :final reason) when turn == _usageTurn:
+        _finishUsageTurn(switch (reason.kind) {
+          'completed' => UsageOutcome.ready,
+          'aborted' => UsageOutcome.cancelled,
+          'error' || 'blocked' || 'max-tokens' => UsageOutcome.failed,
+          _ => UsageOutcome.unknown,
+        });
+      default:
+        break;
+    }
+  }
+
+  /// A model call finished on the host: the tokens its provider reported go
+  /// to the usage statistics. Only a new log record (after the cursor, before
+  /// [Transcript.apply] moves it), never a snapshot's history, so a
+  /// reconnect replays nothing twice. A call that reported no usage adds
+  /// nothing.
+  void _countTokens(DshEvent event) {
+    if (event is! SessionLogEvent || event.seq <= _transcript.cursor || !ref.mounted) return;
+    if (event is! AssistantMessageEvent && event is! AssistantAttemptEvent) return;
+    final stats = ref.read(usageStatsProvider.notifier);
+    if (stats.observesChatLogUsage) {
+      final partial = event is! AssistantMessageEvent || event.interrupted;
+      final raw = event.data['usage'];
+      final usage = raw is Map<String, Object?>
+          ? raw
+          : partial
+          ? _attemptUsage(event.data['stream'])
+          : null;
+      final reported = usage?['reported'];
+      stats.chatLogUsage(reported is Map<String, Object?> ? reported : usage, partial: partial, local: _sameClock);
+    }
+    if (event is! AssistantMessageEvent) return;
+    final usage = event.usage;
+    if (usage == null) return;
+    stats.tokens(usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0), usage.outputTokens);
+  }
+
+  // Keep field presence: UsageChunk normalizes missing fields to zero for rendering.
+  Map<String, Object?>? _attemptUsage(Object? stream) {
+    if (stream is! List) return null;
+    for (final record in stream.reversed) {
+      if (record is! Map || record['type'] != 'chunk') continue;
+      final frame = record['chunk'];
+      if (frame is Map && frame['type'] == 'usage' && frame['usage'] is Map<String, Object?>) {
+        return frame['usage'] as Map<String, Object?>;
+      }
+    }
+    return null;
+  }
+
+  /// Retry the same text and attachment selections. Picking again is a new
+  /// intent even if the name matches; encoding preserves text boundaries.
+  static String _contentKey(String text, List<DraftAttachment> attachments) => jsonEncode([
+    text,
+    [for (final a in attachments) a.id],
+  ]);
+
+  /// Stages attachment receipts locally/over SSH, or publishes Remote files
+  /// into the current workspace. Images stay inline unless [images] is set.
+  Future<({List<String> receipts, List<String> paths})> _stageFiles(
     _ChatOperation operation,
     List<DraftAttachment> attachments, {
     bool images = false,
   }) async {
     final receipts = <String>[];
+    final paths = <String>[];
+    final client = operation.client;
     for (final attachment in attachments) {
       if (attachment.isImage != images) continue;
       _requireCurrent(operation);
-      receipts.add(await _upload(operation.client, attachment));
+      try {
+        if (client.supportsEndpoint('fileUploads/upload')) {
+          final receipt = await client.uploadFile(sessionId, attachment.bytes, name: attachment.name);
+          receipts.add(receipt.receiptId);
+        } else {
+          final file = await client.uploadWorkspaceFile(sessionId, attachment.bytes, name: attachment.name);
+          paths.add(file.path);
+        }
+      } catch (e) {
+        throw _UploadFailed(e);
+      }
       _requireCurrent(operation);
     }
-    return receipts;
+    return (receipts: receipts, paths: paths);
   }
 
-  Future<String> _upload(DshClient client, DraftAttachment attachment) async {
-    try {
-      final receipt = await client.uploadFile(sessionId, attachment.bytes, name: attachment.name);
-      return receipt.receiptId;
-    } catch (e) {
-      throw _UploadFailed(e);
-    }
-  }
-
-  /// `session/prompt` with the images of [attachments] inline and [receipts]
-  /// for its staged files. A model that reads text only (V4 Pro) refuses
+  /// `session/prompt` with the images of [attachments] inline and [staged]
+  /// for its uploaded files. A model that reads text only (V4 Pro) refuses
   /// images at admission, recording nothing: the same request goes again
   /// with them staged as files, so the message still lands and tools can
-  /// open them, and the returned notice says so. DSH Remote stages no files,
-  /// so there the refusal stands.
+  /// open them, and the returned notice says so. Remote workspace uploads
+  /// supply paths instead of receipt IDs.
   Future<String?> _deliver(
     _ChatOperation operation,
     String text,
     List<DraftAttachment> attachments,
-    List<String> receipts, {
+    ({List<String> receipts, List<String> paths}) staged, {
     required String requestId,
     required PromptMode mode,
+    bool Function()? deliveryAllowed,
   }) async {
     final client = operation.client;
     final images = [
       for (final a in attachments)
         if (a.isImage) PromptImage.fromBytes(a.bytes, mediaType: a.mediaType!, name: a.name),
     ];
-    Future<void> prompt(List<PromptImage> images, List<String> receipts) {
+    Future<void> prompt(List<PromptImage> images, ({List<String> receipts, List<String> paths}) files) {
       _requireCurrent(operation);
+      if (deliveryAllowed != null && !deliveryAllowed()) {
+        throw const DshClosedException('Prepared phone route source changed');
+      }
+      final paths = files.paths.map((path) => '- ${jsonEncode(path)}').join('\n');
+      final content = paths.isEmpty
+          ? text
+          : [if (text.isNotEmpty) text, '${appL10n.stateWorkspaceFilesHint}\n$paths'].join('\n\n');
       return client.prompt(
         sessionId,
-        text,
+        content,
         images: images,
-        fileReceiptIds: receipts,
+        fileReceiptIds: files.receipts,
         requestId: requestId,
         mode: mode,
         // No clientTimeZone: DSH needs an IANA name, which Dart can't provide; the
@@ -1267,14 +1699,18 @@ class ChatController extends Notifier<ChatState> {
     }
 
     try {
-      await prompt(images, receipts);
+      await prompt(images, staged);
       return null;
     } on DshRemoteException catch (e) {
-      if (images.isEmpty || !_imagesRefused(e) || !client.supportsEndpoint('fileUploads/upload')) {
+      if (images.isEmpty || !_imagesRefused(e) || !client.supportsFileUpload) {
         rethrow;
       }
       _requireCurrent(operation);
-      await prompt(const [], [...receipts, ...await _stageFiles(operation, attachments, images: true)]);
+      final uploaded = await _stageFiles(operation, attachments, images: true);
+      await prompt(const [], (
+        receipts: [...staged.receipts, ...uploaded.receipts],
+        paths: [...staged.paths, ...uploaded.paths],
+      ));
       return appL10n.stateChatTextOnlyModel;
     }
   }
@@ -1285,10 +1721,37 @@ class ChatController extends Notifier<ChatState> {
   /// The banner for a send that did not go through.
   static String _sendFailure(Object e) => switch (e) {
     _UploadFailed(:final cause) => chatErrorText(cause, action: appL10n.stateAttachmentUploadFailed),
-    // DSH Remote: the images cannot go as files either.
+    // Older Remote Hosts may not support workspace uploads either.
     _ when _imagesRefused(e) => appL10n.stateChatImageModelRequired,
     _ => chatErrorText(e, action: appL10n.stateSendFailed),
   };
+
+  /// A current send without observed acceptance reaches this diagnostic.
+  /// Keep content and arbitrary remote error text out of the process log.
+  void _recordSendFailure(_ChatOperation operation, Object error) {
+    final cause = error is _UploadFailed ? error.cause : error;
+    final stage = error is _UploadFailed ? 'attachment_upload' : 'prompt';
+    final category = switch (cause) {
+      DshRemoteException(code: 'session/writer-held') => 'session_writer_held',
+      DshRemoteException() => 'remote_other',
+      DshTransportException() => 'transport',
+      DshCarrierLostException() => 'carrier_lost',
+      DshHttpException() => 'http',
+      DshProtocolException() => 'protocol',
+      DshCarrierRefusedException() => 'carrier_refused',
+      DshClosedException() => 'closed',
+      _ => 'unknown',
+    };
+    final connection = ref.read(activeConnectionProvider).value;
+    final host = connection != null && identical(connection.client, operation.client)
+        ? connection.kind.name
+        : 'unknown';
+    appErrorLog.record(
+      AppErrorSource.session,
+      'chat_send_failure stage=$stage host=$host category=$category outcome_unknown=${_outcomeUnknown(error)}',
+      StackTrace.empty,
+    );
+  }
 
   /// The connection dropped mid-call: the prompt may have landed.
   static bool _outcomeUnknown(Object e) => switch (e is _UploadFailed ? e.cause : e) {
@@ -1336,6 +1799,99 @@ class ChatController extends Notifier<ChatState> {
     }
   }
 
+  /// Resolves when 「正在停止」 is over: the stopped turn ended, the stop key
+  /// came back after ten seconds, or the follow started over. Also when this
+  /// build goes away (its listeners and stop timer go with it); the caller's
+  /// operation is retired then.
+  Future<void> _stopSettled() {
+    if (!state.stopping) return Future.value();
+    final settled = Completer<void>();
+    void done() {
+      if (!settled.isCompleted) settled.complete();
+    }
+    final unlisten = listenSelf((_, next) {
+      if (!next.stopping) done();
+    });
+    final undispose = ref.onDispose(done);
+    return settled.future.whenComplete(() {
+      unlisten();
+      undispose();
+    });
+  }
+
+  /// Stop just this sent prompt. Its HTTP/RPC can be in flight before its
+  /// echo or inbox slot arrives. Keep this follow alive until we can identify
+  /// its own slot or running turn, even if the original room has closed.
+  void Function() stopPrompt(String requestId) {
+    final owner = ref;
+    final client = _client;
+    if (client == null) return () {};
+    final lease = owner.keepAlive();
+    late final Timer deadline;
+    var closed = false;
+    var scheduled = false;
+    String? lastSlot;
+    late final void Function() unlisten;
+    late final void Function() undispose;
+    void close() {
+      if (closed) return;
+      closed = true;
+      deadline.cancel();
+      unlisten();
+      undispose();
+      lease.close();
+    }
+    void check() {
+      scheduled = false;
+      if (closed) return;
+      if (!owner.mounted || !identical(client, _client)) {
+        close();
+        return;
+      }
+      if (!state.controlReady) return;
+      final echo = events.whereType<UserMessageEvent>().where(
+        (e) => e.isHumanPrompt && !e.message.source.raw.containsKey('principal') && e.requestId == requestId,
+      ).firstOrNull;
+      if (echo != null) {
+        final turn = state.turns.reversed.where(
+          (t) => t.startSeq <= echo.seq && (t.endSeq == null || echo.seq <= t.endSeq!),
+        ).firstOrNull;
+        if (turn == null) return;
+        if (turn.running && state.runningTurn?.turn == turn.turn && !state.stopping) {
+          unawaited(_stop(_ChatOperation(owner, client, _syncScope), failure: appL10n.stateChatStopFailed));
+        }
+        close();
+        return;
+      }
+      final pending = state.pending.where((p) => p.requestId == requestId).firstOrNull;
+      if (pending?.failed == true) {
+        close();
+        return;
+      }
+      if (pending != null && pending.inboxId != null && pending.inboxId != lastSlot) {
+        lastSlot = pending.inboxId;
+        unawaited(withdrawQueued(pending).then((ok) {
+          if (ok) close(); // A concurrent claim will instead arrive as an echo.
+        }));
+      }
+    }
+    unlisten = listenSelf((_, _) {
+      if (!scheduled && !closed) {
+        scheduled = true;
+        scheduleMicrotask(check);
+      }
+    });
+    undispose = owner.onDispose(close);
+    // Same grace period as a closed chat screen. A lost, superseded HTTP
+    // delivery may never acquire a durable identity on this host.
+    deadline = Timer(const Duration(seconds: 60), close);
+    check();
+    return close;
+  }
+
+  /// A false send with this identity may still receive a durable echo.
+  bool awaitingPromptOutcome(String requestId) => _unsettled?.requestId == requestId;
+
   /// The stop key. What waits in the inbox then goes right away, as if the
   /// turn had ended: DSH keeps the inbox across a stop but starts no turn
   /// for it, so the last waiting prompt is taken out and put back, which
@@ -1349,9 +1905,8 @@ class ChatController extends Notifier<ChatState> {
       return const [];
     }
     final last = _waiting().lastOrNull;
-    if (last == null || !last.resendable || !await _takeOut(operation, last) || !_currentOperation(operation)) {
-      return const [];
-    }
+    if (last == null || !last.resendable || !await _takeOut(operation, last)) return const [];
+    if (!_currentOperation(operation)) return _retireTaken([last]);
     return _putBack(operation, [last]);
   }
 
@@ -1372,18 +1927,19 @@ class ChatController extends Notifier<ChatState> {
       for (final p in _waiting().skipWhile((p) => p.requestId != prompt.requestId).skip(1))
         if (p.slot == InboxSlot.nextTurn && p.resendable) p,
     ];
-    if (!await _takeOut(operation, prompt) || !_currentOperation(operation)) return const [];
+    if (!await _takeOut(operation, prompt)) return const [];
+    if (!_currentOperation(operation)) return _retireTaken([prompt]);
     // Stopped or not, it goes back: a turn that goes on takes it as before.
     if (state.running) {
       await _stop(operation, failure: appL10n.stateChatStopFailed);
-      if (!_currentOperation(operation)) return const [];
+      if (!_currentOperation(operation)) return _retireTaken([prompt]);
     }
     final moved = [prompt];
     for (final p in behind) {
-      if (!_currentOperation(operation)) return const [];
+      if (!_currentOperation(operation)) return _retireTaken(moved);
       if (await _takeOut(operation, p)) moved.add(p);
     }
-    if (!_currentOperation(operation)) return const [];
+    if (!_currentOperation(operation)) return _retireTaken(moved);
     return _putBack(operation, moved);
   }
 
@@ -1403,10 +1959,11 @@ class ChatController extends Notifier<ChatState> {
           mode: prompt.mode,
           sourceKind: prompt.sourceKind,
           sourceForm: prompt.sourceForm,
-          attachments: prompt.attachments,
           webComposition: prompt.webComposition,
         ),
       ]);
+      // The selected queue card can outlive its echo arriving from the Host.
+      _dropEchoed(_transcript.events);
     }
     _moving[prompt.requestId] = operation;
     state = state.copyWith(pending: _placePending());
@@ -1434,7 +1991,7 @@ class ChatController extends Notifier<ChatState> {
     final lost = <PendingPrompt>[];
     Object? failure;
     for (final prompt in prompts) {
-      if (!_currentOperation(operation)) return const [];
+      if (!_currentOperation(operation)) return _retireTaken([...lost, prompt]);
       try {
         await _deliver(
           operation,
@@ -1524,20 +2081,22 @@ class ChatController extends Notifier<ChatState> {
   }
 
   Future<void> respond(ApprovalRequest request, ApprovalDecision decision) async {
+    final scope = _approvalScope;
     try {
       await _client?.respondApproval(request, decision);
     } catch (e) {
-      if (!ref.mounted) return;
+      if (!ref.mounted || !identical(scope, _approvalScope)) return;
       state = state.copyWith(error: chatErrorText(e, action: appL10n.stateChatApprovalFailed));
     }
   }
 
   Future<bool> answer(UserQuestionRequest request, List<QuestionAnswer> answers) async {
+    final scope = _approvalScope;
     try {
       await _client?.answerQuestion(request, answers);
       return true;
     } catch (e) {
-      if (!ref.mounted) return false;
+      if (!ref.mounted || !identical(scope, _approvalScope)) return false;
       state = state.copyWith(error: chatErrorText(e, action: appL10n.stateChatAnswerFailed));
       return false;
     }
@@ -1548,6 +2107,7 @@ class ChatController extends Notifier<ChatState> {
   Future<bool> rejectQuestion(UserQuestionRequest request) async {
     final client = _client;
     if (client == null) return false;
+    final scope = _approvalScope;
     try {
       await client.rejectQuestion(
         request,
@@ -1556,7 +2116,9 @@ class ChatController extends Notifier<ChatState> {
       );
       return true;
     } catch (e) {
-      if (ref.mounted) state = state.copyWith(error: chatErrorText(e, action: appL10n.stateChatAnswerFailed));
+      if (ref.mounted && identical(scope, _approvalScope)) {
+        state = state.copyWith(error: chatErrorText(e, action: appL10n.stateChatAnswerFailed));
+      }
       return false;
     }
   }
@@ -1583,15 +2145,26 @@ class ChatController extends Notifier<ChatState> {
     state = state.copyWith(model: selection);
     try {
       if (!current()) return false;
-      final applied = await client.setModel(
+      final result = await client.setModelResult(
         sessionId,
         provider: selection.provider,
         model: selection.model,
         reasoningEffort: selection.reasoningEffort,
       );
       if (!current()) return false;
-      _model = applied;
-      state = state.copyWith(model: applied);
+      _model = result.selected;
+      switch (result.defaultSave?.status) {
+        case ModelDefaultSaveStatus.failed:
+          _defaultModelSaveFailed = true;
+        case ModelDefaultSaveStatus.saved || ModelDefaultSaveStatus.skipped:
+          _defaultModelSaveFailed = false;
+        case ModelDefaultSaveStatus.unknown || null:
+          break;
+      }
+      state = state.copyWith(model: result.selected, defaultModelSaveFailed: _defaultModelSaveFailed);
+      // Old hosts do not acknowledge persistence; a fresh catalog is still
+      // useful, but is never presented as proof that the default was saved.
+      ref.invalidate(modelCatalogProvider);
       return current();
     } catch (e) {
       if (!current()) return false;
@@ -1610,6 +2183,8 @@ class ChatController extends Notifier<ChatState> {
         loading: state.loading,
         loadingOlder: state.loadingOlder,
         error: chatErrorText(e, action: appL10n.stateChatModelSwitchFailed),
+        syncError: state.syncError,
+        defaultModelSaveFailed: _defaultModelSaveFailed,
         connection: state.connection,
         model: previous,
         pending: state.pending,
@@ -1655,6 +2230,7 @@ class ChatController extends Notifier<ChatState> {
       );
       if (!current()) return;
       _transcript.prependHistory(page);
+      _dropEchoed(page.events);
       // A done event may have arrived before its run was loaded. Fold the
       // merged log in seq order so paging cannot resurrect a finished command.
       _transcript.events.forEach(_applyCommandEvent);
@@ -1669,6 +2245,11 @@ class ChatController extends Notifier<ChatState> {
   }
 
   void dismissError() => state = state.copyWith(clearError: true);
+
+  void dismissDefaultModelSaveWarning() {
+    _defaultModelSaveFailed = false;
+    state = state.copyWith(defaultModelSaveFailed: false);
+  }
 
   // ---------------------------------------------------------------------------
   // Message actions. DSH 0.2.1 cannot edit, regenerate or rewind a session in
@@ -1699,7 +2280,7 @@ class ChatController extends Notifier<ChatState> {
     final seq = item.seq;
     if (seq == null || item.streaming) return null;
     _checkLookups();
-    return _branchPoints.putIfAbsent(seq, () => forkPointAfterReply(_transcript.events, seq));
+    return _branchPoints.putIfAbsent(seq, () => forkPointAfterReply(_transcript.eventsFrom(seq), seq));
   }
 
   /// DSH `message.id` of the durable reply [item] (the feedback target).
@@ -1708,7 +2289,7 @@ class ChatController extends Notifier<ChatState> {
     if (seq == null || item.streaming) return null;
     _checkLookups();
     return _replyIds.putIfAbsent(seq, () {
-      for (final event in _transcript.events) {
+      for (final event in _transcript.eventsFrom(seq)) {
         if (event.seq == seq) {
           final id = event is AssistantMessageEvent ? event.message.id : '';
           return id.isEmpty ? null : id;

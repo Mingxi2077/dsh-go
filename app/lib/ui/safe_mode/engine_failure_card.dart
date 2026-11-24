@@ -6,9 +6,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../l10n/l10n.dart';
 import '../../runtime/runtime_bridge.dart';
 import '../../runtime/runtime_state.dart';
+import '../../state/engine_control.dart';
 import '../../state/safe_mode_state.dart';
 import '../common/status_chip.dart';
 import '../engine/diagnostics_export_card.dart';
+import '../engine/engine_status.dart';
 import '../remote/remote_screen.dart';
 import '../settings/background_guide_page.dart';
 import '../theme/theme.dart';
@@ -40,7 +42,13 @@ class FailureCardModel {
   final List<FailureAction> secondary;
   final StatusTone tone;
 
-  static FailureCardModel of(RuntimeFailure f, {required bool lkgUseful}) {
+  /// [held]: the engine won't start by itself until someone says so ([EngineControl.shouldAutoStart]).
+  static FailureCardModel of(
+    RuntimeFailure f, {
+    required bool lkgUseful,
+    bool held = false,
+    bool tawcRecoveryAvailable = false,
+  }) {
     if (f.safeMode && f.kind.isFatal) {
       return FailureCardModel(
         title: appL10n.phoneFailureSafeStartup,
@@ -54,12 +62,19 @@ class FailureCardModel {
       case FailureKind.launchFailed:
         return FailureCardModel(
           title: appL10n.phoneFailureLaunch,
-          body: appL10n.phoneFailureLaunchHint,
-          detail: f.summary,
-          primary: FailureAction.retry,
-          secondary: const [FailureAction.remote, FailureAction.showLog],
+          body: tawcRecoveryAvailable ? appL10n.phoneFailureTawcHint : appL10n.phoneFailureLaunchHint,
+          detail: f.causeUnknown ? null : f.summary,
+          primary: tawcRecoveryAvailable ? FailureAction.retryWithTawcroot : FailureAction.retry,
+          secondary: [
+            if (tawcRecoveryAvailable) FailureAction.retry,
+            // HarmonyOS: a safe run that couldn't launch can still go back to the person's own configuration.
+            if (f.safeMode && f.causeUnknown) FailureAction.startNormal,
+            FailureAction.remote,
+            FailureAction.showLog,
+          ],
         );
       case FailureKind.killed:
+        if (f.causeUnknown) return _unclean(f, lkgUseful: lkgUseful, held: held);
         return FailureCardModel(
           title: appL10n.phoneFailureKilled,
           body: appL10n.phoneFailureKilledHint,
@@ -100,12 +115,33 @@ class FailureCardModel {
         );
     }
   }
+
+  /// HarmonyOS's engine runs in the app's process, so a configuration that breaks it
+  /// reads the same as the system reclaiming the app, and its failures are only
+  /// ever this or [FailureKind.launchFailed]. The ways out are on offer either way;
+  /// they come first once it has happened enough that the engine waits.
+  static FailureCardModel _unclean(RuntimeFailure f, {required bool lkgUseful, required bool held}) {
+    final rescue = [if (lkgUseful) FailureAction.restoreLkg, FailureAction.enterSafe];
+    final (primary, rest) = f.safeMode
+        ? (FailureAction.retry, const [FailureAction.startNormal])
+        : held
+        ? (rescue.first, [...rescue.skip(1), FailureAction.retry])
+        : (FailureAction.retry, rescue);
+    return FailureCardModel(
+      title: appL10n.harmonyFailureUnclean,
+      body: appL10n.harmonyFailureUncleanHint,
+      primary: primary,
+      secondary: [...rest, FailureAction.background, FailureAction.showLog],
+      tone: StatusTone.warn,
+    );
+  }
 }
 
 enum FailureAction {
   restoreLkg,
   enterSafe,
   retry,
+  retryWithTawcroot,
   startNormal,
   background,
   remote,
@@ -115,6 +151,7 @@ enum FailureAction {
     FailureAction.restoreLkg => appL10n.phoneFailureRestore,
     FailureAction.enterSafe => appL10n.phoneFailureEnterSafe,
     FailureAction.retry => appL10n.commonRetry,
+    FailureAction.retryWithTawcroot => appL10n.phoneFailureRetryWithTawcroot,
     FailureAction.startNormal => appL10n.phoneFailureStartNormal,
     FailureAction.background => appL10n.phoneEngineKeepAlive,
     FailureAction.remote => appL10n.commonRemoteHost,
@@ -131,7 +168,9 @@ class EngineFailureCard extends ConsumerWidget {
   final EdgeInsetsGeometry padding;
 
   static bool visibleFor(RuntimeStatus status) =>
-      status.failure != null && (status.phase == RuntimePhase.error || status.phase == RuntimePhase.installed);
+      status.failure != null &&
+      !isLocalStartupFailure(status) &&
+      (status.phase == RuntimePhase.error || status.phase == RuntimePhase.installed);
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -139,8 +178,16 @@ class EngineFailureCard extends ConsumerWidget {
     final status = ref.watch(localRuntimeProvider.select((s) => s.status));
     final failure = status.failure;
     if (failure == null || !visibleFor(status)) return const SizedBox.shrink();
-    final lkg = failure.kind.isFatal && !failure.safeMode ? ref.watch(lastKnownGoodProvider).value : null;
-    final model = FailureCardModel.of(failure, lkgUseful: lkg?.useful ?? false);
+    final held = !EngineControl.shouldAutoStart(status);
+    final lkg = (failure.kind.isFatal || failure.causeUnknown) && !failure.safeMode
+        ? ref.watch(lastKnownGoodProvider).value
+        : null;
+    final model = FailureCardModel.of(
+      failure,
+      lkgUseful: lkg?.useful ?? false,
+      held: held,
+      tawcRecoveryAvailable: status.tawcRecoveryAvailable,
+    );
     final hazards = failure.safeMode && failure.kind.isFatal
         ? ref.watch(safePreflightProvider).value ?? const <SafeHazard>[]
         : const <SafeHazard>[];
@@ -155,6 +202,8 @@ class EngineFailureCard extends ConsumerWidget {
           unawaited(SafeModeActions.enter(context));
         case FailureAction.retry:
           unawaited(SafeModeActions.retry(context));
+        case FailureAction.retryWithTawcroot:
+          unawaited(SafeModeActions.retryWithTawcroot(context));
         case FailureAction.startNormal:
           unawaited(SafeModeActions.startNormal(context));
         case FailureAction.showLog:
@@ -188,6 +237,14 @@ class EngineFailureCard extends ConsumerWidget {
             ),
             const SizedBox(height: 8),
             Text(model.body, style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
+            // Where there is no safe mode to fall back on, this is what two in a row do.
+            if (failure.causeUnknown && held) ...[
+              const SizedBox(height: 8),
+              Text(
+                l10n.harmonyFailureHeld,
+                style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              ),
+            ],
             for (final h in hazards) ...[
               const SizedBox(height: 10),
               Text(h.path, style: AppType.monoLabel(color: colors.textTertiary)),

@@ -1,80 +1,58 @@
 package io.github.ccch1mneyyy.dsh_app
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.view.KeyEvent
-import android.view.MotionEvent
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
+import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.view.View
+import android.view.ViewGroup
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterEngineCache
-import io.flutter.embedding.engine.dart.DartExecutor
 import io.flutter.plugin.common.MethodChannel
-import io.github.ccch1mneyyy.dsh_app.files.FilesPlugin
+import io.github.ccch1mneyyy.dsh_app.companion.CompanionAssistant
 import io.github.ccch1mneyyy.dsh_app.launch.LaunchScreen
 import io.github.ccch1mneyyy.dsh_app.launch.LaunchThemeSync
-import io.github.ccch1mneyyy.dsh_app.links.LinksPlugin
-import io.github.ccch1mneyyy.dsh_app.notify.NotifyPlugin
-import io.github.ccch1mneyyy.dsh_app.phone.PhonePlugin
-import io.github.ccch1mneyyy.dsh_app.performance.RefreshRateController
+import io.github.ccch1mneyyy.dsh_app.runtime.AndroidBackgroundProtection
 import io.github.ccch1mneyyy.dsh_app.runtime.LaunchStart
-import io.github.ccch1mneyyy.dsh_app.runtime.RuntimePlugin
-import io.github.ccch1mneyyy.dsh_app.share.SharePlugin
-import io.github.ccch1mneyyy.dsh_app.shortcuts.ShortcutsPlugin
-import io.github.ccch1mneyyy.dsh_app.update.UpdatePlugin
-import io.github.ccch1mneyyy.dsh_app.voice.VoicePlugin
+import io.github.ccch1mneyyy.dsh_app.text.CachedTextActions
 import java.lang.ref.WeakReference
 import java.util.TimeZone
 
 class MainActivity : FlutterActivity() {
     private var appChannel: MethodChannel? = null
-    private val refreshRate by lazy { RefreshRateController(this, refreshMode) }
+    private val assistantMain = Handler(Looper.getMainLooper())
+    private var assistantYield: MethodChannel.Result? = null
+    private val assistantYieldTimeout = Runnable { finishAssistantYield(false) }
+
+    /** The selection toolbar's text actions, asked of the engine once (see [CachedTextActions]). */
+    private var textActions: CachedTextActions? = null
 
     /**
      * One engine per process, outliving this activity: swiping the app away from recents keeps
      * Dart running, and with it the event subscriptions behind turn-finished / needs-you
      * notifications. Plugins are registered once, with the engine.
      */
-    override fun provideFlutterEngine(context: Context): FlutterEngine {
-        val cache = FlutterEngineCache.getInstance()
-        cache.get(ENGINE_ID)?.let { return it }
-        return FlutterEngine(applicationContext).also { engine ->
-            engine.plugins.add(RuntimePlugin())
-            engine.plugins.add(PhonePlugin())
-            engine.plugins.add(NotifyPlugin())
-            engine.plugins.add(FilesPlugin())
-            engine.plugins.add(LinksPlugin())
-            engine.plugins.add(UpdatePlugin())
-            engine.plugins.add(VoicePlugin())
-            engine.plugins.add(SharePlugin())
-            engine.plugins.add(ShortcutsPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.diagnostics.DiagnosticsPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.media.MediaPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.icons.LauncherIconPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.theme.DynamicColorPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.performance.PerformancePlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.pet.PetOverlayPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.islands.IslandsPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.nativemedia.NativeMediaPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.nativefiles.NativeFilesPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.web.WebFilesPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.web.BrowserSelectionPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.web.BrowserDownloadsPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.launch.LaunchPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.launch.LaunchClipPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.icons.PictureShortcutPlugin())
-            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.usage.UsagePlugin())
-            engine.dartExecutor.executeDartEntrypoint(DartExecutor.DartEntrypoint.createDefault())
-            cache.put(ENGINE_ID, engine)
-        }
-    }
+    override fun provideFlutterEngine(context: Context): FlutterEngine = DshFlutterEngine.getOrCreate(context)
 
     override fun shouldDestroyEngineWithHost(): Boolean = false
+
+    override fun onActionModeStarted(mode: android.view.ActionMode) {
+        super.onActionModeStarted(mode)
+        io.github.ccch1mneyyy.dsh_app.web.BrowserSelectionPlugin.onActionModeStarted(mode)
+    }
 
     /**
      * This activity's own <meta-data> (normal theme, Flutter deep linking off), whichever launcher
@@ -114,53 +92,141 @@ class MainActivity : FlutterActivity() {
         super.onConfigurationChanged(newConfig)
         // Light / dark: a custom launch screen's plain splash colour (the page's) may change with it.
         LaunchThemeSync.sync(this)
-        refreshRate.apply()
+        // The language: other apps' text actions are named in it.
+        textActions?.forget()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        AndroidBackgroundProtection.get(this).setAppVisible(true)
+    }
+
+    override fun onStop() {
+        AndroidBackgroundProtection.get(this).setAppVisible(false)
+        super.onStop()
+        finishAssistantYield(true)
     }
 
     override fun onResume() {
         super.onResume()
+        io.github.ccch1mneyyy.dsh_app.companion.CompanionNotices.get(this).refreshBinding()
+        io.github.ccch1mneyyy.dsh_app.phone.background.BackgroundControl.get(applicationContext).restoreKeptChannel()
         inForeground = true
-        refreshRate.resume()
+        // Another app may have been changed meanwhile.
+        textActions?.forget()
+        // Coming back counts as activity: the first frames may not be scheduled yet.
+        framesActive = true
+        applyRefreshRate()
     }
 
-    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        refreshRate.touch(event)
-        return super.dispatchTouchEvent(event)
+    /**
+     * The window's preferred display mode, from the in-app refresh-rate setting.
+     *
+     * `preferredDisplayModeId = 0` means "no preference": the system picks, and its own
+     * refresh-rate setting and power saving still decide. Apps that never ask stay at 60 or
+     * 90 Hz on some 120 Hz phones (OriginOS, HyperOS, ColorOS); once an app does ask, those
+     * systems show their per-app switch as an in-app setting – hence the setting in 设置 › 性能.
+     *
+     * auto: fastest mode while Flutter is producing frames, released after the last one.
+     * max: pinned. system: never declared.
+     */
+    private fun applyRefreshRate() {
+        val want = if (refreshMode == "max" || (refreshMode != "system" && framesActive)) {
+            @Suppress("DEPRECATION")
+            val display = windowManager.defaultDisplay
+            val now = display.mode
+            display.supportedModes
+                .filter { it.physicalWidth == now.physicalWidth && it.physicalHeight == now.physicalHeight }
+                .maxByOrNull { it.refreshRate }
+        } else null
+        val target = want?.modeId ?: 0
+        if (window.attributes.preferredDisplayModeId != target) {
+            window.attributes = window.attributes.apply { preferredDisplayModeId = target }
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val view = flutterSurfaceView(findViewById<View>(FlutterActivity.FLUTTER_VIEW_ID)) ?: return
+        if (view !== votedView) {
+            votedView = view
+            // Coming back from the background, onResume runs before the surface is made again.
+            view.holder.addCallback(object : SurfaceHolder.Callback {
+                override fun surfaceCreated(holder: SurfaceHolder) = applyRefreshRate()
+                override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+                override fun surfaceDestroyed(holder: SurfaceHolder) {}
+            })
+        }
+        val surface = view.holder.surface
+        if (surface.isValid) surface.setFrameRate(want?.refreshRate ?: 0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
     }
 
-    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
-        if (event.actionMasked == MotionEvent.ACTION_SCROLL) refreshRate.nativeActivity()
-        return super.dispatchGenericMotionEvent(event)
-    }
+    /** Flutter's SurfaceView, which [applyRefreshRate] also votes on. */
+    private var votedView: SurfaceView? = null
 
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN) refreshRate.nativeActivity()
-        return super.dispatchKeyEvent(event)
+    private fun flutterSurfaceView(view: View?): SurfaceView? {
+        if (view is SurfaceView) return view
+        if (view is ViewGroup) {
+            for (index in 0 until view.childCount) {
+                flutterSurfaceView(view.getChildAt(index))?.let { return it }
+            }
+        }
+        return null
     }
 
     override fun onPause() {
         inForeground = false
-        refreshRate.pause()
+        framesActive = false
+        applyRefreshRate()
         super.onPause()
     }
 
-    override fun onDestroy() {
-        refreshRate.dispose()
-        super.onDestroy()
-    }
-
-    override fun onActionModeStarted(mode: android.view.ActionMode) {
-        super.onActionModeStarted(mode)
-        io.github.ccch1mneyyy.dsh_app.web.BrowserSelectionPlugin.onActionModeStarted(mode)
+    private fun finishAssistantYield(stopped: Boolean) {
+        assistantMain.removeCallbacks(assistantYieldTimeout)
+        assistantYield?.success(stopped)
+        assistantYield = null
     }
 
     /** Per activity: the handler acts on this activity, so it goes with it (see [cleanUpFlutterEngine]). */
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        textActions = CachedTextActions.install(flutterEngine)
         appChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "dsh/app")
         appChannel!!.setMethodCallHandler { call, result ->
             when (call.method) {
                 "getTimeZoneId" -> result.success(TimeZone.getDefault().id)
+                "companionAssistantStatus" -> result.success(mapOf(
+                    "selected" to CompanionAssistant.selected(this),
+                    "sharePage" to CompanionAssistant.sharePage(this),
+                    "calendarAllowed" to (checkSelfPermission(Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED),
+                ))
+                "requestCompanionCalendar" -> {
+                    requestPermissions(arrayOf(Manifest.permission.READ_CALENDAR), CALENDAR_PERMISSION_REQUEST)
+                    result.success(null)
+                }
+                "openCompanionPermissions" -> {
+                    startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null)))
+                    result.success(null)
+                }
+                "configureCompanionAssistantPage" -> {
+                    CompanionAssistant.setSharePage(this, call.arguments as Boolean)
+                    result.success(null)
+                }
+                "openCompanionAssistantSettings" -> result.success(CompanionAssistant.openSettings(this))
+                "yieldCompanionAssistant" -> {
+                    if (!inForeground) {
+                        result.success(true)
+                    } else {
+                        assistantYield = result
+                        if (moveTaskToBack(true)) assistantMain.postDelayed(assistantYieldTimeout, 2_000)
+                        else finishAssistantYield(false)
+                    }
+                }
+                "initializePairingScanner" -> {
+                    try {
+                        io.github.ccch1mneyyy.dsh_app.mlkit.MlKitRuntime.initialize(applicationContext)
+                        result.success(null)
+                    } catch (_: Exception) {
+                        result.error("scanner_initialization_failed", "The barcode scanner could not be initialized", null)
+                    }
+                }
                 // A browser sign-in finished (a Custom Tab on top of this task): clearing down
                 // to this activity closes the tab and shows the app again.
                 // 设置 → 性能 → 刷新率: auto | max | system, and whether Flutter is drawing.
@@ -168,14 +234,14 @@ class MainActivity : FlutterActivity() {
                     when (call.argument<String>("mode")) {
                         "auto", "max", "system" -> refreshMode = call.argument<String>("mode")!!
                     }
-                    refreshRate.setMode(refreshMode)
+                    applyRefreshRate()
                     result.success(null)
                 }
                 "setFrameActive" -> {
-                    call.argument<Boolean>("active")?.let { refreshRate.setFlutterActive(it) }
+                    framesActive = call.argument<Boolean>("active") ?: framesActive
+                    applyRefreshRate()
                     result.success(null)
                 }
-                "getRefreshRateDiagnostics" -> result.success(refreshRate.diagnostics())
                 "bringToFront" -> {
                     startActivity(
                         Intent(this, MainActivity::class.java)
@@ -189,8 +255,10 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        finishAssistantYield(false)
         appChannel?.setMethodCallHandler(null)
         appChannel = null
+        textActions = null
         super.cleanUpFlutterEngine(flutterEngine)
     }
 
@@ -198,10 +266,14 @@ class MainActivity : FlutterActivity() {
     // (Android 12's default for launcher roots): coming back finds it as it was.
     override fun popSystemNavigator(): Boolean = moveTaskToBack(true)
 
+    /** Flutter produced a frame recently (see RefreshRateService): auto mode follows it. */
+    private var framesActive = true
+
     companion object {
         private const val ENGINE_ID = "dsh-main"
+        private const val CALENDAR_PERMISSION_REQUEST = 441
 
-        /** Preserve the engine's choice across activity recreation; Dart owns persistence. */
+        /** 设置 › 性能 › 刷新率; the Flutter side owns the stored choice. */
         private var refreshMode = "auto"
 
         /** The app is on screen (resumed). */

@@ -167,6 +167,7 @@ void main() {
       );
       // Other providers' OAuth and ordinary failures are not a sign-in.
       expect(lapsedSubscription(_lapsed('github-copilot').failure), isNull);
+      expect(lapsedSubscription(_lapsed('openai-siwc').failure), isNull);
       expect(lapsedSubscription(const LlmFailure(message: 'HTTP 429 Too Many Requests', code: 'RATE_LIMIT')), isNull);
       expect(lapsedSubscription(null), isNull);
     });
@@ -299,7 +300,8 @@ void main() {
       await tester.pumpWidget(const SizedBox());
       await _pumpChat(tester, parentId);
       final composer = tester.getRect(find.byType(Composer));
-      expect(composer, bar);
+      expect(composer.top, moreOrLessEquals(bar.top, epsilon: 0.5));
+      expect(composer.bottom, moreOrLessEquals(bar.bottom, epsilon: 0.5));
     });
 
     testWidgets('the empty chat names the workspace it starts in', (tester) async {

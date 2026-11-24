@@ -7,6 +7,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:dsh_app/media/gallery.dart';
+import 'package:dsh_app/state/android_features.dart';
 import 'package:dsh_app/ui/chat/widgets/image_actions.dart';
 import 'package:dsh_app/ui/theme/app_icons.dart';
 import 'package:flutter/material.dart';
@@ -62,6 +63,20 @@ void main() {
       expect(galleryFileName(null, 'image/png', now: now), 'DSH_20261024_153012.png');
       expect(galleryFileName('图片', 'image/gif', now: now), 'DSH_20261024_153012.gif');
       expect(galleryFileName('  ', 'image/jpeg', now: now), 'DSH_20261024_153012.jpg');
+    });
+
+    test('UTF-16 cap never splits a supplementary character', () {
+      final prefix = '图' * 79;
+      final name = galleryFileName('$prefix😀.png', 'image/png');
+      expect(utf8.decode(utf8.encode(name)), name, reason: 'a valid title must remain valid through UTF-8');
+      expect(name, '$prefix.png');
+    });
+
+    test('UTF-16 cap preserves complete pairs and the original size budget', () {
+      final prefix = '图' * 78;
+      expect(galleryFileName('$prefix😀suffix.png', 'image/png'), '$prefix😀.png');
+      expect(galleryFileName('${'图' * 81}.webp', 'image/webp'), '${'图' * 80}.webp');
+      expect(galleryFileName('${'a' * 81}.jpeg', 'image/jpeg'), '${'a' * 80}.jpg');
     });
   });
 
@@ -134,6 +149,87 @@ void main() {
         saveToGallery(const MediaChannel(), _png, name: 'a.png'),
         throwsA(isA<GallerySaveException>().having((e) => e.code, 'code', 'permission')),
       );
+    });
+
+    test('Android\'s refusals keep their codes; backing out of HarmonyOS\'s window is its own', () async {
+      for (final (native, code) in [
+        ('invalid', 'unsupported'),
+        ('failed', 'failed'),
+        ('anything else', 'failed'),
+        ('cancelled', 'cancelled'),
+      ]) {
+        _mockMedia((_) async => throw PlatformException(code: native));
+        await expectLater(
+          saveToGallery(const MediaChannel(), _png, name: 'a.png'),
+          throwsA(isA<GallerySaveException>().having((e) => e.code, 'code', code)),
+          reason: native,
+        );
+      }
+    });
+
+    group('what saving a picture says', () {
+      bool? saved;
+
+      Future<bool?> save(WidgetTester tester, String os) async {
+        await tester.pumpWidget(
+          testApp(
+            Scaffold(
+              body: Builder(
+                builder: (context) => TextButton(
+                  onPressed: () async => saved = await saveImageToGallery(context, () async => _png, name: 'a.png'),
+                  child: const Text('save'),
+                ),
+              ),
+            ),
+            overrides: [operatingSystemProvider.overrideWithValue(os)],
+          ),
+        );
+        saved = null;
+        await tester.tap(find.text('save'));
+        await tester.pump();
+        await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 50)));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+        return saved;
+      }
+
+      for (final (os, place) in [('android', 'Pictures/DSH Go/a.png'), ('ohos', 'file://media/Photo/1/a.png')]) {
+        testWidgets('$os: saved says so, whatever the place looks like', (tester) async {
+          _mockMedia((_) async => place);
+          expect(await save(tester, os), isTrue);
+          expect(find.text('已保存到相册'), findsOneWidget);
+          expect(find.textContaining('file://'), findsNothing);
+          await tester.pumpAndSettle(const Duration(seconds: 3));
+        });
+
+        testWidgets('$os: a real failure still says so', (tester) async {
+          _mockMedia((_) async => throw PlatformException(code: 'failed'));
+          expect(await save(tester, os), isFalse);
+          expect(find.text('保存失败，请重试'), findsOneWidget);
+          await tester.pumpAndSettle(const Duration(seconds: 5));
+        });
+      }
+
+      testWidgets('ohos: backing out of the album window reads as nothing, neither failed nor saved', (tester) async {
+        _mockMedia((_) async => throw PlatformException(code: 'cancelled', message: '保存图片已取消。'));
+        expect(await save(tester, 'ohos'), isFalse);
+        expect(find.byType(SnackBar), findsNothing);
+      });
+    });
+
+    test('UTF-16 cap does not send a replacement character through the media channel', () async {
+      final prefix = '图' * 79;
+      final expected = '$prefix.png';
+      final calls = _mockMedia((call) async {
+        final args = call.arguments as Map;
+        return 'Pictures/DSH Go/${args['name']}';
+      });
+      final where = await saveToGallery(const MediaChannel(), _png, name: '$prefix😀.png');
+      final args = calls.single.arguments as Map;
+      expect(args['name'], expected);
+      expect(args['bytes'], _png);
+      expect(args['mime'], 'image/png');
+      expect(where, 'Pictures/DSH Go/$expected');
     });
   });
 

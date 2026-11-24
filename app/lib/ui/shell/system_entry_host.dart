@@ -3,11 +3,15 @@
 //
 //   share sheet        a lone `.dshgo` file or a share link → the share-code
 //                      importer (as if opened); a hosted conversation link →
-//                      its replay; anything else → 新对话 with the text and
-//                      attachments in the composer, not sent
+//                      its replay; a lone character card → 酒馆; anything
+//                      else → 新对话 with the text and attachments in the
+//                      composer, not sent
 //   launcher shortcut  新对话 / 语音输入 → 新对话 (listening) · a recent
 //                      conversation → that conversation, on its host
 //   Quick Settings     新对话
+//   pet screenshot     新对话 with the image attached, focused and unsent
+//   companion phone    back to her room when the task was asked for there;
+//   task               otherwise the app as it was
 //   a file opened with the app that no feature claims → 新对话 with it attached
 //
 // and keeps the launcher's recent conversations current. Bridges:
@@ -18,18 +22,29 @@
 // onboarding they are held, natively and in the bridges.
 
 import 'dart:async';
+import 'dart:io';
 
+import 'package:dsh_tavern/dsh_tavern.dart' show isDeepSeekExport;
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../companion/companion_state.dart' show companionSessionFilterProvider, companionSessionsProvider;
 import '../../l10n/l10n.dart';
 import '../../links/app_links.dart';
 import '../../links/launcher_entries.dart';
 import '../../links/share_intake.dart';
+import '../../state/android_features.dart';
+import '../../state/attachments.dart';
 import '../../state/compose_inbox.dart';
+import '../../state/draft_store.dart';
 import '../../state/hosts_state.dart';
 import '../../state/sessions_state.dart';
 import '../common/discard_guard.dart';
+import '../companion/companion_page.dart';
+import '../companion/companion_tasks_page.dart';
+import '../tavern/tavern_deepseek_import.dart';
+import '../tavern/tavern_intake.dart';
 
 /// Draws nothing. Put it once in the home shell's stack, next to [LinkHost].
 class SystemEntryHost extends ConsumerStatefulWidget {
@@ -82,17 +97,82 @@ class _SystemEntryHostState extends ConsumerState<SystemEntryHost> {
       ref.read(appLinksProvider).add(link.appLink);
       return;
     }
-    final request = await ComposeRequest.fromShare(share);
-    if (mounted) await _compose(request);
+    // A lone character card goes to 酒馆.
+    if (share.files case [final file]
+        when share.skipped.isEmpty && await isTavernCardFile(File(file.path), file.name)) {
+      final ui = ref.read(linkRouterProvider).context ?? (mounted ? context : null);
+      if (ui != null && ui.mounted) await openTavernCardFile(ui, ref, File(file.path), file.name);
+      // HarmonyOS's inbox holds the batch until it is used: the card has been read.
+      if (share.consumption case final consumption?) unawaited(consumption.finish());
+      return;
+    }
+    // DeepSeek's chat export goes to 酒馆 too, to be continued there.
+    if (share.files case [final file]
+        when share.skipped.isEmpty &&
+            file.name.toLowerCase().endsWith('.zip') &&
+            await compute(isDeepSeekExport, file.path)) {
+      final ui = ref.read(linkRouterProvider).context ?? (mounted ? context : null);
+      if (ui != null && ui.mounted) await takeInDeepSeekExport(ui, ref, path: file.path);
+      if (share.consumption case final consumption?) unawaited(consumption.finish());
+      return;
+    }
+    // Android's native side keeps only a few unread shares, dropping the oldest
+    // as the next arrives, with no way to say one is still wanted: read it now.
+    final os = ref.read(operatingSystemProvider);
+    if (os != 'ohos' && os != 'ios') {
+      final request = await ComposeRequest.fromShare(share, heldBytes: _heldDraftBytes);
+      if (mounted) await _compose(request);
+      return;
+    }
+    // HarmonyOS's and iOS's inboxes hold a batch until it is used. Read after
+    // the answer: shares arriving behind an unanswered 「放弃修改？」 wait in the
+    // cache, not in memory.
+    await _showChat();
+    if (!mounted) return ComposeRequest.discardShare(share);
+    final request = await ComposeRequest.fromShare(share, heldBytes: _heldDraftBytes);
+    if (mounted) ref.read(composeInboxProvider.notifier).push(request);
+  }
+
+  String _draftKeyFor(String? sessionId) {
+    final host = ref.read(activeHostProvider);
+    return draftStorageKey(hostKey: '${host.kind.name}:${host.id}', sessionId: sessionId);
+  }
+
+  /// Bytes the draft this arrival lands in already holds; share loading checks
+  /// the message's whole budget before buffering anything.
+  int get _heldDraftBytes {
+    // iOS shares always merge into the new-chat draft, even when another
+    // conversation is selected. Its attachments own the pre-read budget.
+    final sessionId = ref.read(operatingSystemProvider) == 'ios' ? null : ref.read(currentSessionProvider);
+    final draft = ref.read(draftStoreProvider).drafts[_draftKeyFor(sessionId)];
+    return totalAttachmentBytes(draft?.attachments ?? const []);
   }
 
   Future<void> _onEntry(LauncherEntry entry) async {
+    if (entry is OpenChatEntry) {
+      // A cold start may still be reading her saved sessions.
+      await ref.read(companionSessionsProvider.notifier).ready;
+      if (!mounted) return;
+      entry = entry.forCompanion(ref.read(companionSessionFilterProvider), active: ref.read(activeHostProvider));
+    }
     switch (entry) {
       case NewChatEntry(:final voice, :final text):
         // The microphone opens only for an app on screen; the shortcut's
         // intent can arrive a beat before Flutter hears it is resumed.
         if (voice) await _untilResumed();
         if (mounted) await _compose(ComposeRequest(text: text, voice: voice));
+      case ScreenshotEntry(:final path):
+        final draft = ref.read(draftStoreProvider).drafts[_draftKeyFor(null)];
+        // Reuse share intake's validation and cache cleanup; unlike an opened
+        // file, this copy belongs only to this pending attachment.
+        final request = await ComposeRequest.fromShare(
+          IncomingShare(
+            files: [SharedFile(path: path, name: path.split('/').last)],
+          ),
+          heldBytes: totalAttachmentBytes(draft?.attachments ?? const []),
+        );
+        await _untilResumed();
+        if (mounted) await _compose(request);
       case OpenChatEntry(:final host, :final sessionId):
         if (!await _showChat() || !mounted) return;
         final hosts = ref.read(hostsProvider);
@@ -105,6 +185,20 @@ class _SystemEntryHostState extends ConsumerState<SystemEntryHost> {
         // one from switching away on a cold start (as notification taps do).
         ref.read(activeHostProvider.notifier).select(host);
         ref.read(currentSessionProvider.notifier).select(sessionId);
+      case OpenCompanionTaskEntry(:final taskId, :final taskRev):
+        await _untilResumed();
+        if (mounted) {
+          await Navigator.of(context, rootNavigator: true).push(
+            MaterialPageRoute<void>(
+              builder: (_) => CompanionTasksPage(taskId: taskId, openedRevision: taskRev),
+            ),
+          );
+        }
+      case CompanionAssistantEntry():
+        if (mounted) await openCompanionAssistant(context, ref, entry);
+      case OpenCompanionEntry(:final room):
+        // Never _showChat: closing the room would end her turn, and she is no chat.
+        if (room && mounted) await showCompanionRoom(context, ref);
     }
   }
 
@@ -127,7 +221,7 @@ class _SystemEntryHostState extends ConsumerState<SystemEntryHost> {
   /// A file opened with the app that no feature registered for.
   Future<bool> _onFile(Uri uri) async {
     if (uri.scheme != 'file') return false;
-    final request = await ComposeRequest.fromFile(uri.toFilePath());
+    final request = await ComposeRequest.fromFile(uri.toFilePath(), heldBytes: _heldDraftBytes);
     if (!mounted) return false;
     await _compose(request);
     return true;
@@ -137,8 +231,12 @@ class _SystemEntryHostState extends ConsumerState<SystemEntryHost> {
   /// with unsaved edits open, it still lands there, ready for when they're
   /// back.
   Future<void> _compose(ComposeRequest request) async {
-    await _showChat();
-    if (mounted) ref.read(composeInboxProvider.notifier).push(request);
+    final revealed = await _showChat();
+    if (!mounted) return;
+    // Siri dictation needs the visible composer. Keeping an edit page open
+    // cancels this voice request; text and files may still wait in its draft.
+    if (!revealed && request.voice && ref.read(operatingSystemProvider) == 'ios') return;
+    ref.read(composeInboxProvider.notifier).push(request);
   }
 
   /// Back to the chat: pages and sheets above it closed (unsaved edits only

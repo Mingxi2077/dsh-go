@@ -6,16 +6,17 @@ import { FilePickerRuntime } from "./file-picker-runtime.js";
 import { randomBytes } from "node:crypto";
 import { readFile, realpath, stat } from "node:fs/promises";
 import { extname, sep } from "node:path";
+import { performance } from "node:perf_hooks";
 import { normalize as normalizeEffects, splitPending } from "./effects.js";
-import { ID, PKG, PROTOCOL, SEMVER } from "./limits.js";
+import { ID, NEGOTIATED_PLACEMENTS, PKG, PROTOCOL, SEMVER } from "./limits.js";
 import { insidePackage, panelTitle } from "./manifest.js";
 import { acceptUpgrade } from "./ws.js";
 import { LOCALE, call, errorText, isPlainObject, normalizeScope, toJson, utf8Bytes, viewStats, withTimeout } from "./util.js";
 
 export const STREAM_PATH = "/dsh-go/v1/stream";
 const BASE = "/dsh-go/v1/";
-const SURFACE_KEYS = { "composer.actions": "composer.actions", "message.actions": "message.actions", "composer.strip": "composer.strip", panel: "panels" };
-const CONTEXT_FOR = { "composer.actions": ["draft", "clipboard"], "message.actions": ["message"] };
+const SURFACE_KEYS = { "composer.actions": "composer.actions", "message.actions": "message.actions", "composer.strip": "composer.strip", panel: "panels", "composer.tools": "composer.tools", "session.actions": "session.actions" };
+const CONTEXT_FOR = { "composer.actions": ["draft", "clipboard"], "composer.tools": ["draft", "clipboard"], "message.actions": ["message"] };
 const IMAGE_TYPES = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif" };
 const SUB_ID = /^.{1,32}$/su;
 
@@ -53,6 +54,7 @@ function parseCaps(sp) {
   const surfaces = list("surfaces");
   const components = list("components");
   const features = featuresOf(list("features"));
+  const placements = surfaces.filter((s) => NEGOTIATED_PLACEMENTS.includes(s));
   return {
     versions,
     app,
@@ -60,8 +62,12 @@ function parseCaps(sp) {
     surfaces,
     components,
     features,
-    key: JSON.stringify([versions, app, locale.toLowerCase(), ...(features.length ? [features] : [])]),
-    forPlugin: () => ({ protocol: PROTOCOL, app, locale, surfaces: [...surfaces], components: [...components], ...(features.length ? { features: [...features] } : {}) }),
+    key: JSON.stringify([versions, app, locale.toLowerCase(), ...(features.length ? [features] : []), ...(placements.length ? [placements] : [])]),
+    // Omitted lists preserve the SDK's v1 defaults; explicit empty lists stay empty.
+    forPlugin: () => ({ protocol: PROTOCOL, app, locale,
+      ...(sp.has("surfaces") ? { surfaces: [...surfaces] } : {}),
+      ...(sp.has("components") ? { components: [...components] } : {}),
+      ...(features.length ? { features: [...features] } : {}) }),
   };
 }
 
@@ -89,6 +95,7 @@ function scopeFromQuery(sp) {
 
 function readJsonBody(req, limit) {
   return new Promise((resolve, reject) => {
+    if (req.aborted || req.destroyed) return reject(new HttpError(400, "bad-request", "request body was interrupted"));
     const chunks = [];
     let size = 0;
     let over = false;
@@ -109,7 +116,7 @@ function readJsonBody(req, limit) {
   });
 }
 
-export function createNativeRoutes(core) {
+export function createNativeRoutes(core, { beginUsage = () => () => {} } = {}) {
   const L = core.limits;
   const conns = new Set();
   const connById = new Map();
@@ -117,7 +124,7 @@ export function createNativeRoutes(core) {
   const capabilities = new CapabilityRuntime(core, fail);
   const files = new FilePickerRuntime(core, { fail, sendJson, readJsonBody });
   let disposed = false;
-  const staticViews = new Map();   // file -> {stamp, view}
+  const staticViews = new Map();   // file -> {stamp, view: normalized JSON value and byte size}
 
   const pluginOrFail = (pkg, caps) => {
     const rec = core.plugin(pkg);
@@ -126,6 +133,14 @@ export function createNativeRoutes(core) {
     if (state === "degraded") fail(409, "degraded", `${pkg} is degraded for this run`);
     if (state !== "ok") fail(409, "not-native", `${pkg} is ${state}`);
     return rec;
+  };
+
+  // Whether pkg is still the plugin load and registration that origin was taken from.
+  const isCurrent = (pkg, kind, id, origin) => {
+    const now = core.plugin(pkg);
+    return !disposed && now !== undefined && core.stateOf(now) === "ok"
+      && now.uid === origin.uid && now.stamp === origin.stamp
+      && core.registration(pkg, kind, id)?.token === origin.token;
   };
 
   // -------------------------------------------------------------- contributions
@@ -163,8 +178,11 @@ export function createNativeRoutes(core) {
       fail(500, "invalid-view", "static view file is not JSON");
     }
     if (!isPlainObject(view)) fail(500, "invalid-view", "static view must be an object");
-    staticViews.set(file, { stamp, view });
-    return view;
+    const json = toJson(view);
+    if (json && json.bytes > L.viewBytes) fail(500, "invalid-view", `static view exceeds ${L.viewBytes} bytes`);
+    const normalized = json && { value: json.value, bytes: json.bytes };
+    staticViews.set(file, { stamp, view: normalized });
+    return normalized;
   }
 
   async function view(req, res, url, rest) {
@@ -178,6 +196,11 @@ export function createNativeRoutes(core) {
     const item = rec.parsed.items.panels.find((p) => p.id === id);
     if (item === undefined) fail(404, "not-found", `${pkg} declares no panel ${id}`);
     const reg = core.registration(pkg, "panels", id);
+    // Like invoke: a view or first data that finishes after a reload answers no-handler.
+    const origin = { uid: rec.uid, stamp: rec.stamp, token: reg?.token };
+    const requireCurrent = () => {
+      if (!isCurrent(pkg, "panels", id, origin)) fail(409, "no-handler", "panel registration was unloaded or changed");
+    };
     let viewJson;
     if (reg !== undefined) {
       let result;
@@ -186,10 +209,12 @@ export function createNativeRoutes(core) {
           ? await withTimeout(call(reg.def.view, { ...scope.scope }, caps.forPlugin()), L.viewTimeoutMs)
           : reg.def.view;
       } catch (error) {
+        requireCurrent();
         core.violation(pkg, error?.timeout ? "timeout" : "plugin-error", `view(${id}): ${errorText(error)}`);
         if (error?.timeout) fail(504, "timeout", `view(${id}) took longer than ${L.viewTimeoutMs} ms`);
         fail(500, "plugin-error", `view(${id}) failed`);
       }
+      requireCurrent();
       const json = isPlainObject(result) ? toJson(result) : undefined;
       if (json === undefined) {
         core.violation(pkg, "invalid-view", `view(${id}) is not a JSON object`);
@@ -201,7 +226,7 @@ export function createNativeRoutes(core) {
       }
       viewJson = json;
     } else if (item.viewFile !== undefined) {
-      viewJson = toJson(await staticView(item.viewFile));
+      viewJson = await staticView(item.viewFile).finally(requireCurrent);
     } else {
       fail(409, "no-handler", `${pkg} has neither panel("${id}") nor a static view`);
     }
@@ -222,6 +247,7 @@ export function createNativeRoutes(core) {
         } finally {
           feed.unpin();
         }
+        requireCurrent();
         if (feed.data !== undefined) {
           data = feed.data;
           rev = feed.rev;
@@ -267,7 +293,7 @@ export function createNativeRoutes(core) {
     if (body.userGesture !== undefined && typeof body.userGesture !== "boolean") fail(400, "bad-request", "userGesture must be a boolean");
 
     const rec = pluginOrFail(body.pkg);
-    const item = rec.parsed.items[surfaceKey].find((x) => x.id === body.id);
+    const item = rec.parsed.items[surfaceKey]?.find((x) => x.id === body.id);
     if (item === undefined) fail(404, "not-found", `${body.pkg} declares no ${body.surface} ${body.id}`);
     const capabilityConn = connById.get(body.stream);
     if (!(item.requires ?? []).every(x => capabilityConn?.features?.includes(x))) fail(409, "unsupported", "action requires negotiated capabilities");
@@ -280,12 +306,7 @@ export function createNativeRoutes(core) {
     if (typeof fn !== "function") fail(409, "no-handler", `no handler for ${body.id}${body.action ? `/${body.action}` : ""}`);
     // Bind all results (not only file capabilities) to this exact registration.
     const origin = { uid: rec.uid, stamp: rec.stamp, token: registration.token };
-    const current = () => {
-      const now = core.plugin(body.pkg);
-      return !disposed && now !== undefined && core.stateOf(now) === "ok"
-        && now.uid === origin.uid && now.stamp === origin.stamp
-        && core.registration(body.pkg, kind, body.id)?.token === origin.token;
-    };
+    const current = () => isCurrent(body.pkg, kind, body.id, origin);
     const rejectStale = () => {
       controller.abort();
       return sendJson(res, 200, { v: PROTOCOL, effects: [], issues: [{ path: "/runtime/effects", code: "bad-effect", severity: "warn", message: "invocation registration was unloaded or changed" }] });
@@ -313,10 +334,24 @@ export function createNativeRoutes(core) {
     const event = { surface: body.surface, id: body.id, locale, signal: controller.signal };
     if (body.action !== undefined) event.action = body.action;
     if (body.value !== undefined) event.value = body.value;
-    let result;
+    const settleUsage = beginUsage();
+    let result, deferred;
     try {
-      result = await withTimeout(call(fn, arg, event), L.handlerTimeoutMs);
+      ({ result, deferred } = await withTimeout(call(fn, arg, event).then(result => {
+        const deferred = splitPending(result);
+        // Own eager work even if the outer handler finishes after its deadline.
+        // Assimilate a thenable once; later delivery consumes this same Promise.
+        // Never start lazy work, and never mutate the plugin's result object.
+        const work = deferred?.ok ? deferred.work : deferred ? result.result : undefined;
+        if (typeof work !== "function" && typeof work?.then === "function") {
+          const owned = Promise.resolve(work);
+          owned.then(undefined, () => {});
+          if (deferred.ok) deferred.work = owned;
+        }
+        return { result, deferred };
+      }), L.handlerTimeoutMs));
     } catch (error) {
+      settleUsage(current() ? 2 : 4);
       controller.abort();
       if (!current()) return rejectStale();
       core.violation(body.pkg, error?.timeout ? "timeout" : "plugin-error", `on(${body.id}): ${errorText(error)}`);
@@ -326,17 +361,16 @@ export function createNativeRoutes(core) {
       release();
     }
     const panels = new Set(rec.parsed.items.panels.map((p) => p.id));
-    const deferred = splitPending(result);
-    if (!current() && typeof deferred?.work?.then === "function") deferred.work.then(undefined, () => {});
-    if (!current()) return rejectStale();
+    if (!current()) { settleUsage(4); return rejectStale(); }
     if (deferred !== undefined) {
-      return startPending(res, { pkg: body.pkg, id: body.id, streamId: body.stream, scope, panels, source: isPanel ? body.id : undefined, controller, deferred, current, filterPatches });
+      return startPending(res, { settleUsage, pkg: body.pkg, id: body.id, streamId: body.stream, scope, panels, source: isPanel ? body.id : undefined, controller, deferred, current, filterPatches });
     }
     const norm = normalizeEffects(result, { panels, source: isPanel ? body.id : undefined, capabilities: capabilities.options(rec, capabilityConn), userGesture: body.userGesture === true });
     if (!current()) return rejectStale();
     filterPatches(norm);
     norm.effects = capabilities.bind(norm.effects, rec, capabilityConn, scope, locale, norm.issues);
     norm.effects = files.bind(norm.effects, rec, capabilityConn, scope, locale, body, norm.issues, fileInvocation);
+    settleUsage(norm.violation ? 2 : 1);
     if (norm.violation) core.violation(body.pkg, "bad-effect", `on(${body.id}) returned invalid effects: ${norm.issues.map((i) => i.message).join("; ").slice(0, 200)}`);
     else core.success(body.pkg);
     for (const e of norm.effects) if (e.type === "patch") core.patchFeed(body.pkg, e.id, scope, e.data);
@@ -345,10 +379,11 @@ export function createNativeRoutes(core) {
 
   // -------------------------------------------------------------- deferred results (§4.7)
 
-  function startPending(res, { pkg, id, streamId, scope, panels, source, controller, deferred, current, filterPatches }) {
+  function startPending(res, { settleUsage, pkg, id, streamId, scope, panels, source, controller, deferred, current, filterPatches }) {
     // A refused deferred result must not leave an eager rejected Promise unhandled.
     const swallow = () => { if (typeof deferred.work?.then === "function") deferred.work.then(undefined, () => {}); };
     if (!deferred.ok) {
+      settleUsage(2);
       swallow();
       controller.abort();
       core.violation(pkg, "bad-effect", `on(${id}): ${deferred.issues[0].message}`);
@@ -356,6 +391,7 @@ export function createNativeRoutes(core) {
     }
     const conn = typeof streamId === "string" ? connById.get(streamId) : undefined;
     if (conn === undefined || conn.ws.closed) {
+      settleUsage(4);
       swallow();
       controller.abort();
       fail(409, "no-stream", "a deferred result needs an open stream: pass welcome.conn as `stream`");
@@ -363,12 +399,13 @@ export function createNativeRoutes(core) {
     let active = 0;
     for (const p of pendings.values()) if (p.pkg === pkg) active++;
     if (active >= L.pendingPerPlugin) {
+      settleUsage(4);
       swallow();
       controller.abort();
       fail(429, "too-many-pending", `at most ${L.pendingPerPlugin} pending results per plugin`, { "retry-after": "1" });
     }
     core.success(pkg);
-    const entry = { id: `p${randomBytes(8).toString("hex")}`, pkg, conn, controller, current, settled: false, timer: undefined };
+    const entry = { id: `p${randomBytes(8).toString("hex")}`, pkg, conn, controller, current, settleUsage, settled: false, timer: undefined };
     pendings.set(entry.id, entry);
     conn.pendings.add(entry.id);
     entry.timer = setTimeout(() => settle(entry, { t: "void", reason: "timeout" }), deferred.timeoutMs);
@@ -386,7 +423,7 @@ export function createNativeRoutes(core) {
       if (norm.violation) core.violation(pkg, "bad-effect", `deferred on(${id}) returned invalid effects: ${norm.issues.map((i) => i.message).join("; ").slice(0, 200)}`);
       else core.success(pkg);
       for (const e of norm.effects) if (e.type === "patch") core.patchFeed(pkg, e.id, scope, e.data);
-      settle(entry, { t: "done", effects: norm.effects, ...(norm.issues.length > 0 ? { issues: norm.issues } : {}) }, false);
+      settle(entry, { t: "done", effects: norm.effects, ...(norm.issues.length > 0 ? { issues: norm.issues } : {}) }, false, norm.violation ? 2 : 1);
     }, async (error) => {
       await gate;
       if (entry.settled) return;
@@ -401,9 +438,10 @@ export function createNativeRoutes(core) {
   }
 
   /** Each pending id settles exactly once; only its own connection hears about it. */
-  function settle(entry, msg, abort = true) {
+  function settle(entry, msg, abort = true, outcome = msg.reason === "cancelled" ? 3 : 2) {
     if (entry.settled) return;
     entry.settled = true;
+    entry.settleUsage(outcome);
     clearTimeout(entry.timer);
     pendings.delete(entry.id);
     entry.conn.pendings.delete(entry.id);
@@ -416,6 +454,7 @@ export function createNativeRoutes(core) {
       const e = pendings.get(pid);
       if (e === undefined) continue;
       e.settled = true;
+      e.settleUsage(4);
       clearTimeout(e.timer);
       pendings.delete(pid);
       e.controller.abort();
@@ -433,13 +472,14 @@ export function createNativeRoutes(core) {
     if (rec?.parsed.assetsDir === undefined) fail(404, "not-found", "no such asset");
     const type = IMAGE_TYPES[extname(tail[tail.length - 1]).toLowerCase()];
     if (type === undefined) fail(404, "not-found", "no such asset");
-    const file = insidePackage(rec.parsed.assetsDir, tail.join("/"));
+    let file = insidePackage(rec.parsed.assetsDir, tail.join("/"));
     let st;
     try {
       if (file === undefined) throw new Error();
       const [real, realDir] = await Promise.all([realpath(file), realpath(rec.parsed.assetsDir)]);
       if (!real.startsWith(realDir + sep)) throw new Error();
-      st = await stat(real);
+      file = real;
+      st = await stat(file);
       if (!st.isFile() || st.size > L.assetBytes) throw new Error();
     } catch {
       fail(404, "not-found", "no such asset");
@@ -452,6 +492,7 @@ export function createNativeRoutes(core) {
       return;
     }
     const bytes = await readFile(file);
+    if (bytes.length > L.assetBytes) fail(404, "not-found", "no such asset");
     res.writeHead(200, { ...headers, "content-length": bytes.length });
     res.end(req.method === "HEAD" ? undefined : bytes);
   }
@@ -466,7 +507,8 @@ export function createNativeRoutes(core) {
   function upgrade(req, socket, head) {
     const ws = acceptUpgrade(req, socket, head, { maxMessage: L.streamInboundFrameBytes });
     if (ws === undefined) return;
-    const conn = { id: randomBytes(12).toString("base64url"), ws, helloed: false, subs: new Map(), pendings: new Set(), lastRecv: Date.now(), openedAt: Date.now() };
+    const openedAt = performance.now();
+    const conn = { id: randomBytes(12).toString("base64url"), ws, helloed: false, subs: new Map(), pendings: new Set(), lastRecv: openedAt, openedAt };
     conn.send = (msg) => {
       if (ws.closed) return;
       if (ws.bufferedAmount > L.streamBacklogBytes) {
@@ -482,13 +524,13 @@ export function createNativeRoutes(core) {
     conns.add(conn);
     connById.set(conn.id, conn);
     const hb = setInterval(() => {
-      const now = Date.now();
+      const now = performance.now();
       if (now - conn.lastRecv > L.idleTimeoutSeconds * 1000) return ws.close(1001, "idle");
       if (!conn.helloed && now - conn.openedAt > 10000) return ws.close(1008, "hello expected");
       ws.ping();
     }, L.heartbeatSeconds * 1000);
     hb.unref?.();
-    ws.on("activity", () => { conn.lastRecv = Date.now(); });
+    ws.on("activity", () => { conn.lastRecv = performance.now(); });
     ws.on("close", () => {
       clearInterval(hb);
       conns.delete(conn);
@@ -571,8 +613,10 @@ export function createNativeRoutes(core) {
     if (state === "degraded") return end("degraded");
     if (state !== "ok") return end("not-native");
     const declared = rec.parsed.ids.get(msg.id);
-    if (declared !== "panels" && declared !== "composer.strip") return end("not-found");
-    const feed = core.feed(msg.pkg, msg.id, declared === "panels" ? "panel" : "strip", scope, conn.locale);
+    if (declared !== "panels" && declared !== "composer.strip" && declared !== "turn.note") return end("not-found");
+    // A turn's note belongs to a conversation.
+    if (declared === "turn.note" && scope.scope.sessionId === undefined) return end("not-found");
+    const feed = core.feed(msg.pkg, msg.id, declared === "panels" ? "panel" : declared === "turn.note" ? "note" : "strip", scope, conn.locale);
     if (feed === undefined) return end("limit");
     const sub = {
       id: msg.sub,

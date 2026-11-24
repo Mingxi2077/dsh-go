@@ -139,7 +139,7 @@ void main() {
       expect(custom.edge, isNull);
     });
 
-    test('replacing removes the old file, keeps the old fit and background choice', () async {
+    test('replacing keeps the old fit and background choice, and the old file until it is saved', () async {
       final first = (await importer([
         _file(await _png(100, 100, edge: const Color(0xFF000000))),
       ]).pick()).$1!.copyWith(backdrop: LaunchBackdrop.white);
@@ -148,7 +148,7 @@ void main() {
         directory: () async => dir,
         now: () => DateTime(2030),
       ).pick(previous: first);
-      expect(File(first.path).existsSync(), isFalse);
+      expect(File(first.path).existsSync(), isTrue, reason: 'the controller removes it once the new one is saved');
       expect(File(second!.path).existsSync(), isTrue);
       expect(second.backdrop, LaunchBackdrop.white);
     });
@@ -249,6 +249,24 @@ void main() {
       expect(await CustomLaunch.load(), isNull);
     });
 
+    test('framing (zoom, alignX, alignY) round trips and clamps out-of-range values', () async {
+      final file = File('${dir.path}/custom-frame.png')..writeAsBytesSync(await _png(10, 10));
+      final framed = CustomLaunch(
+        kind: LaunchMediaKind.image,
+        path: file.path,
+        width: 10,
+        height: 10,
+        zoom: 2.5,
+        alignX: -0.4,
+        alignY: 0.75,
+      );
+      await CustomLaunch.save(framed);
+      expect(await CustomLaunch.load(), framed);
+
+      final clamped = CustomLaunch.fromJson({...framed.toJson(), 'zoom': 99, 'alignX': -5, 'alignY': 3})!;
+      expect((clamped.zoom, clamped.alignX, clamped.alignY), (CustomLaunch.maxZoom, -1.0, 1.0));
+    });
+
     test('garbage reads as none', () async {
       SharedPreferences.setMockInitialValues({CustomLaunch.prefsKey: '{"kind": "nope"'});
       expect(await CustomLaunch.load(), isNull);
@@ -275,6 +293,11 @@ void main() {
       expect(center.width, 1080);
       final small = LaunchMedia.targetSize(300, 300, screen, LaunchFit.fill);
       expect((small.width, small.height), (300, 300));
+      // Zoomed in: decodes enough detail for the zoomed window, capped at the file's own size.
+      final zoomed = LaunchMedia.targetSize(4000, 3000, const Size(540, 1200), LaunchFit.fill, zoom: 2);
+      expect((zoomed.width, zoomed.height), (3200, 2400));
+      final capped = LaunchMedia.targetSize(4000, 3000, screen, LaunchFit.fill, zoom: 3);
+      expect((capped.width, capped.height), (4000, 3000));
     });
   });
 }

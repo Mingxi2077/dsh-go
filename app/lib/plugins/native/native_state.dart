@@ -67,8 +67,10 @@ class _SystemLocales with WidgetsBindingObserver {
 /// What the app tells the bridge it can do (protocol §3.1).
 final nativeCapsProvider = Provider<DshGoCaps>(
   (ref) => DshGoCaps(
-    app: AppInfo.version.split('+').first,
+    // The bridge reads x.y.z; a beta (1.3.0-beta.1) counts as its release.
+    app: AppInfo.version.split('+').first.split('-').first,
     locale: ref.watch(nativeLocaleProvider),
+    surfaces: DshGoSurfaces.all,
     components: ref.watch(nativeViewComponentsProvider),
     // v1.2: empty (nothing sent) until a plugin declares a capability.
     features: ref.watch(nativeFeatureStateProvider),
@@ -237,18 +239,21 @@ final nativeStreamProvider = Provider<DshGoStream?>((ref) {
   final stream = features.isNotEmpty && bridge is ClientNativeBridge
       ? bridge.client.openDshGoStream(locale: locale, features: features)
       : bridge.openStream(locale: locale);
-  final lifecycle = AppLifecycleListener(
-    onStateChange: (state) {
-      switch (state) {
-        case AppLifecycleState.resumed:
-          stream.foreground();
-        case AppLifecycleState.paused || AppLifecycleState.hidden || AppLifecycleState.detached:
-          stream.background();
-        case AppLifecycleState.inactive:
-          break;
-      }
-    },
-  );
+  // A stream made while the app is already in the background (a host that
+  // came late, a locale rebuild) starts its grace now, not at the next change.
+  void follow(AppLifecycleState? state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        stream.foreground();
+      case AppLifecycleState.paused || AppLifecycleState.hidden || AppLifecycleState.detached:
+        stream.background();
+      case AppLifecycleState.inactive || null:
+        break;
+    }
+  }
+
+  final lifecycle = AppLifecycleListener(onStateChange: follow);
+  follow(WidgetsBinding.instance.lifecycleState);
   final changes = stream.changes.listen((_) => ref.invalidate(nativeRawContributionsProvider));
   ref.onDispose(() {
     lifecycle.dispose();
@@ -391,6 +396,24 @@ final nativeStripsProvider = Provider<List<NativeStrip>>((ref) {
   return [
     for (final p in plugins)
       if (ref.watch(nativeSurfaceOnProvider((p.package, NativeSurface.composerStrip)))) ...p.strips,
+  ];
+});
+
+/// The ＋ panel's tools, switched-on ones, every plugin's, up to what the panel holds.
+final nativeComposerToolsProvider = Provider<List<NativeAction>>((ref) {
+  final plugins = ref.watch(nativeContributionsProvider).plugins;
+  return [
+    for (final p in plugins)
+      if (ref.watch(nativeSurfaceOnProvider((p.package, NativeSurface.composerTools)))) ...p.composerTools,
+  ].take(NativeLimits.toolsTotal).toList();
+});
+
+/// What plugins can do to a whole conversation, switched-on ones.
+final nativeSessionActionsProvider = Provider<List<NativeAction>>((ref) {
+  final plugins = ref.watch(nativeContributionsProvider).plugins;
+  return [
+    for (final p in plugins)
+      if (ref.watch(nativeSurfaceOnProvider((p.package, NativeSurface.sessionActions)))) ...p.sessionActions,
   ];
 });
 

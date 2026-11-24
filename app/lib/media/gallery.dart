@@ -27,6 +27,11 @@ class MediaChannel {
       await channel.invokeMethod<String>('saveImage', {'bytes': bytes, 'name': name, 'mime': mime}) ??
       'Pictures/DSH Go/$name';
 
+  /// Streams an already materialized local video into the gallery.
+  Future<String> saveVideoFile(String path, {required String name}) async =>
+      await channel.invokeMethod<String>('saveVideoFile', {'path': path, 'name': name}) ??
+      'Movies/DSH Go/$name';
+
   /// The app's page in system settings (storage was refused for good).
   Future<bool> openSettings() async => await channel.invokeMethod<bool>('openSettings') ?? false;
 }
@@ -38,7 +43,8 @@ class GallerySaveException implements Exception {
   const GallerySaveException(this.code);
 
   /// `permission` (storage refused), `unsupported` (not a picture Flutter
-  /// can read), `download` (a web image did not come), `failed`.
+  /// can read), `download` (a web image did not come), `failed`, `cancelled`
+  /// (the person backed out of HarmonyOS's album window: nothing to say).
   final String code;
 
   @override
@@ -74,7 +80,14 @@ String galleryFileName(String? name, String mime, {DateTime? now}) {
         'DSH_${t.year}${two(t.month)}${two(t.day)}_'
         '${two(t.hour)}${two(t.minute)}${two(t.second)}';
   }
-  if (base.length > 80) base = base.substring(0, 80).trim();
+  if (base.length > 80) {
+    var end = 80;
+    final lead = base.codeUnitAt(end - 1);
+    final trail = base.codeUnitAt(end);
+    // Preserve the code-unit budget without creating an unpaired surrogate.
+    if (lead >= 0xd800 && lead <= 0xdbff && trail >= 0xdc00 && trail <= 0xdfff) end--;
+    base = base.substring(0, end).trim();
+  }
   return '$base.${galleryExtension(mime)}';
 }
 
@@ -179,6 +192,7 @@ Future<String> saveToGallery(MediaChannel channel, Uint8List raw, {String? name}
     throw GallerySaveException(switch (e.code) {
       'permission' => 'permission',
       'invalid' => 'unsupported',
+      'cancelled' => 'cancelled',
       _ => 'failed',
     });
   } on MissingPluginException {

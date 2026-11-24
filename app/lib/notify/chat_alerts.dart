@@ -21,6 +21,8 @@ import 'dart:convert';
 
 import 'package:dsh_client/dsh_client.dart';
 
+import '../companion/companion_signals.dart';
+import '../l10n/host_text.dart';
 import '../l10n/l10n.dart';
 import '../state/hosts_state.dart';
 import '../ui/chat/media/media_format.dart' show chatTitleShown;
@@ -74,6 +76,11 @@ class ChatAlert {
     this.petToken,
     this.choices,
     this.reply,
+    this.endSeq,
+    this.turn,
+    this.sourceSessionId,
+    this.signalProvenance,
+    this.signalFreshness = 'reconciled',
   });
 
   final HostRef host;
@@ -115,6 +122,12 @@ class ChatAlert {
   /// A finished turn's reply, masked, on one line: 问一句's answer.
   final String? reply;
 
+  /// Metadata projection keeps the actual source distinct from navigation.
+  final int? endSeq, turn;
+  final String? sourceSessionId;
+  final MuxEventProvenance? signalProvenance;
+  final String signalFreshness;
+
   @override
   String toString() => 'ChatAlert(${kind.name} $sessionId "$title" / "$text")';
 }
@@ -136,7 +149,9 @@ String _masked(String text) => maskSecrets(text, mark: '•').replaceAll(RegExp(
 
 /// How a turn ended, read back after the session went idle.
 class TurnOutcome {
-  const TurnOutcome({required this.seq, required this.reason, this.reply, this.title});
+  const TurnOutcome({required this.seq, required this.reason, this.reply, this.title, this.turn});
+
+  final int? turn;
 
   /// Seq of the `turn/end` event (dedup across reconnects).
   final int seq;
@@ -155,11 +170,13 @@ class TurnOutcome {
   };
 
   /// The alert line, in the chat's own words (`NoticeRow`).
-  String get text {
+  String get text => _textWithFlatReply(reason.kind == 'completed' ? _flatSnippet(reply) : null);
+
+  String _textWithFlatReply(String? flatReply) {
     switch (reason.kind) {
       case 'completed':
-        final s = snippet(reply);
-        return s == null ? appL10n.stateAlertTurnDone : appL10n.stateAlertCompletedReply(s);
+        final preview = _clipSnippet(flatReply, 120);
+        return preview == null ? appL10n.stateAlertTurnDone : appL10n.stateAlertCompletedReply(preview);
       case 'max-tokens':
         return appL10n.stateAlertOutputLimit;
       case 'aborted':
@@ -172,7 +189,7 @@ class TurnOutcome {
         // The chat's short line for the code; the model's own message stays out of notifications.
         final code = reason.error?.code;
         if (code == 'MISSING_CREDENTIAL') return appL10n.stateAlertMissingKey;
-        final text = turnFailureText(code);
+        final text = turnFailureText(code, message: reason.error?.message);
         return text == turnFailureText(null) ? appL10n.stateAlertTurnFailed : appL10n.stateAlertErrorDetail(text);
     }
   }
@@ -180,7 +197,9 @@ class TurnOutcome {
 
 /// First [max] characters of [text] on one line, markdown markers dropped,
 /// credentials masked (before cutting, so no tail of one shows).
-String? snippet(String? text, {int max = 120}) {
+String? snippet(String? text, {int max = 120}) => _clipSnippet(_flatSnippet(text), max);
+
+String? _flatSnippet(String? text) {
   if (text == null) return null;
   final flat = _masked(text)
       .replaceAll(RegExp(r'```[a-zA-Z0-9_-]*'), ' ')
@@ -188,10 +207,14 @@ String? snippet(String? text, {int max = 120}) {
       .replaceAll(RegExp(r'\*\*|__|`'), '')
       .replaceAll(RegExp(r'\s+'), ' ')
       .trim();
-  if (flat.isEmpty) return null;
-  final chars = flat.runes.toList();
+  return flat.isEmpty ? null : flat;
+}
+
+String? _clipSnippet(String? flat, int max) {
+  if (flat == null || flat.length <= max) return flat;
+  final chars = flat.runes.take(max + 1).toList();
   if (chars.length <= max) return flat;
-  return '${String.fromCharCodes(chars.take(max)).trimRight()}…';
+  return '${String.fromCharCodes(chars, 0, max).trimRight()}…';
 }
 
 /// The approval line, with the same verbs as the approval card.
@@ -204,12 +227,8 @@ String approvalText(ApprovalRequest request) {
     'web_search' => appL10n.stateWebSearch,
     final name => appL10n.stateAlertUseTool(name),
   };
-  final display = request.displayReason;
   final reason = snippet(
-    (AppLocale.isEnglish
-            ? display['en'] ?? display['zh-CN'] ?? display['zh-Hans'] ?? display['zh']
-            : display['zh-CN'] ?? display['zh-Hans'] ?? display['zh'] ?? display['en']) ??
-        request.reason,
+    localizedHostText(request.displayReason, locale: AppLocale.current.toLanguageTag(), fallback: request.reason),
     max: 90,
   );
   return reason == null ? appL10n.stateAlertApprovalAction(action) : appL10n.stateAlertApprovalReason(action, reason);
@@ -283,10 +302,12 @@ String? petApprovalText(ApprovalRequest request, ToolCallPart? call) {
   // just as much as the command/path. Never approve an abbreviated action.
   if (!const {'bash', 'pwsh', 'write', 'edit', 'str_replace_editor', 'web_fetch'}.contains(call.name)) return null;
   final text = '${call.name} ${jsonEncode(args)}';
-  if (text.contains(RegExp('[\\u061c\\u200b-\\u200f\\u202a-\\u202e\\u2066-\\u2069]')) || _masked(text) != text) {
+  if (text.runes.elementAtOrNull(petApprovalMax) != null ||
+      text.contains(RegExp('[\\u061c\\u200b-\\u200f\\u202a-\\u202e\\u2066-\\u2069]')) ||
+      _masked(text) != text) {
     return null;
   }
-  return text.runes.length <= petApprovalMax ? text : null;
+  return text;
 }
 
 /// A question the pet's bubble takes with one tap: exactly one, single choice,
@@ -346,7 +367,10 @@ class DshAlertSource implements AlertSource {
   final DshClient client;
 
   @override
-  Stream<HostEvent> get events => client.hostEvents;
+  Stream<HostEvent> get events =>
+      client.mux.hostEventReceipts.where((receipt) => receipt.provenance.current).map((receipt) => receipt.event);
+
+  MuxEventProvenance? provenance(HostEvent event) => client.mux.provenanceFor(event);
 
   @override
   List<HostEvent> get pendingRequests => client.mux.pendingRequests;
@@ -395,8 +419,9 @@ TurnOutcome? outcomeFromEvents(List<SessionLogEvent> events, {String? title}) {
     switch (event) {
       case TurnEndedEvent():
         end = event;
-      case AssistantMessageEvent(:final message) when message.text.trim().isNotEmpty:
-        reply = message.text;
+      case AssistantMessageEvent(:final message):
+        final text = message.text;
+        if (text.trim().isNotEmpty) reply = text;
       case TurnStartedEvent():
         end = null;
         reply = null;
@@ -405,16 +430,26 @@ TurnOutcome? outcomeFromEvents(List<SessionLogEvent> events, {String? title}) {
     }
   }
   if (end == null) return null;
-  return TurnOutcome(seq: end.seq, reason: end.reason, reply: reply, title: title);
+  return TurnOutcome(seq: end.seq, reason: end.reason, reply: reply, title: title, turn: end.turn);
 }
 
 /// Turns one host's `$events` into [ChatAlert]s: dedups redelivered requests
 /// and repeated turn ends, routes subagent requests to their conversation, and
 /// withdraws what was answered elsewhere.
 class _RequestScope {
+  _RequestScope(this.sourceSessionId, this.kind, this.provenance);
+  final String sourceSessionId;
+  final AlertKind kind;
+  final MuxEventProvenance? provenance;
   static int _next = 0;
   final int petToken = ++_next;
 }
+
+// Alert display and lineage do not need the raw row or its inbox projections.
+typedef _AlertSession = ({String? title, bool isSubagent, String? parentSessionId});
+
+_AlertSession _alertSession(SessionSummary session) =>
+    (title: session.title, isSubagent: session.isSubagent, parentSessionId: session.parentSessionId);
 
 class HostAlertTracker {
   HostAlertTracker({
@@ -426,6 +461,9 @@ class HostAlertTracker {
     this.skipApproval,
     this.onReannounce,
     this.onRequestEpochChanged,
+    this.onCompanionSignal,
+    this._companionConnection,
+    this.isCompanionAttached,
     this.announceDelay = const Duration(milliseconds: 800),
     this.reconcileDelay = const Duration(seconds: 3),
   });
@@ -446,6 +484,19 @@ class HostAlertTracker {
   /// native card identity, without duplicating ordinary chat alerts.
   final void Function(ChatAlert alert)? onReannounce;
   final void Function(HostRef host)? onRequestEpochChanged;
+  final void Function(CompanionAlertDelivery delivery)? onCompanionSignal;
+  Object? _companionConnection;
+  Object? get companionConnection => _companionConnection;
+  final bool Function()? isCompanionAttached;
+
+  /// The attachment owner may refresh display metadata for the same Host and
+  /// actual client. This does not replace [source] or any request/delivery
+  /// history. Existing receipts keep their old wrapper and retire immediately.
+  bool updateCompanionConnection({required Object previous, required Object next}) {
+    if (_disposed || !identical(_companionConnection, previous)) return false;
+    _companionConnection = next;
+    return true;
+  }
 
   /// Requests wait this long before alerting, so one that is answered at once
   /// (auto-approve on this or another device) never pops up.
@@ -459,8 +510,10 @@ class HostAlertTracker {
   Timer? _reconcile;
   bool _disposed = false;
 
-  final Map<String, SessionSummary> _sessions = {};
+  final Map<String, _AlertSession> _sessions = {};
   final Map<String, bool> _running = {};
+  final Map<String, MuxGeneration> _companionRunning = {};
+  MuxEventProvenance? _readyProvenance;
   final Map<String, int> _statusRevision = {};
   final Set<String> _pendingIdle = {};
   int _revision = 0;
@@ -494,8 +547,15 @@ class HostAlertTracker {
   bool petRequestMatches(String eventId, String sessionId, int token) =>
       requestScope(eventId) != null && _requests[eventId] == sessionId && _requestScopes[eventId]?.petToken == token;
 
-  Object? requestScope(String eventId) =>
-      _disposed || !source.connected || _stale.contains(eventId) ? null : _requestScopes[eventId];
+  Object? requestScope(String eventId) {
+    final scope = _requestScopes[eventId];
+    return _disposed ||
+            !source.connected ||
+            _stale.contains(eventId) ||
+            (scope?.provenance != null && !scope!.provenance!.current)
+        ? null
+        : scope;
+  }
 
   ({ApprovalRequest request, String text})? phoneApprovalFor(String eventId) =>
       requestScope(eventId) == null ? null : _phoneApprovals[eventId];
@@ -523,9 +583,14 @@ class HostAlertTracker {
 
   void _onEvent(HostEvent event) {
     if (_disposed) return;
+    final actual = source;
+    final provenance = actual is DshAlertSource ? actual.provenance(event) : null;
+    if (actual is DshAlertSource && (provenance == null || !provenance.current)) return;
     switch (event) {
       case HostReadyEvent():
         _generation++;
+        _companionRunning.clear();
+        _readyProvenance = provenance;
         _requestScopes.clear();
         _phoneApprovals.clear();
         _approvals.clear();
@@ -539,10 +604,31 @@ class HostAlertTracker {
         _reconcile = Timer(reconcileDelay, _dropStale);
         unawaited(_resync());
       case ApprovalRequestedEvent(:final request):
-        _onRequest(request.eventId, request.sessionId, AlertKind.approval, approvalText(request), approval: request);
+        _onRequest(
+          request.eventId,
+          request.sessionId,
+          AlertKind.approval,
+          approvalText(request),
+          approval: request,
+          provenance: provenance,
+        );
       case UserQuestionRequestedEvent(:final request):
-        _onRequest(request.eventId, request.sessionId, AlertKind.question, questionText(request), question: request);
+        _onRequest(
+          request.eventId,
+          request.sessionId,
+          AlertKind.question,
+          questionText(request),
+          question: request,
+          provenance: provenance,
+        );
       case HostRequestCancelledEvent(:final eventId):
+        final oldScope = _requestScopes[eventId];
+        final oldSession = _requests[eventId];
+        // An unknown raw cancel has no trustworthy request kind/source. Known
+        // scopes clear metadata before any legacy notification withdrawal.
+        if (oldScope != null && oldSession != null && provenance != null) {
+          _publishRequest(eventId, oldScope.sourceSessionId, oldSession, oldScope.kind, provenance, cleared: true);
+        }
         _approvals.remove(eventId);
         _requestScopes.remove(eventId);
         _phoneApprovals.remove(eventId);
@@ -553,18 +639,22 @@ class HostAlertTracker {
         if (session != null) onWithdraw(host, session, eventId);
       case SessionStatusEvent(:final sessionId, :final running):
         final was = _running[sessionId];
+        final wasLive = provenance != null && identical(_companionRunning[sessionId], provenance.generation);
+        if (running && provenance != null) _companionRunning[sessionId] = provenance.generation;
+        if (!running) _companionRunning.remove(sessionId);
         _running[sessionId] = running;
         if (running || was != false) _statusRevision[sessionId] = ++_revision;
         if (running) _pendingIdle.remove(sessionId);
         if (!running && was != false) {
           _pendingIdle.add(sessionId);
-          unawaited(_onIdle(sessionId));
+          unawaited(_onIdle(sessionId, provenance: provenance, freshness: wasLive ? 'live' : 'reconciled'));
         }
       case SessionAddedEvent(:final summary):
-        _sessions[summary.sessionId] = summary;
+        _sessions[summary.sessionId] = _alertSession(summary);
       case SessionRemovedEvent(:final sessionId):
         _sessions.remove(sessionId);
         _running.remove(sessionId);
+        _companionRunning.remove(sessionId);
         _statusRevision[sessionId] = ++_revision;
         _pendingIdle.remove(sessionId);
         _requests.removeWhere((_, s) => s == sessionId);
@@ -601,12 +691,17 @@ class HostAlertTracker {
     String text, {
     ApprovalRequest? approval,
     UserQuestionRequest? question,
+    MuxEventProvenance? provenance,
   }) {
     _stale = _stale.difference({eventId});
     if (_requestScopes.containsKey(eventId)) return;
     final reannounce = _requests.containsKey(eventId);
-    final scope = _requestScopes[eventId] = _RequestScope();
-    bool current() => !_disposed && identical(_requestScopes[eventId], scope);
+    final scope = _requestScopes[eventId] = _RequestScope(agentId, kind, provenance);
+    bool current() =>
+        !_disposed &&
+        source.connected &&
+        identical(_requestScopes[eventId], scope) &&
+        (provenance == null || provenance.current);
     _requests[eventId] = agentId;
     unawaited(() async {
       if (announceDelay > Duration.zero) await Future<void>.delayed(announceDelay);
@@ -653,13 +748,18 @@ class HostAlertTracker {
         petText: petText,
         petToken: scope.petToken,
         choices: choices,
+        sourceSessionId: agentId,
+        signalProvenance: provenance,
+        signalFreshness: 'live',
       );
       _requestAlerts[eventId] = alert;
+      if (provenance != null) _publishRequest(eventId, agentId, root, kind, provenance, stillPending: current);
+      if (!current()) return;
       (reannounce ? onReannounce : onAlert)?.call(alert);
     }());
   }
 
-  Future<void> _onIdle(String sessionId) async {
+  Future<void> _onIdle(String sessionId, {MuxEventProvenance? provenance, String freshness = 'reconciled'}) async {
     final revision = _statusRevision[sessionId];
     final generation = _generation;
     bool current() =>
@@ -667,7 +767,8 @@ class HostAlertTracker {
         source.connected &&
         _generation == generation &&
         _running[sessionId] == false &&
-        _statusRevision[sessionId] == revision;
+        _statusRevision[sessionId] == revision &&
+        (provenance == null || provenance.current);
     final info = await _info(sessionId);
     if (!current()) return;
     if (info?.isSubagent ?? false) {
@@ -675,10 +776,24 @@ class HostAlertTracker {
       return;
     }
     TurnOutcome? outcome;
-    try {
-      outcome = await source.lastTurn(sessionId);
-    } catch (_) {
-      // Host gone mid-read: nothing reliable to say.
+    for (var attempt = 0; attempt < 2; attempt++) {
+      if (!current()) return;
+      try {
+        outcome = await source.lastTurn(sessionId).timeout(const Duration(seconds: 3));
+        break;
+      } catch (error) {
+        // Match the client's transient read failures, not permission/not-found
+        // refusals. Unresolved reads stay pending for the next ready snapshot.
+        final retryable =
+            error is TimeoutException ||
+            error is DshTransportException ||
+            error is DshCarrierLostException ||
+            error is DshProtocolException ||
+            error is DshHttpException && (error.statusCode >= 500 || error.statusCode == 408 || error.statusCode == 429) ||
+            error is DshRemoteException && (error.code == 'gateway/internal' || error.details['retryable'] == true);
+        if (!current() || !retryable || attempt == 1) return;
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      }
     }
     // History and reconnect snapshots are asynchronous. A newer running edge
     // (even followed by another idle edge) invalidates this turn-end read.
@@ -687,18 +802,25 @@ class HostAlertTracker {
     if (outcome == null) return;
     if (!_turnsSeen.add('$sessionId@${outcome.seq}')) return;
     final title = alertTitle(outcome.title ?? info?.title);
-    onAlert(
-      ChatAlert(
-        host: host,
-        sessionId: sessionId,
-        kind: outcome.kind,
-        key: turnKey,
-        title: title,
-        text: outcome.text,
-        turnEndKind: outcome.reason.kind,
-        reply: outcome.kind == AlertKind.done ? snippet(outcome.reply, max: 200) : null,
-      ),
+    final reply = outcome.kind == AlertKind.done ? _flatSnippet(outcome.reply) : null;
+    final alert = ChatAlert(
+      host: host,
+      sessionId: sessionId,
+      kind: outcome.kind,
+      key: turnKey,
+      title: title,
+      text: outcome._textWithFlatReply(reply),
+      turnEndKind: outcome.reason.kind,
+      reply: _clipSnippet(reply, 200),
+      endSeq: outcome.seq,
+      turn: outcome.turn,
+      sourceSessionId: sessionId,
+      signalProvenance: provenance,
+      signalFreshness: freshness,
     );
+    if (provenance != null) _publishTerminal(alert, provenance);
+    if (!current()) return;
+    onAlert(alert);
   }
 
   /// Refreshes the session list; turns that ended while we were disconnected
@@ -706,6 +828,7 @@ class HostAlertTracker {
   Future<void> _resync({bool seedOnly = false}) async {
     final revision = _revision;
     final generation = _generation;
+    final provenance = _readyProvenance;
     final List<SessionSummary> list;
     try {
       list = await source.listSessions();
@@ -717,7 +840,7 @@ class HostAlertTracker {
     for (final s in list) {
       // Live events received while listing are newer than this snapshot.
       if ((_statusRevision[s.sessionId] ?? 0) > revision) continue;
-      _sessions[s.sessionId] = s;
+      _sessions[s.sessionId] = _alertSession(s);
       if (!seedOnly && !s.running && (_running[s.sessionId] == true || _pendingIdle.contains(s.sessionId))) {
         missed.add(s.sessionId);
       }
@@ -727,18 +850,18 @@ class HostAlertTracker {
     }
     for (final id in missed) {
       _pendingIdle.add(id);
-      unawaited(_onIdle(id));
+      unawaited(_onIdle(id, provenance: provenance, freshness: 'reconciled'));
     }
   }
 
   /// The summary of [sessionId], listing the sessions once when unknown.
-  Future<SessionSummary?> _info(String sessionId) async {
+  Future<_AlertSession?> _info(String sessionId) async {
     final known = _sessions[sessionId];
     if (known != null) return known;
     _listing ??= () async {
       try {
         for (final s in await source.listSessions()) {
-          _sessions[s.sessionId] = s;
+          _sessions[s.sessionId] = _alertSession(s);
           _running.putIfAbsent(s.sessionId, () => s.running);
         }
       } catch (_) {
@@ -748,6 +871,83 @@ class HostAlertTracker {
     await _listing;
     _listing = null;
     return _sessions[sessionId];
+  }
+
+  void _publishTerminal(ChatAlert alert, MuxEventProvenance provenance) {
+    final session = alert.sourceSessionId, seq = alert.endSeq, reason = alert.turnEndKind;
+    if (session == null || seq == null || reason == null) return;
+    _publishMetadata({
+      'v': 1,
+      'id': '$session:$seq',
+      'kind': 'task.terminal',
+      'source': {
+        'type': 'dsh',
+        'hostKey': companionHostKey(host),
+        'sessionId': session,
+        'seq': seq,
+        'turn': alert.turn,
+      },
+      'observedAt': provenance.observedAt.toIso8601String(),
+      'freshness': alert.signalFreshness,
+      'payload': {'phase': terminalPhase(reason), 'endKind': reason, 'endSeq': seq, 'turn': alert.turn},
+    }, provenance);
+  }
+
+  void _publishRequest(
+    String requestId,
+    String sourceSession,
+    String openSession,
+    AlertKind kind,
+    MuxEventProvenance provenance, {
+    bool cleared = false,
+    bool Function()? stillPending,
+  }) {
+    _publishMetadata(
+      {
+        'v': 1,
+        'id': '${cleared ? 'clear' : 'waiting'}:$requestId',
+        'kind': cleared ? 'task.approval_cleared' : 'task.approval_waiting',
+        'source': {
+          'type': 'dsh',
+          'hostKey': companionHostKey(host),
+          'sessionId': sourceSession,
+          'requestId': requestId,
+        },
+        'observedAt': provenance.observedAt.toIso8601String(),
+        'freshness': 'live',
+        'payload': {
+          'requestId': requestId,
+          'openSessionId': openSession,
+          'requestKind': kind == AlertKind.approval ? 'approval' : 'question',
+        },
+      },
+      provenance,
+      stillPending: stillPending,
+    );
+  }
+
+  void _publishMetadata(Map<String, Object?> json, MuxEventProvenance provenance, {bool Function()? stillPending}) {
+    final actual = source, connection = companionConnection, attached = isCompanionAttached;
+    if (_disposed ||
+        actual is! DshAlertSource ||
+        connection == null ||
+        attached == null ||
+        !provenance.current ||
+        !identical(actual.client.mux, provenance.mux)) {
+      return;
+    }
+    CompanionSignalV1 signal;
+    try {
+      signal = CompanionSignalV1.fromJson(json);
+    } on FormatException {
+      return;
+    }
+    final delivery = CompanionAlertDelivery._(signal, provenance, actual.client, connection, () {
+      if (_disposed || !identical(companionConnection, connection)) return false;
+      final current = attached();
+      return current && !_disposed && identical(companionConnection, connection);
+    }, stillPending);
+    if (delivery.current) onCompanionSignal?.call(delivery);
   }
 
   /// The top-level conversation a (sub)agent belongs to.
@@ -760,5 +960,41 @@ class HostAlertTracker {
       id = parent;
     }
     return id;
+  }
+}
+
+/// Stable local Host identity, with no address, token, display name or path.
+String companionHostKey(HostRef host) => '${host.kind.name}:${host.id}';
+
+/// A metadata-only projection sealed by the actual tracker. Capture the gate
+/// ingress when installing a listener; do not mint an ingress in an old callback.
+final class CompanionAlertDelivery {
+  CompanionAlertDelivery._(this.signal, this.provenance, this.client, this.connection, this._attached, this._pending);
+  final CompanionSignalV1 signal;
+  final MuxEventProvenance provenance;
+  final DshClient client;
+  final Object connection;
+  final bool Function() _attached;
+  final bool Function()? _pending;
+  bool get current {
+    if (!provenance.current || !identical(client.mux, provenance.mux)) return false;
+    bool attached;
+    try {
+      attached = _attached();
+    } catch (_) {
+      attached = false;
+    }
+    return attached && provenance.current && identical(client.mux, provenance.mux);
+  }
+
+  CompanionSignalAdmission receive(CompanionSignalGate gate, CompanionSignalIngress ingress) {
+    if (!identical(ingress.source.client, client) ||
+        !identical(ingress.source.connection, connection) ||
+        !identical(ingress.source.generation, provenance.generation) ||
+        !current ||
+        !gate.ingressCurrent(ingress)) {
+      return CompanionSignalAdmission.stale;
+    }
+    return gate.receive(ingress, signal, provenance: provenance, stillPending: _pending, receiptCurrent: () => current);
   }
 }

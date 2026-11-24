@@ -7,17 +7,20 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../l10n/l10n.dart';
 import '../../state/draft_store.dart';
+import '../../state/web_quote.dart';
 import '../common/app_sheet.dart';
 import '../common/list_page_row.dart';
 import '../common/smooth_size.dart';
 import '../theme/app_icons.dart';
 import '../theme/theme.dart';
+import 'widgets/web_quote_card.dart';
 
 /// The old draft picked and read in full.
-typedef LegacyDraftPick = ({String key, String text});
+typedef LegacyDraftPick = ({String key, String text, List<DraftWebQuote> webQuotes});
 
 /// There is an old draft with words in it to restore.
-bool hasLegacyDrafts(DraftState state) => state.legacyDrafts.values.any((d) => d.text.trim().isNotEmpty);
+bool hasLegacyDrafts(DraftState state) =>
+    state.legacyDrafts.values.any((d) => d.text.trim().isNotEmpty || d.webQuotes.isNotEmpty);
 
 /// [chat] and [host] name where it goes, fixed when the sheet opens.
 Future<LegacyDraftPick?> showLegacyDraftsSheet(BuildContext context, {required String chat, required String host}) =>
@@ -46,10 +49,18 @@ class _LegacyDraftsSheetState extends ConsumerState<LegacyDraftsSheet> {
     final theme = Theme.of(context);
     final colors = DshColors.of(context);
     final legacy = ref.watch(draftStoreProvider.select((s) => s.legacyDrafts));
-    final entries = legacy.entries.where((e) => e.value.text.trim().isNotEmpty).toList()
+    final entries = legacy.entries.where((e) => e.value.text.trim().isNotEmpty || e.value.webQuotes.isNotEmpty).toList()
       ..sort((a, b) => b.value.updatedAt.compareTo(a.value.updatedAt));
     final open = _open == null ? null : legacy[_open];
     String name(String key) => key == 'new' ? l10n.chatLegacyDraftNew : l10n.chatLegacyDraftChat;
+    String subtitle(ChatDraft draft) {
+      final text = draft.text.replaceAll(RegExp(r'\s+'), ' ').trim();
+      if (text.isNotEmpty) return text;
+      return draft.webQuotes
+          .map((quote) => quote.title.trim().isEmpty ? quote.url.host : quote.title.trim())
+          .join(' · ');
+    }
+
     final small = theme.textTheme.bodySmall?.copyWith(color: colors.textTertiary);
 
     final Widget body;
@@ -69,7 +80,7 @@ class _LegacyDraftsSheetState extends ConsumerState<LegacyDraftsSheet> {
                   key: ValueKey('legacy-draft-${e.key}'),
                   icon: AppIcons.document,
                   title: name(e.key),
-                  subtitle: e.value.text.replaceAll(RegExp(r'\s+'), ' ').trim(),
+                  subtitle: subtitle(e.value),
                   onTap: () => setState(() => _open = e.key),
                 ),
             ],
@@ -95,10 +106,24 @@ class _LegacyDraftsSheetState extends ConsumerState<LegacyDraftsSheet> {
                 ),
                 child: SingleChildScrollView(
                   padding: const EdgeInsetsDirectional.only(start: 12),
-                  child: Text(
-                    key: const ValueKey('legacy-draft-text'),
-                    open.text,
-                    style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (open.text.isNotEmpty)
+                        Text(
+                          key: const ValueKey('legacy-draft-text'),
+                          open.text,
+                          style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                        ),
+                      if (open.webQuotes.isNotEmpty) ...[
+                        if (open.text.isNotEmpty) const SizedBox(height: 12),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [for (final quote in open.webQuotes) WebQuoteCard(quote: quote)],
+                        ),
+                      ],
+                    ],
                   ),
                 ),
               ),
@@ -163,13 +188,13 @@ class _LegacyDraftsSheetState extends ConsumerState<LegacyDraftsSheet> {
                 ),
               ),
             ),
-            if (open != null)
+            if (open != null && (open.text.trim().isNotEmpty || open.webQuotes.isNotEmpty))
               Padding(
                 padding: const EdgeInsets.fromLTRB(kSheetGutter, 12, kSheetGutter, 0),
                 child: FilledButton(
                   key: const ValueKey('legacy-draft-append'),
                   style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(48)),
-                  onPressed: () => Navigator.of(context).pop((key: _open!, text: open.text)),
+                  onPressed: () => Navigator.of(context).pop((key: _open!, text: open.text, webQuotes: open.webQuotes)),
                   child: Text(l10n.chatLegacyDraftAppend),
                 ),
               ),

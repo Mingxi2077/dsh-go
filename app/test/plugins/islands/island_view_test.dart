@@ -12,6 +12,7 @@ import 'package:dsh_app/plugins/seams/seat_models.dart';
 import 'package:dsh_app/state/hosts_state.dart';
 import 'package:dsh_app/ui/plugins/islands/islands.dart';
 import 'package:dsh_app/ui/theme/theme.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -21,8 +22,8 @@ import 'support/fakes.dart';
 
 final _url = Uri.parse('http://127.0.0.1:3080/?token=t');
 
-IslandSpec _spec(String slot, {String? cell, IslandForm form = IslandForm.page, String? session}) =>
-    IslandSpec(host: HostRef.local, form: form, slot: slot, cell: cell, sessionId: session);
+IslandSpec _spec(String slot, {String? cell, IslandForm form = IslandForm.page, String? session, String? package}) =>
+    IslandSpec(host: HostRef.local, form: form, slot: slot, cell: cell, sessionId: session, package: package);
 
 final _models = _spec('settings.section', cell: 'models');
 final _schedules = _spec('main', cell: 'schedules');
@@ -78,6 +79,19 @@ void main() {
     WebViewPlatform.instance = _web;
     _platform = FakeIslandPlatform();
     _host = IslandHost(platform: _platform, assets: TestIslandAssets());
+  });
+
+  // A platform view that isn't drawn has no window and no size on iOS.
+  _testIsland('on iOS a WebView not ready yet is still drawn, then shown', (tester) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    await tester.pumpWidget(_app(IslandView(spec: _models, fallback: _fallback)));
+    await _settle(tester);
+    final hidden = _webOpacity(tester);
+    await _ready(tester);
+    final shown = _webOpacity(tester);
+    debugDefaultTargetPlatformOverride = null;
+    expect(hidden, allOf(greaterThan(0), lessThan(0.02)));
+    expect(shown, 1);
   });
 
   _testIsland('page: hidden behind a skeleton until ready, then shown', (tester) async {
@@ -377,6 +391,20 @@ void main() {
     await _settle(tester);
     expect(_web.controllers, hasLength(3));
     expect(_host.live.map((h) => h.spec), [_models]);
+  });
+
+  _testIsland('overlay is destroyed on removal without the page warm grace', (tester) async {
+    final spec = _spec('shell.overlay', form: IslandForm.overlay, package: 'pet-plugin', cell: 'pet');
+    await tester.pumpWidget(_app(IslandView(spec: spec, fallback: _fallback)));
+    await _settle(tester);
+    await _ready(tester);
+    final handle = _host.live.single;
+    expect(_page.scripts[2], contains('"package":"pet-plugin"'));
+    expect(_page.scripts[2], contains('"cell":"pet"'));
+    await tester.pumpWidget(_app(const SizedBox()));
+    await tester.pump(const Duration(milliseconds: 10));
+    expect(_host.live, isEmpty);
+    expect(handle.phase, IslandPhase.closed);
   });
 
   _testIsland('warm for 30 s after leaving, then destroyed', (tester) async {

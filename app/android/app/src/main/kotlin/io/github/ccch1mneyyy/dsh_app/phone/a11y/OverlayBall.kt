@@ -8,6 +8,7 @@ import android.graphics.Canvas
 import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.RectF
 import android.os.Build
 import android.os.Bundle
@@ -33,13 +34,18 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * The folded control: a 48 dp ball on the side of the screen (its own TYPE_ACCESSIBILITY_OVERLAY
- * window, 10 dp of room round it for the shadow), the capsule's surface and mark as a circle. It
- * shows the task's state only and opens the capsule on a tap. Held still for a second it stops the
- * task ([HoldToStop]: a ring fills round it first, letting go cancels); screen readers get the
- * same stop as an action. Dragged, it follows the finger and settles on the nearer side, where it
- * stays (side and height kept across tasks, like the pet's dock: pet/EdgeSnap.kt). Left alone it
- * fades, all of it alike, to the 闲置时不透明度.
+ * The folded control: a 48 dp ball (its own TYPE_ACCESSIBILITY_OVERLAY window, 10 dp of room round
+ * it for the shadow), the capsule's surface and mark as a circle. It shows the task's state only
+ * and opens the capsule on a tap. Held still for a second it stops the task ([HoldToStop]: a ring
+ * fills round it first, letting go cancels); screen readers get the same stop as an action. Under
+ * an island at the top it first rests at the top centre, where the island was ([atTop]); else on
+ * the right, level with the capsule. Dragged, it follows the finger and settles on the nearer side
+ * — or back at the top centre, let go near it — where it stays (kept across tasks, like the pet's
+ * dock: pet/EdgeSnap.kt). A confirm card lifts a ball resting on a side above it. Left alone it
+ * fades, all of it alike, to the 闲置时不透明度, and one on a side slides half out of sight over it
+ * ([tucked]); a touch brings it back. The whole window (the ball and the room round it) takes the
+ * touch, so the half that shows is easy to hit, and it is kept out of the system's edge-back
+ * gesture.
  *
  * The window is added once per control and shown or hidden (GONE windows take no touches); the
  * overlay folds and unfolds the capsule around it ([ControlOverlay]).
@@ -52,17 +58,39 @@ internal class OverlayBall(
     private val onTap: () -> Unit,
     /** Held for a second, or the screen reader's stop action. */
     private val onStop: () -> Unit,
-    /** A finger came down on the ball (tap, hold or drag): it is not idle. */
-    private val onTouchDown: () -> Unit = {},
+    /** A finger came down on the ball or left it (tap, hold or drag): it is not idle, and counts again from the release. */
+    private val onTouched: () -> Unit = {},
+    /** The capsule's centre y: where a ball the person never moved rests, level with it. */
+    private val capsuleCentre: () -> Int,
+    /** A confirm card's top while one shows: a resting ball stays above it. */
+    private val bottomLimit: () -> Int?,
+    /** The capsule is an island at the top (its card opens down): a ball never moved rests at the top centre. */
+    private val islandAtTop: () -> Boolean = { false },
+    /** The centre y of a ball at the top centre: where an island at the top has its centre. */
+    private val topCentreY: () -> Int = capsuleCentre,
 ) {
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    /** Where the ball rests; saved when the person drops it somewhere. */
-    var dock: Dock = Dock(
+    /** Dropped at the top centre last (kept across tasks). */
+    private var savedTop = prefs.getString(K_SIDE, null) == TOP
+
+    /** Where the person dropped the ball on a side last (kept across tasks); null until they do. */
+    private var saved: Dock? = if (!savedTop && prefs.contains(K_Y)) Dock(
         if (prefs.getString(K_SIDE, null) == "left") Side.LEFT else Side.RIGHT,
-        prefs.getFloat(K_Y, DEFAULT_Y),
-    )
-        private set
+        prefs.getFloat(K_Y, 0f),
+    ) else null
+
+    /** The ball rests at the top centre: dropped there, or never moved and under an island at the top. */
+    val atTop: Boolean get() = savedTop || (saved == null && islandAtTop())
+
+    /** Where the ball rests on a side: where it was dropped, else on the right, level with the capsule. */
+    val dock: Dock get() = saved ?: BallGeometry.dockLevel(area(), size, margin, capsuleCentre())
+
+    /** The end of the capsule a fold goes to and an unfold comes from: the ball's side, or its middle (null) at the top centre. */
+    val foldSide: Side? get() = if (atTop) null else dock.side
+
+    /** Idle: half of it slid out over its side ([dockPos] says so). The owner sets it and glides the ball there. */
+    var tucked = false
 
     /** Room round the ball for its shadow, on every side (the window is square and centred on it). */
     val pad = context.dp(PAD_DP)
@@ -87,7 +115,9 @@ internal class OverlayBall(
         size,
         WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+            // Tucked, half the window is past the screen's side.
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
         PixelFormat.TRANSLUCENT,
     ).apply {
         gravity = Gravity.TOP or Gravity.START
@@ -105,9 +135,19 @@ internal class OverlayBall(
     private var tracker: VelocityTracker? = null
     private val hold = HoldToStop()
 
+    /** A finger is on the ball: the owner leaves its position alone (no tucking under a drag). */
+    var touching = false
+        private set
+
     init {
         ball.setOnClickListener { onTap() }
-        ball.setOnTouchListener { v, e -> onTouch(v, e) }
+        ball.setOnTouchListener { _, e -> onTouch(e) }
+        // The room round the ball takes touches anyway (it is the window's): it counts as the ball.
+        root.setOnTouchListener { _, e -> onTouch(e) }
+        if (Build.VERSION.SDK_INT >= 29) {
+            // At the screen's side a drag inward would otherwise be the system's back gesture.
+            root.addOnLayoutChangeListener { v, l, t, r, b, _, _, _, _ -> v.systemGestureExclusionRects = listOf(Rect(0, 0, r - l, b - t)) }
+        }
     }
 
     val attached: Boolean get() = root.isAttachedToWindow
@@ -141,7 +181,8 @@ internal class OverlayBall(
     }
 
     /** What the mark says, the screen reader's line, and whether a lifted limit badges it. */
-    fun setLook(look: MarkLook, description: CharSequence, badge: Boolean, stopLabel: CharSequence?) {
+    fun setLook(look: MarkLook, description: CharSequence, badge: Boolean, stopLabel: CharSequence?, icon: android.graphics.drawable.Drawable? = null) {
+        ball.icon = icon
         ball.look = look
         ball.badge = badge
         ball.contentDescription = description
@@ -149,17 +190,22 @@ internal class OverlayBall(
     }
 
     /** The whole ball's opacity: the 闲置时不透明度 when idle, full otherwise. */
-    fun setIdle(alpha: Float, animated: Boolean, durationMs: Long) {
-        root.animate().cancel()
-        if (!animated || !OverlayMotion.on()) {
-            root.alpha = alpha
-            return
-        }
-        root.animate().alpha(alpha).setDuration(durationMs).setInterpolator(OverlayMotion.emphasized).start()
+    fun setIdle(alpha: Float, animated: Boolean, durationMs: Long) = OverlayMotion.fadeIdle(root, alpha, animated, durationMs)
+
+    /**
+     * Where the ball rests now: at the top centre ([atTop]; never tucked), or [dock] on the current
+     * screen, above a confirm card if one shows, half out of sight when [tucked].
+     */
+    fun dockPos(): WindowPos {
+        val a = area()
+        if (atTop) return BallGeometry.topCentre(a, size, topCentreY())
+        val d = dock
+        val pos = BallGeometry.above(EdgeSnap.position(d, size, size, a, margin), size, bottomLimit(), EdgeSnap.minY(a, margin))
+        return if (tucked) BallGeometry.tucked(pos, d.side, a, pad, diameter) else pos
     }
 
-    /** Where the ball rests now ([dock] on the current screen). */
-    fun dockPos(): WindowPos = EdgeSnap.position(dock, size, size, area(), margin)
+    /** A capsule dragged off [side] folds into the ball there, level with it (centre [centreY]): that is its dock from now on. */
+    fun dropAt(side: Side, centreY: Int) = keep(BallGeometry.dockLevel(area(), size, margin, centreY, side))
 
     val pos: WindowPos get() = WindowPos(params.x, params.y)
 
@@ -232,11 +278,13 @@ internal class OverlayBall(
 
     // ---- touch ----------------------------------------------------------------------------------
 
-    private fun onTouch(v: View, e: MotionEvent): Boolean {
+    private fun onTouch(e: MotionEvent): Boolean {
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 cancelGlide()
-                onTouchDown()
+                // A tucked ball glides back out from here; a drag takes over from wherever it has got to.
+                touching = true
+                onTouched()
                 downX = e.rawX
                 downY = e.rawY
                 startX = params.x
@@ -253,6 +301,13 @@ internal class OverlayBall(
                 val dy = e.rawY - downY
                 if (!dragging && hold.state != HoldToStop.State.FIRED && (abs(dx) > slop || abs(dy) > slop)) {
                     dragging = true
+                    cancelGlide()
+                    // The ball follows the finger from where it was touched. Only a ball that glided
+                    // since then (untucking) is taken over where it has got to, so it doesn't jump back.
+                    if (params.x != startX || params.y != startY) {
+                        startX = params.x - dx.roundToInt()
+                        startY = params.y - dy.roundToInt()
+                    }
                     hold.moved()
                     endHold()
                     press(false)
@@ -269,9 +324,13 @@ internal class OverlayBall(
                 press(false)
                 val release = hold.up(SystemClock.uptimeMillis())
                 endHold()
+                // The drop is kept before the owner hears the touch ended: it may untuck the ball
+                // at once (no animations), and that must go to the new dock, not the old one.
+                if (release == HoldToStop.Release.DRAG) settle(velocityX())
+                touching = false
+                onTouched()
                 when (release) {
-                    HoldToStop.Release.TAP -> v.performClick()
-                    HoldToStop.Release.DRAG -> settle(velocityX())
+                    HoldToStop.Release.TAP -> ball.performClick()
                     HoldToStop.Release.STOP -> fire()
                     else -> Unit
                 }
@@ -282,6 +341,8 @@ internal class OverlayBall(
                 hold.cancel()
                 endHold()
                 if (dragging) settle(0f)
+                touching = false
+                onTouched()
                 endDrag()
             }
         }
@@ -345,9 +406,21 @@ internal class OverlayBall(
 
     private fun settle(velocityX: Float) {
         val a = area()
-        dock = EdgeSnap.dockFor(params.x, params.y, size, size, a, margin, velocityX)
-        prefs.edit().putString(K_SIDE, if (dock.side == Side.LEFT) "left" else "right").putFloat(K_Y, dock.yFraction).apply()
-        glideTo(EdgeSnap.position(dock, size, size, a, margin), OverlayMotion.on())
+        if (BallGeometry.nearTopCentre(params.x + size / 2, params.y + size / 2, a, diameter)) keepTop()
+        else keep(EdgeSnap.dockFor(params.x, params.y, size, size, a, margin, velocityX))
+        glideTo(dockPos(), OverlayMotion.on())
+    }
+
+    private fun keep(d: Dock) {
+        saved = d
+        savedTop = false
+        prefs.edit().putString(K_SIDE, if (d.side == Side.LEFT) "left" else "right").putFloat(K_Y, d.yFraction).apply()
+    }
+
+    private fun keepTop() {
+        saved = null
+        savedTop = true
+        prefs.edit().putString(K_SIDE, TOP).remove(K_Y).apply()
     }
 
     private fun press(down: Boolean) {
@@ -367,6 +440,11 @@ internal class OverlayBall(
     private inner class BallView(context: Context) : View(context) {
         private val painter = MarkPainter(context)
         private val surface = SurfacePainter(context)
+        private val iconPainter = IconPainter()
+
+        /** The app DSH works in, the state as a badge on it (the capsule's mark column, as a ball). */
+        var icon: android.graphics.drawable.Drawable? = null
+            set(value) { if (field !== value) { field = value; invalidate() } }
         private val circle = RectF()
         private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
         private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -455,12 +533,26 @@ internal class OverlayBall(
             surface.draw(canvas, circle, width / 2f, palette)
             val cx = width / 2f
             val cy = height / 2f
-            painter.draw(canvas, cx, cy, look, palette, phase, markAlpha)
+            val app = icon
+            if (app != null) {
+                val s = context.dpf(MarkView.ICON_DP)
+                iconPainter.draw(canvas, app, cx, cy, s, markAlpha)
+                painter.drawBadge(canvas, cx + s / 2 - context.dpf(2f), cy + s / 2 - context.dpf(2f), look, palette, phase, markAlpha)
+                if (look == MarkLook.RUNNING && markAlpha > 0f) {
+                    // A thin breathing ring round the icon: still at work.
+                    ringPaint.color = palette.accent
+                    ringPaint.alpha = (255 * markAlpha * (0.25f + 0.5f * phase)).roundToInt()
+                    ringPaint.strokeWidth = context.dpf(1.5f)
+                    val rr = width / 2f - context.dpf(3f)
+                    canvas.drawCircle(cx, cy, rr, ringPaint)
+                }
+            } else painter.draw(canvas, cx, cy, look, palette, phase, markAlpha)
             if (hold > 0f) {
                 // Over the mark's ring, from twelve o'clock, in the stop colour.
                 ringPaint.color = palette.danger
+                ringPaint.alpha = 255
                 ringPaint.strokeWidth = context.dpf(2.5f)
-                val r = context.dpf(10f)
+                val r = if (icon != null) width / 2f - context.dpf(3f) else context.dpf(10f)
                 canvas.drawArc(cx - r, cy - r, cx + r, cy + r, -90f, 360f * hold, false, ringPaint)
             }
             if (badge && markAlpha > 0f) {
@@ -483,9 +575,8 @@ internal class OverlayBall(
         private const val PREFS = OverlayPrefs.FILE
         private const val K_SIDE = "ballSide"
         private const val K_Y = "ballY"
+        private const val TOP = "top"
 
-        /** First fold: the right side, a third of the way down — clear of most apps' top bars. */
-        const val DEFAULT_Y = 0.3f
         const val BALL_DP = CapsuleMetrics.HEIGHT_DP
         const val PAD_DP = 10
         const val EDGE_DP = CapsuleMetrics.EDGE_DP

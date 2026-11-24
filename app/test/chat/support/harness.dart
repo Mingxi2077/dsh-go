@@ -1,9 +1,8 @@
-import 'package:dsh_app/state/web_quote.dart';
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dsh_app/speech/voice_cloud.dart';
 import 'package:dsh_app/runtime/runtime_bridge.dart';
 import 'package:dsh_app/runtime/runtime_state.dart';
 import 'package:dsh_app/state/attachments.dart';
@@ -11,11 +10,13 @@ import 'package:dsh_app/state/balance_state.dart';
 import 'package:dsh_app/state/chat_state.dart';
 import 'package:dsh_app/state/commands_state.dart';
 import 'package:dsh_app/state/connection_state.dart';
-import 'package:dsh_app/state/draft_store.dart' show draftStorageKey;
+import 'package:dsh_app/state/draft_store.dart';
+import 'package:dsh_app/state/features_state.dart' show agentPresetsProvider, permissionStateProvider;
 import 'package:dsh_app/state/models_state.dart';
 import 'package:dsh_app/state/sessions_state.dart';
 import 'package:dsh_app/state/settings_state.dart';
 import 'package:dsh_app/state/usage_state.dart';
+import 'package:dsh_app/state/web_quote.dart';
 import 'package:dsh_app/ui/common/side_insets.dart';
 import 'package:dsh_app/ui/theme/theme.dart';
 import 'package:dsh_client/dsh_client.dart';
@@ -29,6 +30,9 @@ import 'package:flutter_test/flutter_test.dart';
 import '../../support/test_fonts.dart';
 
 export '../../support/test_fonts.dart' show cjkFamily, loadTestFonts;
+
+String localDraft(String sessionId, {String hostKey = 'local:local'}) =>
+    draftStorageKey(hostKey: hostKey, sessionId: sessionId == 'new' ? null : sessionId);
 
 ThemeData testTheme(Brightness brightness) {
   final base = brightness == Brightness.dark ? buildDarkTheme() : buildLightTheme();
@@ -115,8 +119,8 @@ class FakeChatController extends ChatController {
   final ChatState initial;
   final sent = <String>[];
   final sentAttachments = <List<DraftAttachment>>[];
-  final sentModes = <SendMode>[];
   final sentWebCompositions = <WebQuoteComposition?>[];
+  final sentModes = <SendMode>[];
   final steered = <String>[];
   final withdrawn = <String>[];
   final sentNow = <String>[];
@@ -143,12 +147,30 @@ class FakeChatController extends ChatController {
     List<DraftAttachment> attachments = const [],
     SendMode mode = SendMode.now,
     WebQuoteComposition? webComposition,
+    bool verbatim = false,
+    String? originalRequestId,
+    Future<bool> Function(String requestId)? beforeDeliver,
+    bool Function()? deliveryAllowed,
   }) async {
     sent.add(text);
     sentAttachments.add(attachments);
-    sentModes.add(mode);
     sentWebCompositions.add(webComposition);
+    sentModes.add(mode);
     return await (sendResult ?? Future.value(true));
+  }
+
+  @override
+  Future<bool> retryFailed(PendingPrompt prompt, String text) async {
+    final ok = await send(text, attachments: prompt.attachments, webComposition: prompt.webComposition);
+    if (ok) {
+      state = state.copyWith(
+        pending: [
+          for (final p in state.pending)
+            if (p.requestId != prompt.requestId) p,
+        ],
+      );
+    }
+    return ok;
   }
 
   @override
@@ -274,11 +296,14 @@ class FakeSessions extends SessionsController {
   final String created;
   var creates = 0;
 
-  @override
-  Future<List<SessionSummary>> build() async => const [];
+  /// What the session list says.
+  var listed = const <SessionSummary>[];
 
   @override
-  Future<String> create() async {
+  Future<List<SessionSummary>> build() async => listed;
+
+  @override
+  Future<String> create({bool autoApprove = true}) async {
     creates++;
     return created;
   }
@@ -373,6 +398,7 @@ class ChatHarness {
     this.catalog,
     this.runtime,
     this.extra = const [],
+    this.newChatCatalogs = false,
     FakePicker? picker,
   }) : sessions = FakeSessions(created: created),
        picker = picker ?? FakePicker();
@@ -390,6 +416,11 @@ class ChatHarness {
   /// Overrides of providers the harness leaves alone (the active host, updates).
   final List<Override> extra;
   final FakePicker picker;
+
+  /// Let the new-chat preset/permission chips read the Host's catalogs.
+  /// Off by default: suites that script their Host's traffic must not leave
+  /// catalog requests in flight (test/chat/new_chat_options_test.dart opts in).
+  final bool newChatCatalogs;
   final controllers = <String, FakeChatController>{};
   final balanceRequests = <String>[];
 
@@ -413,11 +444,19 @@ class ChatHarness {
     }),
     attachmentPickerProvider.overrideWithValue(picker),
     settingsProvider.overrideWith(() => TestSettings(settings)),
+    // The test key must not send dictation to DeepSeek: the phone's and the
+    // engine's recognizers as before (test/speech covers the cloud ones).
+    voiceCloudProvider.overrideWithValue((_) async => null),
+    voiceCloudLikelyProvider.overrideWithValue(() => false),
     balanceFetcherProvider.overrideWithValue((key) async {
       balanceRequests.add(key);
       return balance;
     }),
     hostCommandsProvider.overrideWith((ref, sessionId) async => testHostCommands),
+    if (!newChatCatalogs) ...[
+      agentPresetsProvider.overrideWith((ref) async => null),
+      permissionStateProvider.overrideWith((ref, sessionId) async => null),
+    ],
     sessionUsageProvider.overrideWith2((id) => FakeUsage(id, usage[id] ?? SessionUsage.empty)),
     sessionsProvider.overrideWith(() => sessions),
     currentSessionProvider.overrideWith(() => FixedSession(session)),
@@ -427,11 +466,6 @@ class ChatHarness {
     ...extra,
   ];
 }
-
-/// The draft/quote storage key of [session] on 本机 (`new`: its new chat),
-/// as the chat screen stores them ([draftStorageKey]).
-String localDraft(String session, {String hostKey = 'local:local'}) =>
-    draftStorageKey(hostKey: hostKey, sessionId: session == 'new' ? null : session);
 
 /// Pumps a few frames without waiting for repeating animations to settle.
 Future<void> pumpFrames(WidgetTester tester, [int frames = 6]) async {
@@ -479,7 +513,7 @@ class FakePicker implements AttachmentPicker {
   }
 
   @override
-  Future<PickedAttachments> pickFiles({int limit = maxAttachments}) async {
+  Future<PickedAttachments> pickFiles({int limit = maxAttachments, int heldBytes = 0}) async {
     calls.add('files');
     return PickedAttachments(files);
   }

@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 
+import 'background_protection.dart';
+
 /// Lifecycle of the on-device Linux runtime and the local DSH server.
 enum RuntimePhase {
   notInstalled,
@@ -86,6 +88,7 @@ class RuntimeFailure {
     this.recent = const [],
     this.diagnostics,
     this.upSeconds,
+    this.causeUnknown = false,
   });
 
   static RuntimeFailure? fromMap(Object? raw) {
@@ -109,6 +112,7 @@ class RuntimeFailure {
       recent: strings(raw['recent']),
       diagnostics: raw['diagnostics'] as String?,
       upSeconds: (raw['upSeconds'] as num?)?.toInt(),
+      causeUnknown: raw['causeUnknown'] == true,
     );
   }
 
@@ -135,11 +139,39 @@ class RuntimeFailure {
   final String? diagnostics;
   final int? upSeconds;
 
+  /// The native side only knows the run didn't end cleanly (HarmonyOS, where
+  /// the engine shares the app's process: the system or the person ending the
+  /// app looks the same as a crash), so nothing may name a cause.
+  final bool causeUnknown;
+
   /// Crash-output suspects first, then recent changes.
   List<String> get culprits => {...suspects, ...recent}.toList();
 }
 
 /// Snapshot of the native runtime (see docs/architecture.md, "RuntimeStatus").
+/// HarmonyOS's background grant, as its native side reports it. Android has none.
+class RuntimeBackgroundTask {
+  const RuntimeBackgroundTask({required this.phase, required this.foreground});
+
+  /// The phase of the long-running task: the turn goes on, with no deadline.
+  static const longRunningPhase = 7;
+
+  final int phase;
+
+  /// The app is on screen, so a task ending now is the return, not the system's doing.
+  final bool foreground;
+
+  bool get longRunning => phase == longRunningPhase;
+
+  static RuntimeBackgroundTask? fromMap(Object? raw) => switch (raw) {
+    {'phase': final num phase, 'foreground': final bool foreground} => RuntimeBackgroundTask(
+      phase: phase.toInt(),
+      foreground: foreground,
+    ),
+    _ => null,
+  };
+}
+
 class RuntimeStatus {
   const RuntimeStatus({
     required this.phase,
@@ -153,6 +185,7 @@ class RuntimeStatus {
     this.managedSkillGeneration,
     this.error,
     this.mode = EngineMode.normal,
+    this.workspaceRecovery = false,
     this.safeState = SafeModeState.off,
     this.safeReason,
     this.strikes = 0,
@@ -166,16 +199,32 @@ class RuntimeStatus {
     this.directEngineAvailable = false,
     this.directEngineActive = false,
     this.directEngineFallbackReason,
+    this.tawcEngineEnabled = false,
+    this.tawcEngineAvailable = false,
+    this.tawcEngineActive = false,
+    this.tawcRecoveryAvailable = false,
     this.currentExecutionMode,
     this.launchSelectedMode,
     this.launchSpawned = false,
     this.launchFailureReason,
     this.tidyingFiles = false,
+    this.resetPending = false,
+    this.backgroundTask,
+    this.longTaskEligible = false,
+    this.continuedRun = false,
   });
 
   const RuntimeStatus.unknown() : this(phase: RuntimePhase.notInstalled);
 
   final RuntimePhase phase;
+
+  /// Null where there's no such grant.
+  final RuntimeBackgroundTask? backgroundTask;
+
+  /// This build may ask HarmonyOS for a long-running task for a turn (debug and
+  /// device builds have the permission, store builds don't). The system can still
+  /// say no, or take it back.
+  final bool longTaskEligible;
   final String? abi;
   final String? bundledVersion;
   final String? installedVersion;
@@ -192,6 +241,10 @@ class RuntimeStatus {
 
   /// Mode of the running process, or the mode the next start will use.
   final EngineMode mode;
+
+  /// Uses the persistent independent workspace index on this local runtime.
+  /// This is a launch setting, not evidence that workspace services are ready.
+  final bool workspaceRecovery;
   final SafeModeState safeState;
 
   /// Why safe mode is on: `manual`, `auto` (two failures in a row) or `probation` (normal mode failed again).
@@ -224,6 +277,14 @@ class RuntimeStatus {
   final bool directEngineActive;
   final String? directEngineFallbackReason;
 
+  /// The tawcroot launch, on by default (native `TawcrootLaunch`); one of it and Direct is on at most.
+  final bool tawcEngineEnabled;
+  final bool tawcEngineAvailable;
+  final bool tawcEngineActive;
+
+  /// Android can offer the opt-in launcher for the most recent PRoot failure.
+  final bool tawcRecoveryAvailable;
+
   /// Native process observation, never inferred from the saved direct preference.
   final String? currentExecutionMode;
 
@@ -236,11 +297,21 @@ class RuntimeStatus {
   /// files for more than a moment (once per install, before Direct launch).
   final bool tidyingFiles;
 
+  /// A reset was committed and hasn't finished (HarmonyOS): it finishes as the
+  /// app opens, and nothing starts until it has.
+  final bool resetPending;
+
+  /// iOS: the system is letting the engine keep running while the app is away.
+  final bool continuedRun;
+
   Map<String, Object?> get launchDiagnostics => {
     'directEngineEnabled': directEngineEnabled,
     'directEngineAvailable': directEngineAvailable,
     'directEngineActive': directEngineActive,
     'directEngineFallbackReason': directEngineFallbackReason,
+    'tawcEngineEnabled': tawcEngineEnabled,
+    'tawcEngineAvailable': tawcEngineAvailable,
+    'tawcEngineActive': tawcEngineActive,
     'currentExecutionMode': currentExecutionMode,
     'launchSelectedMode': launchSelectedMode,
     'launchSpawned': launchSpawned,
@@ -261,6 +332,8 @@ class RuntimeStatus {
 
   factory RuntimeStatus.fromMap(Map<Object?, Object?> map) => RuntimeStatus(
     phase: RuntimePhase.parse(map['phase']),
+    backgroundTask: RuntimeBackgroundTask.fromMap(map['transientTask']),
+    longTaskEligible: map['longTaskEligible'] == true,
     abi: map['abi'] as String?,
     bundledVersion: map['bundledVersion'] as String?,
     installedVersion: map['installedVersion'] as String?,
@@ -274,6 +347,7 @@ class RuntimeStatus {
     },
     error: map['error'] as String?,
     mode: EngineMode.parse(map['mode']),
+    workspaceRecovery: map['workspaceRecovery'] == true,
     safeState: SafeModeState.parse(map['safeState']),
     safeReason: map['safeReason'] as String?,
     strikes: (map['strikes'] as num?)?.toInt() ?? 0,
@@ -293,11 +367,17 @@ class RuntimeStatus {
     directEngineAvailable: map['directEngineAvailable'] == true,
     directEngineActive: map['directEngineActive'] == true,
     directEngineFallbackReason: map['directEngineFallbackReason'] as String?,
+    tawcEngineEnabled: map['tawcEngineEnabled'] == true,
+    tawcEngineAvailable: map['tawcEngineAvailable'] == true,
+    tawcEngineActive: map['tawcEngineActive'] == true,
+    tawcRecoveryAvailable: map['tawcRecoveryAvailable'] == true,
     currentExecutionMode: map['currentExecutionMode'] as String?,
     launchSelectedMode: map['launchSelectedMode'] as String?,
     launchSpawned: map['launchSpawned'] == true,
     launchFailureReason: map['launchFailureReason'] as String?,
     tidyingFiles: map['tidyingFiles'] == true,
+    resetPending: map['resetPending'] == true,
+    continuedRun: map['continuedRun'] == true,
   );
 }
 
@@ -421,11 +501,31 @@ class RuntimeProgressEvent extends RuntimeEvent {
   double get fraction => total <= 0 ? 0 : (done / total).clamp(0, 1).toDouble();
 }
 
-class RuntimeLogEvent extends RuntimeEvent {
-  const RuntimeLogEvent(this.line, this.stream);
+class RuntimeLogEntry {
+  const RuntimeLogEntry(this.seq, this.line, this.stream);
+
+  factory RuntimeLogEntry.fromMap(Map<Object?, Object?> raw) =>
+      RuntimeLogEntry(raw['seq'] as int, raw['line'] as String, raw['stream'] as String);
+
+  final int seq;
   final String line;
   final String stream;
 }
+
+class RuntimeLogsEvent extends RuntimeEvent {
+  const RuntimeLogsEvent(this.entries);
+  final List<RuntimeLogEntry> entries;
+}
+
+class RuntimeLogSnapshot {
+  const RuntimeLogSnapshot(this.entries, this.throughSeq);
+  final List<RuntimeLogEntry> entries;
+  final int throughSeq;
+}
+
+List<RuntimeLogEntry> _logEntries(Object? raw) => [
+  for (final entry in raw as List) RuntimeLogEntry.fromMap(entry as Map<Object?, Object?>),
+];
 
 /// One-off message from the native side, e.g. "已用安全模式启动".
 class RuntimeNoticeEvent extends RuntimeEvent {
@@ -494,8 +594,7 @@ class RuntimeBridge {
       .receiveBroadcastStream()
       .map((raw) => _parse(raw as Map<Object?, Object?>))
       .where((e) => e != null)
-      .cast<RuntimeEvent>()
-      .asBroadcastStream();
+      .cast<RuntimeEvent>();
 
   Future<RuntimeStatus> status() async {
     final map = await _methods.invokeMapMethod<Object?, Object?>('getStatus');
@@ -565,6 +664,10 @@ class RuntimeBridge {
     return map == null ? const LastKnownGood.none() : LastKnownGood.fromMap({...map, 'available': true});
   }
 
+  /// HarmonyOS: whether this build may schedule system reminders: `granted`,
+  /// `denied` or `unsupported`.
+  Future<String?> reminderAccess() => _methods.invokeMethod<String>('reminderAccess');
+
   Future<List<SafeHazard>> safePreflight() async {
     final list = await _methods.invokeListMethod<Object?>('safePreflight') ?? const [];
     return [
@@ -586,8 +689,14 @@ class RuntimeBridge {
 
   Future<void> setAutoSafe(bool enabled) => _methods.invokeMethod<void>('setAutoSafe', {'enabled': enabled});
 
+  /// Selects the local workspace index for subsequent starts. Native code
+  /// verifies the engine is stopped; this call does not start or stop it.
+  Future<void> setWorkspaceRecovery(bool enabled) =>
+      _methods.invokeMethod<void>('setWorkspaceRecovery', {'enabled': enabled});
+
   /// Takes effect on the next start; native code rejects changes while active.
   Future<void> setDirectEngine(bool enabled) => _methods.invokeMethod<void>('setDirectEngine', {'enabled': enabled});
+  Future<void> setTawcEngine(bool enabled) => _methods.invokeMethod<void>('setTawcEngine', {'enabled': enabled});
 
   /// Output around the last failure, tokens masked.
   Future<List<String>> failureLog() async => (await _methods.invokeListMethod<String>('failureLog')) ?? const [];
@@ -601,6 +710,38 @@ class RuntimeBridge {
 
   /// Opens Android's "All files access" page for this app (fallback when legacy access is off).
   Future<bool> openAllFilesAccess() async => await _methods.invokeMethod<bool>('openAllFilesAccess') ?? false;
+
+  /// Optional native background protection; old hosts expose no switches.
+  Future<BackgroundProtection?> backgroundProtection() async {
+    try {
+      return BackgroundProtection.fromMap(await _methods.invokeMapMethod<Object?, Object?>('backgroundProtection'));
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  Future<BackgroundProtection?> setBackgroundProtection({
+    bool? audioEnabled,
+    bool? locationEnabled,
+    bool? taskEnabled,
+  }) async => BackgroundProtection.fromMap(
+    await _methods.invokeMapMethod<Object?, Object?>('setBackgroundProtection', {
+      'audioEnabled': ?audioEnabled,
+      'locationEnabled': ?locationEnabled,
+      'taskEnabled': ?taskEnabled,
+    }),
+  );
+
+  /// Opens the relevant system settings, without assuming permission was granted.
+  Future<bool> openBackgroundProtectionSettings() async {
+    try {
+      return await _methods.invokeMethod<bool>('openBackgroundProtectionSettings') ?? false;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
 
   /// Whether Android leaves DSH out of battery optimization; null without the native side.
   Future<bool?> batteryExempt() async {
@@ -669,11 +810,26 @@ class RuntimeBridge {
 
   Future<void> stop() => _methods.invokeMethod<void>('stop');
 
+  /// HarmonyOS: closes the app and opens it again, the only way to another engine start.
+  Future<void> reopenApp() => _methods.invokeMethod<void>('reopenApp');
+
+  /// iOS and Android: report a local turn to the native background protection owner.
+  Future<void> setTurnRunning(bool running) => _methods.invokeMethod<void>('turnRunning', {'running': running});
+
   /// Deletes the runtime with everything in /root except [keep].
   Future<void> reset({ResetKeep keep = const ResetKeep()}) => _methods.invokeMethod<void>('reset', {'keep': keep.wire});
 
+  /// Explicit HarmonyOS reset intent. Existing uninstall calls keep the old wire.
+  Future<void> resetAndReinstall({ResetKeep keep = const ResetKeep()}) =>
+      _methods.invokeMethod<void>('reset', {'keep': keep.wire, 'reinstall': true});
+
   Future<List<String>> logs({int lines = 500}) async =>
       (await _methods.invokeListMethod<String>('getLogs', {'lines': lines})) ?? const [];
+
+  Future<RuntimeLogSnapshot> logSnapshot({int lines = 300}) async {
+    final raw = await _methods.invokeMapMethod<Object?, Object?>('getLogSnapshot', {'lines': lines});
+    return RuntimeLogSnapshot(_logEntries(raw!['entries']), raw['throughSeq'] as int);
+  }
 
   static RuntimeEvent? _parse(Map<Object?, Object?> raw) {
     switch (raw['type']) {
@@ -685,8 +841,8 @@ class RuntimeBridge {
           done: (raw['done'] as num?)?.toInt() ?? 0,
           total: (raw['total'] as num?)?.toInt() ?? 0,
         );
-      case 'log':
-        return RuntimeLogEvent(raw['line'] as String? ?? '', raw['stream'] as String? ?? 'stdout');
+      case 'logs':
+        return RuntimeLogsEvent(_logEntries(raw['entries']));
       case 'notice':
         final text = raw['text'] as String?;
         return text == null || text.isEmpty ? null : RuntimeNoticeEvent(text);

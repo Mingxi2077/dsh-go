@@ -7,6 +7,7 @@ import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../runtime/local_paths.dart';
 import '../runtime/runtime_bridge.dart';
 import '../runtime/runtime_state.dart';
 import 'account_state.dart';
@@ -43,8 +44,8 @@ final localReadListRootProvider = FutureProvider<String?>((ref) async {
     ),
   );
   try {
-    final support = await getApplicationSupportDirectory();
-    return await Directory('${support.path}/runtime/rootfs').resolveSymbolicLinks();
+    final root = LocalPaths.root ?? '${(await getApplicationSupportDirectory()).path}/runtime/rootfs';
+    return await Directory(root).resolveSymbolicLinks();
   } on Object {
     return null;
   }
@@ -143,15 +144,20 @@ final readListIdentityProvider = Provider<ReadListIdentity?>((ref) {
 
   switch (selected.kind) {
     case HostKind.local:
-      final runtime = ref.watch(localRuntimeProvider);
+      final (loaded, resetting, version, mode) = ref.watch(
+        localRuntimeProvider.select(
+          (s) => (
+            s.loaded,
+            s.loaded && (s.status.phase == RuntimePhase.installing || s.status.phase == RuntimePhase.notInstalled),
+            s.status.installedVersion,
+            s.status.mode,
+          ),
+        ),
+      );
       final rootEpoch = ref.watch(_rootEpochProvider);
-      final resetting =
-          runtime.loaded &&
-          (runtime.status.phase == RuntimePhase.installing || runtime.status.phase == RuntimePhase.notInstalled);
       rootEpoch.observe(resetting);
       final root = ref.watch(localReadListRootProvider).value;
-      final version = runtime.status.installedVersion;
-      if (resetting || !runtime.loaded || root == null || version == null || version.isEmpty) return null;
+      if (resetting || !loaded || root == null || version == null || version.isEmpty) return null;
       if (!ref.watch(settingsProvider.select((s) => s.loaded))) return null;
       // AccountController deliberately keeps the last known login across a
       // process disconnect. Unknown identities are never inferred as signed out.
@@ -173,7 +179,7 @@ final readListIdentityProvider = Provider<ReadListIdentity?>((ref) {
         'local',
         root,
         version,
-        runtime.status.mode.name,
+        mode.name,
         rootEpoch.generation,
         account.phase.name,
         accountId,

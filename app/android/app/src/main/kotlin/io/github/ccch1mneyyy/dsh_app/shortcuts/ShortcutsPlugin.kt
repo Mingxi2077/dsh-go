@@ -15,6 +15,7 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.PluginRegistry
 import io.github.ccch1mneyyy.dsh_app.R
+import io.github.ccch1mneyyy.dsh_app.companion.CompanionAssistant
 import io.github.ccch1mneyyy.dsh_app.icons.LauncherIconPlugin
 import java.util.UUID
 import java.util.concurrent.ExecutorService
@@ -24,8 +25,9 @@ import java.util.concurrent.Executors
  * Launcher shortcuts and the Quick Settings tile: MethodChannel `dsh/shortcuts`.
  *
  * Entries ([EntryActivity] → MainActivity as [ACTION_ENTRY]) are pushed to Dart as `entry`
- * calls, `{kind: new | voice | chat, sessionId?, host?, text?}`, after Dart's `ready` (held until
- * then, like links/LinksPlugin). An entry without this process's [token] is ignored. `text` is
+ * calls, `{kind: new | voice | chat | screenshot | companion_task, sessionId?, host?, text?, path?, taskId?, taskRev?}`, after
+ * Dart's `ready` (held until then, like links/LinksPlugin). An entry without this process's
+ * [token] is ignored. `text` is
  * 问一句's text the floating pet couldn't send itself (pet/PetOverlay.kt): it waits in the composer.
  *
  * - `setRecent {items: [{id, title, host}]}`: the recent conversations as dynamic shortcuts
@@ -137,9 +139,32 @@ class ShortcutsPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHa
     /** Delivers an entry; false when [intent] isn't one of ours. */
     private fun take(intent: Intent): Boolean {
         if (intent.action != ACTION_ENTRY) return false
+        val kind = intent.getStringExtra(EXTRA_KIND) ?: return true
+        if (kind == KIND_SCREENSHOT) {
+            val event = ScreenshotEntry.event(context.cacheDir, token,
+                intent.getStringExtra(EXTRA_TOKEN), intent.getStringExtra(EXTRA_PATH)) ?: return true
+            if (ready) methods.invokeMethod("entry", event) else pending += event
+            return true
+        }
         // Consumed either way: an entry without our token goes nowhere.
         if (intent.getStringExtra(EXTRA_TOKEN) != token) return true
-        val kind = intent.getStringExtra(EXTRA_KIND) ?: return true
+        if (kind == KIND_COMPANION_ASSISTANT) {
+            val event = mapOf("kind" to kind,
+                "page" to CompanionAssistant.takePage(intent.getStringExtra(EXTRA_ASSIST_PAGE)),
+                "returnToApp" to intent.getBooleanExtra(EXTRA_ASSIST_RETURN, false))
+            // Repeated system invocations while Flutter is starting all open the same room.
+            pending.removeAll { it["kind"] == KIND_COMPANION_ASSISTANT }
+            if (ready) methods.invokeMethod("entry", event) else pending += event
+            return true
+        }
+        if (kind == KIND_COMPANION_TASK) {
+            val taskId = intent.getStringExtra(EXTRA_TASK)
+            val revision = intent.getLongExtra(EXTRA_TASK_REV, 0)
+            if (taskId.isNullOrEmpty() || revision < 1) return true
+            val event = mapOf("kind" to kind, "taskId" to taskId, "taskRev" to revision)
+            if (ready) methods.invokeMethod("entry", event) else pending += event
+            return true
+        }
         if (kind != KIND_NEW && kind != KIND_VOICE && kind != KIND_CHAT) return true
         val sessionId = intent.getStringExtra(EXTRA_SESSION)
         if (kind == KIND_CHAT && sessionId.isNullOrEmpty()) return true
@@ -158,12 +183,20 @@ class ShortcutsPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHa
         const val EXTRA_SESSION = "io.github.ccch1mneyyy.dsh_app.entry.SESSION"
         const val EXTRA_HOST = "io.github.ccch1mneyyy.dsh_app.entry.HOST"
         const val EXTRA_TEXT = "io.github.ccch1mneyyy.dsh_app.entry.TEXT"
+        const val EXTRA_PATH = "io.github.ccch1mneyyy.dsh_app.entry.PATH"
         const val EXTRA_TOKEN = "io.github.ccch1mneyyy.dsh_app.entry.TOKEN"
+        const val EXTRA_TASK = "io.github.ccch1mneyyy.dsh_app.entry.TASK"
+        const val EXTRA_TASK_REV = "io.github.ccch1mneyyy.dsh_app.entry.TASK_REV"
+        const val EXTRA_ASSIST_PAGE = "io.github.ccch1mneyyy.dsh_app.entry.ASSIST_PAGE"
+        const val EXTRA_ASSIST_RETURN = "io.github.ccch1mneyyy.dsh_app.entry.ASSIST_RETURN"
+        const val KIND_COMPANION_ASSISTANT = "companion_assistant"
         private const val EXTRA_TAKEN = "io.github.ccch1mneyyy.dsh_app.entry.TAKEN"
 
         const val KIND_NEW = "new"
         const val KIND_VOICE = "voice"
         const val KIND_CHAT = "chat"
+        const val KIND_SCREENSHOT = "screenshot"
+        const val KIND_COMPANION_TASK = "companion_task"
 
         const val MAX_RECENT = 3
         const val RECENT_PREFIX = "chat:"

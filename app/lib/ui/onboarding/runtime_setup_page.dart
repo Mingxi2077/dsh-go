@@ -7,9 +7,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../l10n/l10n.dart';
 import '../../runtime/runtime_bridge.dart';
 import '../../runtime/runtime_state.dart';
+import '../../state/android_features.dart';
 import '../../state/notify_state.dart';
 import '../common/app_sheet.dart';
 import '../common/progress_halo.dart';
+import '../engine/diagnostics_export_card.dart';
 import '../engine/engine_status.dart';
 import '../engine/log_view.dart';
 import '../shell/adaptive/adaptive_layout.dart' show WindowClass;
@@ -27,7 +29,7 @@ enum _SetupView { choose, waiting, installing, done, failed }
 /// The screen is meant to be calm: one slowly filling halo, a percentage, one
 /// short line about what is happening, and a rough time estimate. Logs are one
 /// tap away but never on screen by default. On failure the halo turns the danger
-/// colour and the page offers "重试" and "查看日志".
+/// colour and the page offers retry, logs and a diagnostics export.
 ///
 /// With [choose], a runtime that is not there yet is not installed at once:
 /// the page first asks where DSH runs, on this phone or on a remote host
@@ -42,6 +44,7 @@ class RuntimeSetupPage extends ConsumerStatefulWidget {
     this.choose = false,
     this.onRemote,
     this.onLocal,
+    this.onTavern,
     this.waiting = false,
     this.leading,
   });
@@ -59,6 +62,9 @@ class RuntimeSetupPage extends ConsumerStatefulWidget {
   /// Picked 「本机」 in the choice: the caller starts the unpack and moves on
   /// while it runs. Null: this page installs and shows the progress.
   final VoidCallback? onLocal;
+
+  /// 和角色聊天 in the choice (first run): 酒馆 without the runtime.
+  final VoidCallback? onTavern;
 
   /// Set up while unpacking and done with it: the progress says it will go
   /// on by itself (and, when it can, that a notification will say so).
@@ -163,6 +169,7 @@ class _RuntimeSetupPageState extends ConsumerState<RuntimeSetupPage> {
               leading: widget.leading,
               onLocal: widget.onLocal ?? () => _install(),
               onRemote: widget.onRemote!,
+              onTavern: widget.onTavern,
             )
           : KeyedSubtree(key: const ValueKey('progress'), child: _progress(context, state, view)),
     );
@@ -197,11 +204,12 @@ class _RuntimeSetupPageState extends ConsumerState<RuntimeSetupPage> {
       _SetupView.failed when state.status.keepFailed => l10n.shellRuntimeRestoreFailed,
       _SetupView.failed => humanizeRuntimeError(state.status.error) ?? l10n.shellRuntimeExtractFailed,
     };
-    final meta = view == _SetupView.installing
-        ? installMetaLine(l10n, progress, ref.watch(installEtaProvider))
-        : null;
-    // Set up and waiting: when a notification can say it's done, say so.
+    final meta = view == _SetupView.installing ? installMetaLine(l10n, progress, ref.watch(installEtaProvider)) : null;
+    // Set up and waiting: when a notification can say it's done, say so. HarmonyOS
+    // has none for it, and suspends the app if it leaves the screen.
+    final ohos = ref.watch(operatingSystemProvider) == 'ohos';
     final notifies =
+        !ohos &&
         widget.waiting &&
         ref.watch(notifySystemStatusProvider.select((s) => s.value?.native == true && s.value?.enabled == true));
 
@@ -280,6 +288,15 @@ class _RuntimeSetupPageState extends ConsumerState<RuntimeSetupPage> {
               ),
             ],
           ),
+          const SizedBox(height: 8),
+          Center(
+            // Quiet like the links below it: a way to get help, not the next step.
+            child: TextButton(
+              onPressed: () => unawaited(showDiagnosticsExportSheet(context)),
+              style: TextButton.styleFrom(foregroundColor: scheme.onSurfaceVariant),
+              child: Text(l10n.phoneDiagnosticsExport),
+            ),
+          ),
         ] else
           // One quiet line instead of a card: what matters while it runs.
           Row(
@@ -289,7 +306,11 @@ class _RuntimeSetupPageState extends ConsumerState<RuntimeSetupPage> {
               const SizedBox(width: 6),
               Flexible(
                 child: Text(
-                  notifies ? l10n.setupNotifyWhenDone : l10n.shellRuntimeLocalOnly,
+                  notifies
+                      ? l10n.setupNotifyWhenDone
+                      : ohos && view == _SetupView.installing
+                      ? l10n.harmonySetupStay
+                      : l10n.shellRuntimeLocalOnly,
                   textAlign: TextAlign.center,
                   style: theme.textTheme.bodySmall?.copyWith(color: colors.textTertiary),
                 ),
@@ -335,7 +356,7 @@ Future<void> showRuntimeLogSheet(BuildContext context, {String? title}) {
     heightFactor: 0.72,
     builder: (context) => Consumer(
       builder: (context, ref, _) {
-        final logs = ref.watch(localRuntimeProvider.select((s) => s.logs));
+        final logs = ref.watch(localRuntimeLogsProvider);
         return Column(
           children: [
             SheetHeader(

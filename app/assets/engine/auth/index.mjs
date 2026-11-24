@@ -4,7 +4,8 @@
 // Claude) to the app as the `appAuth` Remote service:
 //
 //   appAuth/list                  → {providers: [{id, signedIn, account?}]}
-//   appAuth/begin  {provider}     → {attemptId}
+//   appAuth/usage {provider}      → {provider, status, windows, plan?}
+//   appAuth/begin  {provider, newAccount?} → {attemptId}
 //   appAuth/poll   {attemptId}    → {phase, url?, userCode?, message?, placeholder?, error?}
 //   appAuth/answer {attemptId, value} → {}
 //   appAuth/cancel {attemptId}    → {}
@@ -57,28 +58,67 @@ async function hostImport(specifier) {
 const { TypertRemoteService, Remote, RemoteError } = await hostImport('@deepseek-ai/dsh-typert-protocol')
 
 /** The Remote methods, by implementation name (= wire method name). */
-const REMOTE_METHODS = ['list', 'begin', 'poll', 'answer', 'cancel', 'signOut']
+const REMOTE_METHODS = ['list', 'usage', 'begin', 'poll', 'answer', 'cancel', 'signOut']
 const markRemoteMethods = []
 
 export default class AppAuth extends TypertRemoteService {
   // credentials: grants are read and deleted here. authorization: the flows
   // llm-pi-ai registers. settings is optional and looked up per call.
   static inject = ['credentials', 'authorization']
+  #siwc
 
   /** @param ctx - plugin context. */
   constructor(ctx) {
     super(ctx, 'appAuth')
     for (const mark of markRemoteMethods) mark.call(this)
-    this.bridge = new AuthBridge({ get: (name) => ctx.get(name), RemoteError })
+    this.bridge = new AuthBridge({ get: (name) => ctx.get(name), RemoteError, siwc: () => this.#siwc })
     ctx.effect(() => () => this.bridge.dispose(), 'appAuth: sign-in attempts')
+    // The same authorization writer survives replacement of the LLM owner.
+    let oauthReady
+    const openOAuth = async () => {
+      const { openSiwcStore } = await import('./siwc/store.mjs')
+      const storage = await openSiwcStore()
+      if (!storage) return null
+      const { createSiwcOAuth } = await import('./siwc/oauth.mjs')
+      return createSiwcOAuth({
+        ...storage, fetch: globalThis.fetch,
+        onGrantLost: () => this.#siwc?.invalidate({ stopRequests: false }),
+      })
+    }
+    ctx.inject(['llm'], async (owner) => {
+      let active = true
+      let registration
+      owner.effect(() => () => {
+        active = false
+        if (registration && this.#siwc?.invalidate === registration.invalidate) {
+          this.#siwc = undefined
+          this.bridge.withdrawOpenAiAttempt()
+        }
+        registration?.dispose()
+      }, 'appAuth: OpenAI channel')
+      try {
+        const oauth = await (oauthReady ??= openOAuth())
+        if (!oauth || !active) return
+        const { registerSiwcProvider } = await import('./siwc/provider.mjs')
+        if (!active) return
+        registration = registerSiwcProvider({ llm: owner.llm, oauth })
+        this.#siwc = { oauth, invalidate: registration.invalidate }
+      } catch {
+        if (active) console.error('[dsh-app auth] OpenAI channel initialization failed')
+      }
+    })
   }
 
   list() {
     return this.bridge.list()
   }
 
-  begin(provider) {
-    return this.bridge.begin(provider)
+  usage(provider) {
+    return this.bridge.usage(provider)
+  }
+
+  begin(provider, newAccount) {
+    return this.bridge.begin(provider, newAccount)
   }
 
   poll(attemptId) {

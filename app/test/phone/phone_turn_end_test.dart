@@ -179,6 +179,92 @@ void main() {
 
     Map<String, Object?> finishArgs() => (native.callsOf('finishTask').single.arguments as Map).cast<String, Object?>();
 
+    Map<String, Object?> exactStatus({bool ended = false, int selected = 2}) => {
+      ...phoneStatus(), 'taskProtocol': 1, 'parallelLimit': 1, 'selectedTaskId': selected,
+      'tasks': [
+        {'id': 1, 'sessionId': 's1', 'runId': 'epoch:1', 'active': !ended, 'generation': ended ? 3 : 1,
+          if (ended) ...{'endedRunId': 'epoch:1', 'endedGeneration': 3, 'completion': 'completed'}},
+        {'id': 2, 'sessionId': 's2', 'runId': 'other:4', 'active': true, 'generation': 1},
+      ],
+    };
+
+    test('exact receipt finishes only its session while another task remains selected and running', () async {
+      final phone = await make(running: {'s1', 's2'}, viewed: 's2');
+      native.push(exactStatus());
+      await settle();
+      expect(phone.onTurnEnd(_end('s1')), isNull); // host idle inference is not the native receipt
+      expect(native.callsOf('finishTask'), isEmpty);
+      native.push(exactStatus(ended: true));
+      await settle();
+      expect(finishArgs(), {
+        'taskId': 1, 'sessionId': 's1', 'host': HostRef.local.encode(), 'reopen': true,
+        'runId': 'epoch:1', 'generation': 3,
+      });
+      expect(container.read(chatRevealProvider)?.sessionId, 's1');
+      native.push(exactStatus(ended: true));
+      await settle();
+      expect(native.callsOf('finishTask'), hasLength(1));
+    });
+
+    test('a selected modern task does not disable a separately linked legacy task', () async {
+      final phone = await make(running: {'s1'});
+      native.push({
+        ...phoneStatus(taskId: 1, taskActive: true),
+        'taskProtocol': 1, 'parallelLimit': 1, 'selectedTaskId': 2,
+        'tasks': [
+          {'id': 1, 'active': true, 'identity': 'legacy'},
+          {'id': 2, 'sessionId': 's2', 'runId': 'other:4', 'active': true},
+        ],
+      });
+      await settle();
+      expect(phone.link.candidates, {'s1'});
+      await phone.onTurnEnd(_end('s1'));
+      expect(finishArgs()['taskId'], 1);
+      expect(finishArgs().containsKey('runId'), isFalse);
+    });
+
+    test('a receipt seen without a prior active push is still consumed once', () async {
+      await make(running: {'s1', 's2'});
+      native.push(exactStatus(ended: true));
+      await settle();
+      expect(finishArgs()['runId'], 'epoch:1');
+      native.push(exactStatus(ended: true));
+      await settle();
+      expect(native.callsOf('finishTask'), hasLength(1));
+    });
+
+    test('exact receipt preserves the return preference without relying on viewed chat', () async {
+      await make(running: {'s1', 's2'}, viewed: 's2');
+      await container.read(phoneReturnPrefProvider.notifier).set(false);
+      native.push(exactStatus(ended: true));
+      await settle();
+      expect(finishArgs()['sessionId'], 's1');
+      expect(finishArgs()['reopen'], isFalse);
+      expect(container.read(chatRevealProvider), isNull);
+    });
+
+    test('a companion task goes back to her room, or leaves the person where it was asked from', () async {
+      await make(running: {'s1'});
+      Map<String, Object?> companionEnd(int id, String session) => {
+        ...phoneStatus(), 'taskProtocol': 1, 'parallelLimit': 1, 'selectedTaskId': id,
+        'tasks': [
+          {'id': id, 'sessionId': session, 'runId': 'r$id', 'active': false, 'generation': 3,
+            'endedRunId': 'r$id', 'endedGeneration': 3, 'completion': 'completed'},
+        ],
+      };
+      native.push(companionEnd(1, 'companion:room:t1:r1'));
+      await settle();
+      expect(finishArgs()['sessionId'], 'companion:room:t1:r1');
+      expect(finishArgs()['reopen'], isTrue);
+      // She is no conversation: nothing in the chat moves.
+      expect(container.read(chatRevealProvider), isNull);
+
+      native.calls.clear();
+      native.push(companionEnd(2, 'companion:floating:t2:r2'));
+      await settle();
+      expect(finishArgs()['reopen'], isFalse);
+    });
+
     test('the phone turn ending closes the overlay and brings the app back to that conversation', () async {
       final phone = await make(running: {'s2'}, viewed: 's2');
       expect(phone.link.candidates, {'s2'});

@@ -123,6 +123,7 @@ class FakeProviderBackend implements ProviderBackend {
     String? baseUrl,
     String? apiKeyEnv,
     List<ProviderModelSpec>? models,
+    Map<String, String>? headers,
     int? expectedRevision,
   }) async {
     calls.add((
@@ -133,6 +134,7 @@ class FakeProviderBackend implements ProviderBackend {
         'api': ?api?.wire,
         'baseURL': ?baseUrl,
         'apiKeyEnv': ?apiKeyEnv,
+        'headers': ?headers,
         if (models != null) 'models': [for (final m in models) m.toJson()],
         'expectedRevision': ?expectedRevision,
       },
@@ -146,7 +148,7 @@ class FakeProviderBackend implements ProviderBackend {
       baseUrl: baseUrl ?? old.baseUrl,
       apiKeyEnv: apiKeyEnv ?? old.apiKeyEnv,
       models: models ?? old.models,
-      headers: old.headers,
+      headers: headers ?? old.headers,
       modelOverrides: old.modelOverrides,
       defaultContextWindow: old.defaultContextWindow,
       defaultMaxTokens: old.defaultMaxTokens,
@@ -239,8 +241,17 @@ class FakeProviderBackend implements ProviderBackend {
   }
 
   @override
-  Future<List<DiscoveredModel>> discover({String? provider, String? baseUrl, ProviderApi? api, String? apiKey}) async {
-    calls.add(('discover', {'provider': ?provider, 'baseURL': ?baseUrl, 'api': ?api?.wire, 'apiKey': ?apiKey}));
+  Future<List<DiscoveredModel>> discover({
+    String? provider,
+    String? baseUrl,
+    ProviderApi? api,
+    String? apiKey,
+    Map<String, String>? headers,
+  }) async {
+    calls.add((
+      'discover',
+      {'provider': ?provider, 'baseURL': ?baseUrl, 'api': ?api?.wire, 'apiKey': ?apiKey, 'headers': ?headers},
+    ));
     if (discoverFor case final pick?) {
       final answer = pick(baseUrl);
       if (answer is List<DiscoveredModel>) return answer;
@@ -316,7 +327,11 @@ FakeProviderBackend sampleBackend({bool isLocal = true}) => FakeProviderBackend(
 class FakeSubscriptionBackend implements SubscriptionBackend {
   FakeSubscriptionBackend({this.available = true, List<SubscriptionStatus>? statuses, List<LoginStep>? steps})
     : statuses =
-          statuses ?? [for (final s in Subscription.values) SubscriptionStatus(subscription: s, signedIn: false)],
+          statuses ??
+          const [
+            SubscriptionStatus(subscription: Subscription.chatgpt, signedIn: false),
+            SubscriptionStatus(subscription: Subscription.claude, signedIn: false),
+          ],
       steps = steps ?? const [LoginStep(phase: LoginPhase.starting)];
 
   /// False: `appAuth/list` fails as on an engine without the bridge.
@@ -338,8 +353,8 @@ class FakeSubscriptionBackend implements SubscriptionBackend {
   }
 
   @override
-  Future<String> begin(Subscription subscription) async {
-    calls.add('begin:${subscription.wire}');
+  Future<String> begin(Subscription subscription, {bool newAccount = false}) async {
+    calls.add('begin:${subscription.wire}${newAccount ? ':newAccount' : ''}');
     if (beginError case final error?) throw error;
     _polled = 0;
     return 'att-${++_attempts}';

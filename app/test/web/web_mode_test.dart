@@ -6,8 +6,10 @@
 // ignore_for_file: depend_on_referenced_packages
 
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:dsh_app/state/hosts_state.dart';
+import 'package:dsh_app/state/android_features.dart';
 import 'package:dsh_app/state/notify_state.dart';
 import 'package:dsh_app/state/sessions_state.dart';
 import 'package:dsh_app/state/ui_mode_state.dart';
@@ -22,6 +24,7 @@ import 'package:dsh_app/ui/web/web_home.dart';
 import 'package:dsh_app/ui/web/web_target.dart';
 import 'package:dsh_app/ui/web/web_view_page.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -103,6 +106,7 @@ Future<ProviderContainer> _pumpHome(
   _Window window, {
   String? session,
   DshWebTarget? initial,
+  String? operatingSystem,
 }) async {
   _useWindow(tester, window);
   _shares = _Native(tester, 'dsh/share', 'share');
@@ -117,7 +121,11 @@ Future<ProviderContainer> _pumpHome(
   await tester.pumpWidget(
     testApp(
       WebHome(initial: initial),
-      overrides: [...harness.overrides, dshWebAccessProvider.overrideWithValue(SshDshWeb(_url, 'studio'))],
+      overrides: [
+        ...harness.overrides,
+        if (operatingSystem != null) operatingSystemProvider.overrideWithValue(operatingSystem),
+        dshWebAccessProvider.overrideWithValue(SshDshWeb(_url, 'studio')),
+      ],
     ),
   );
   // The WebView loads once it is set up and guarded.
@@ -272,6 +280,94 @@ void main() {
     });
   });
 
+  group('compose reply ownership', () {
+    Future<List<Object?>> runPair(WidgetTester tester, {bool ios = true, bool lateFirst = false}) async {
+      debugDefaultTargetPlatformOverride = ios ? TargetPlatform.iOS : TargetPlatform.android;
+      try {
+        await _pumpHome(tester, _windows.first, operatingSystem: ios ? 'ios' : 'android');
+        for (final text in ['first ordinary draft', 'second ordinary draft']) {
+          await _shares.push({'text': text, 'files': <Object>[], 'skipped': <Object>[]});
+          await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 50)));
+          await pumpFrames(tester, 3);
+          if (lateFirst && text == 'first ordinary draft') {
+            await tester.pump(const Duration(seconds: 31));
+            await pumpFrames(tester, 3);
+          }
+        }
+        expect(_composeCalls().length, 2);
+        const prefix = 'window.__dshAppCompose && window.__dshAppCompose(';
+        final drafts = [for (final s in _composeCalls()) jsonDecode(s.substring(prefix.length, s.length - 2))];
+        final output = await tester.runAsync(
+          () => Process.run('node', [
+            'test/web/support/compose_pair_harness.mjs',
+            'assets/web/dsh_web_open.js',
+            jsonEncode(drafts),
+          ]),
+        );
+        expect(output!.exitCode, 0, reason: output.stderr.toString());
+        final actualJS = jsonDecode(output.stdout.toString()) as Map<String, dynamic>;
+        final replies = actualJS['messages'] as List;
+        for (final reply in lateFirst ? replies.take(1) : replies) {
+          _page.post('DshAppCompose', jsonEncode(reply));
+          await pumpFrames(tester, 2);
+        }
+        // With lateFirst, A timed out before B began; its success arrives late.
+        // B's response is deliberately withheld to exercise its own timeout.
+        await tester.pump(const Duration(seconds: 31));
+        await pumpFrames(tester, 3);
+        final copied = <Object?>[
+          for (final c in _platformCalls.where((c) => c.method == 'Clipboard.setData')) (c.arguments as Map)['text'],
+        ];
+        debugPrint(jsonEncode({'js': actualJS, 'lateFirst': lateFirst, 'copied': copied}));
+        return copied;
+      } finally {
+        await tester.pumpWidget(const SizedBox());
+        await tester.pump(const Duration(milliseconds: 500));
+        debugDefaultTargetPlatformOverride = null;
+      }
+    }
+
+    testWidgets('iOS two ordinary successful pastes do not falsely time out', (tester) async {
+      expect(await runPair(tester), isEmpty);
+    });
+
+    testWidgets('iOS late reply cannot acknowledge the next unanswered paste', (tester) async {
+      expect(await runPair(tester, lateFirst: true), ['first ordinary draft', 'second ordinary draft']);
+    });
+
+    testWidgets('Android keeps its existing uncorrelated reply contract', (tester) async {
+      expect(await runPair(tester, ios: false), ['first ordinary draft']);
+    });
+  });
+
+  for (final platform in [TargetPlatform.iOS, TargetPlatform.android]) {
+    testWidgets('composer attachment receipt option $platform', (tester) async {
+      debugDefaultTargetPlatformOverride = platform;
+      try {
+        await _pumpHome(tester, _windows.first);
+        await _shares.push({'text': 'ordinary receipt control', 'files': <Object>[], 'skipped': <Object>[]});
+        await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 50)));
+        await pumpFrames(tester, 3);
+        final script = _composeCalls().single;
+        final draft = jsonDecode(script.substring(script.indexOf('({') + 1, script.lastIndexOf(');'))) as Map;
+        expect(draft['text'], 'ordinary receipt control');
+        expect(draft.containsKey('composerAttachmentCount'), platform == TargetPlatform.iOS);
+        if (platform == TargetPlatform.iOS) expect(draft['composerAttachmentCount'], isTrue);
+        expect(draft.containsKey('requireOpenedTarget'), platform == TargetPlatform.iOS);
+        if (platform == TargetPlatform.iOS) expect(draft['requireOpenedTarget'], isTrue);
+        _page.post('DshAppCompose', jsonEncode({'text': true, 'files': 0, 'requestId': ?draft['requestId']}));
+        await pumpFrames(tester, 2);
+        expect(find.byType(SnackBar), findsNothing);
+        expect(draft.containsKey('guardTextFallback'), platform == TargetPlatform.iOS);
+        if (platform == TargetPlatform.iOS) expect(draft['guardTextFallback'], isTrue);
+      } finally {
+        await tester.pumpWidget(const SizedBox());
+        await tester.pump(const Duration(milliseconds: 500));
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+  }
+
   group('the rest of the phone lands in the page', () {
     testWidgets('a shared text goes into a new conversation\'s composer', (tester) async {
       await _pumpHome(tester, _windows.first, session: 's1');
@@ -295,6 +391,27 @@ void main() {
       final copied = _platformCalls.where((c) => c.method == 'Clipboard.setData').single;
       expect((copied.arguments as Map)['text'], '一段分享');
       expect(find.text('文字已复制，粘贴到输入框即可'), findsOneWidget);
+    });
+
+    testWidgets('a pet screenshot reaches the web composer as an unsent image', (tester) async {
+      final slot = Directory.systemTemp.createTempSync('dsh-web-screenshot');
+      addTearDown(() {
+        if (slot.existsSync()) slot.deleteSync(recursive: true);
+      });
+      final image = File('${slot.path}/screenshot.png')..writeAsBytesSync(tinyPng);
+      await _pumpHome(tester, _windows.first, session: 's1');
+      await _entries.push({'kind': 'screenshot', 'path': image.path});
+      for (var i = 0; i < 40 && _composeCalls().isEmpty; i++) {
+        await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 20)));
+        await pumpFrames(tester, 2);
+      }
+
+      expect(_opened().last, {'newSession': true});
+      expect(_composeCalls().single, contains('"name":"screenshot.png"'));
+      expect(_composeCalls().single, contains('"type":"image/png"'));
+      expect(image.existsSync(), isFalse);
+      _page.post('DshAppCompose', jsonEncode({'text': true, 'files': 1}));
+      await pumpFrames(tester, 2);
     });
 
     testWidgets('launcher: 新对话 starts one in the page; a recent conversation opens there', (tester) async {

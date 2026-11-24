@@ -16,19 +16,32 @@ import 'support.dart';
 
 void main() {
   group('seatWebTarget', () {
-    test('settings: an official section by id, a third-party one opens the dialog', () {
+    test('settings: official and third-party section ids are kept', () {
       expect(
         seatWebTarget(occupant(Slots.settingsSection, probe, 'models')),
-        const DshWebTarget(settings: DshWebSettings.models),
+        const DshWebTarget(settingsSection: 'models', settingsPackage: probe),
       );
       expect(
         seatWebTarget(occupant(Slots.settingsSection, probe, 'k4-probe')),
-        const DshWebTarget(settings: DshWebSettings.general),
+        const DshWebTarget(settingsSection: 'k4-probe', settingsPackage: probe),
       );
       expect(
         seatWebTarget(occupant(Slots.generalItem, pet, 'x')),
         const DshWebTarget(settings: DshWebSettings.general),
       );
+    });
+
+    test('a section keeps registered names, never its bundle title', () {
+      final target = seatWebTarget(
+        occupant(Slots.settingsSection, probe, 'k4-probe', label: '探针设置'),
+        bundle: probeBundle,
+        labels: ['Probe settings', '探针设置'],
+      );
+      expect(target.toJson(), {
+        'settings': 'k4-probe',
+        'settingsPackage': probe,
+        'settingsLabels': ['探针设置', 'Probe settings'],
+      });
     });
 
     test('a plugin\'s config: its card on the Plugins page, by every name', () {
@@ -38,6 +51,15 @@ void main() {
         probe,
       ]);
       expect(seatWebTarget(occupant(Slots.rowConfig, pet, '$pet#$pet')).pluginItem, [pet]);
+    });
+
+    test('common page seams fall back to the corresponding web surface', () {
+      expect(seatWebTarget(occupant(Slots.sidebarFooter, probe, 'footer')), const DshWebTarget(sidebar: true));
+      expect(
+        seatWebTarget(occupant(Slots.settingsPluginsTab, probe, 'extra')),
+        const DshWebTarget(settings: DshWebSettings.plugins),
+      );
+      expect(seatWebTarget(occupant(Slots.pluginDetailSection, probe, 'details')).pluginItem, [probe]);
     });
 
     test('panels: an official one by id, a third-party one opens the sidebar', () {

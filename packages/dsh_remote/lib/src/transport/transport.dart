@@ -24,6 +24,19 @@ import 'webrtc_transport.dart' show WebRtcTransport;
 /// Data plane in use; mirrors the `transport.selected` vocabulary.
 enum RemoteTransportMode { lan, p2p, turn, relay }
 
+enum RemoteIpVersion { ipv4, ipv6 }
+
+enum RemoteIceProtocol { udp, tcp }
+
+/// Selected ICE pair metadata only; never retains candidate addresses or URLs.
+class RemotePeerNetworkInfo {
+  const RemotePeerNetworkInfo({this.localIpVersion, this.remoteIpVersion, this.protocol});
+
+  final RemoteIpVersion? localIpVersion;
+  final RemoteIpVersion? remoteIpVersion;
+  final RemoteIceProtocol? protocol;
+}
+
 /// Payload-free reasons for trying a less preferred data plane.
 enum RemoteNetworkFallbackReason {
   webrtcUnavailable,
@@ -45,12 +58,14 @@ class RemoteNetworkDiagnostics {
     this.connectionDuration,
     this.roundTripTime,
     this.fallbackReason,
+    this.peerNetwork,
   });
 
   final RemoteTransportMode? transportMode;
   final Duration? connectionDuration;
   final Duration? roundTripTime;
   final RemoteNetworkFallbackReason? fallbackReason;
+  final RemotePeerNetworkInfo? peerNetwork;
   final DateTime observedAt;
 }
 
@@ -107,6 +122,16 @@ abstract class SecureHandshakeTransport {
   Future<void> send(Uint8List ciphertext, {required int counter});
 
   Future<void> close();
+}
+
+/// Optional lifecycle hooks for transports with lease-backed Control recovery.
+/// The secure-channel owner marks readiness only after registering its receiver.
+abstract interface class LeaseAwareTransport implements SecureHandshakeTransport {
+  void markSecureReady();
+
+  /// Check Control liveness on foreground/network kicks, independent of RPC
+  /// traffic on a still healthy data plane.
+  void checkControlHealth();
 }
 
 /// Thrown while establishing a transport (Control handshake, connect

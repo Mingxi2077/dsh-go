@@ -1,4 +1,11 @@
 {
+  "browserPreview": "Preview web page",
+  "browserPreviewSummary": "Open a local web page running on this computer",
+  "browserPreviewPort": "Port on the computer",
+  "browserPreviewInvalidPort": "Enter a port from 1 to 65535",
+  "browserPreviewPortUnreachable": "Could not connect to 127.0.0.1:{port} on the computer. Check that the web server is running.",
+  "@browserPreviewPortUnreachable": {"placeholders": {"port": {"type": "int"}}},
+  "browserPreviewFailed": "Could not open the preview.",
   "browserTitle": "Browser",
   "browserSummary": "Browse and quote into chats",
   "browserAddressHint": "Search or enter address",

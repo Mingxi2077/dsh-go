@@ -1,18 +1,6 @@
-// When phone control is done as a whole: the overlay goes, and the app comes
-// back to the conversation so the person reads the result there.
-//
-// "Done" is the turn's end, not a tool call's: the local engine's
-// `api-session/status` falling edge for the conversation, which
-// HostAlertTracker (notify/chat_alerts.dart) already turns into turn-end
-// alerts. The MCP bridge does not carry a conversation identity. Automatic
-// finish is therefore allowed only with one running local conversation in
-// that task's initial snapshot; unknown or ambiguous ownership uses the existing
-// idle timeout or the person's controls. Looking at a conversation is not
-// proof that it owns the phone. When the linked turn ends, the native side
-// closes the overlay and, with 「完成后返回 dsh-go」 on and the app in the
-// background, brings the app forward on that conversation. Where a vendor
-// blocks that, the turn's own notification is the way back
-// (an operational phone result, independent of ordinary turn notifications).
+// Native session tasks finish from the exact host run-end receipt. Legacy engines retain
+// the original single-candidate association. Both paths retain return preference,
+// foreground/bot routing and the existing native return/notification fallback.
 
 import 'dart:async';
 
@@ -21,6 +9,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../companion/companion_agent_phone_tools.dart' show companionPhoneWindow;
 import '../notify/chat_alerts.dart';
 import '../notify/notify_channel.dart';
 import '../l10n/l10n.dart';
@@ -28,6 +17,7 @@ import 'app_info.dart';
 import 'bots_state.dart';
 import 'chat_reveal.dart';
 import 'connection_state.dart';
+import 'hosts_state.dart';
 import 'notify_state.dart' show appForegroundProvider, notifyChannelProvider;
 import 'phone_state.dart';
 
@@ -173,6 +163,9 @@ class _DeferredPhoneEnd {
 /// [phoneStopWatcherProvider] by the home shell, so it has seen the task begin.
 class PhoneTurnEndController extends Notifier<void> {
   final link = PhoneTurnLink();
+  bool _sessionTasks = false;
+  final _nativeEnds = <(int, String, int)>{};
+  final _nativeLatest = <String, int>{};
   Object _lifetime = Object();
   _OwnerRead? _reading;
   DshClient? _ownerClient;
@@ -191,6 +184,8 @@ class PhoneTurnEndController extends Notifier<void> {
       final next = after.value?.client;
       if (old != null && !identical(old, next)) {
         link.invalidate();
+        _nativeEnds.clear();
+        _nativeLatest.clear();
         final reading = _reading;
         if (reading != null) _retireRead(reading);
         _ownerClient = null;
@@ -235,19 +230,92 @@ class PhoneTurnEndController extends Notifier<void> {
   }
 
   void _onStatus(PhoneStatus status) {
+    if (status.taskProtocol == 1) {
+      for (final task in status.tasks) {
+        final id = task.id, session = task.sessionId;
+        if (id == null || id <= 0 || session == null) continue;
+        final latest = _nativeLatest[session];
+        if (latest == null || id > latest) _nativeLatest[session] = id;
+      }
+      for (final task in status.tasks) {
+        final id = task.id, run = task.endedRunId, generation = task.endedGeneration;
+        if (id != null && id > 0 && task.sessionId != null && run != null && generation != null &&
+            _nativeEnds.add((id, run, generation))) {
+          unawaited(_nativeEnded(task));
+        }
+      }
+    }
+    final legacy = status.taskProtocol == 1
+        ? status.tasks.where((task) => task.sessionId == null).firstOrNull ?? const PhoneTaskStatus()
+        : status.task;
+    _sessionTasks = status.taskProtocol == 1 && !legacy.active && !legacy.stopped;
+    if (_sessionTasks) {
+      link.invalidate();
+      final reading = _reading;
+      if (reading != null) _retireRead(reading);
+      return;
+    }
     _trace(
-      'task=${status.task.id} event=status active=${status.task.active} stopped=${status.task.stopped} paused=${status.task.paused}',
+      'task=${legacy.id} event=status active=${legacy.active} stopped=${legacy.stopped} paused=${legacy.paused}',
     );
-    if (link.onStatus(status.task)) {
+    if (link.onStatus(legacy)) {
       final reading = _reading;
       if (reading != null) _retireRead(reading, invalidate: false);
       _ownerClient = null;
       _ownerGeneration = null;
       _trace('task=${link.taskId} event=begin');
-      unawaited(_snapshot(link.taskId!));
+      // iOS binds the task to the authenticated engine request at admission.
+      // A session-list snapshot is for legacy Android tasks with no owner; it
+      // can be ambiguous or still pending while the exact iOS owner is known.
+      final client = ref.read(localConnectionProvider).value?.client;
+      final owner = legacy.ownerSessionId;
+      if (owner != null && owner.isNotEmpty && client != null) {
+        _ownerClient = client;
+        _ownerGeneration = client.mux.generation;
+        link.began([owner]);
+      } else {
+        unawaited(_snapshot(link.taskId!));
+      }
     } else if (!link.armed) {
       final reading = _reading;
       if (reading != null) _retireRead(reading, invalidate: false);
+    }
+  }
+
+  Future<void> _nativeEnded(PhoneTaskStatus task) async {
+    final id = task.id!, session = task.sessionId!;
+    final lifetime = _lifetime;
+    final client = ref.read(localConnectionProvider).value?.client;
+    final generation = client?.mux.generation;
+    // A companion task goes back to her room (lib/ui/shell/system_entry_host.dart).
+    // Asked for from her floating self or her notification, it was outside the
+    // app: the person stays where the task left them, her reply in her bubble.
+    final companion = companionPhoneWindow(session);
+    final reopen = ref.read(phoneReturnPrefProvider) && !ref.read(appForegroundProvider) &&
+        (companion == null || companion == 'room');
+    final bot = companion == null && ref.read(dsBotSessionFilterProvider)(HostRef.local, session);
+    final result = await ref.read(phoneChannelProvider).finishTask(
+      taskId: id, sessionId: session, host: HostRef.local.encode(), reopen: reopen,
+      runId: task.endedRunId, generation: task.endedGeneration, appOnly: bot,
+    );
+    // No conversation to reveal, and a chat notification would open none.
+    if (companion != null) return;
+    if (!ref.mounted || !identical(_lifetime, lifetime) || !result.current ||
+        _nativeLatest[session] != id ||
+        !identical(ref.read(localConnectionProvider).value?.client, client) ||
+        !identical(client?.mux.generation, generation)) {
+      return;
+    }
+    if (result.opened && result.launched && !bot) ref.read(chatRevealProvider.notifier).reveal(session);
+    if (result.closed && reopen && !result.opened && !result.notified && !bot && !ref.read(appForegroundProvider)) {
+      await ref.read(notifyChannelProvider).tryShow(
+        NotifyPost(group: notifyGroup(HostRef.local, session), key: 'phone-$id', attention: true,
+          title: AppInfo.name, text: task.completion == 'completed' ? appL10n.phoneTaskResultReady : appL10n.phoneTaskEndedResult, publicText: appL10n.phoneTaskEndedResult,
+          sessionId: session, host: HostRef.local, kind: 'phone-result'),
+        stillCurrent: () => ref.mounted && identical(_lifetime, lifetime) && _nativeLatest[session] == id &&
+          !ref.read(appForegroundProvider) && identical(ref.read(localConnectionProvider).value?.client, client) &&
+          identical(client?.mux.generation, generation),
+      );
     }
   }
 
@@ -354,6 +422,7 @@ class PhoneTurnEndController extends Notifier<void> {
   /// then the overlay is closing (and the app maybe coming back to that
   /// conversation) and the future says how it went.
   Future<PhoneFinish>? onTurnEnd(ChatAlert alert) {
+    if (_sessionTasks) return null;
     if (!alert.host.isLocal || alert.key != turnKey || alert.turnEndKind == null) return null;
     final scope = ref;
     final lifetime = _lifetime;

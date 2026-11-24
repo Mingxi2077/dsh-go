@@ -5,11 +5,12 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
-import '../../../browser/browser_links.dart';
 import '../../../l10n/l10n.dart';
 import '../../../plugins/seams/seat_models.dart';
+import '../../common/app_dialog.dart';
 import '../../common/smooth_size.dart';
 import '../../theme/theme.dart';
 import 'island_gate.dart';
@@ -18,6 +19,11 @@ import 'island_host.dart';
 import 'island_messages.dart';
 import 'island_skeleton.dart';
 import 'island_theme.dart';
+
+/// How an island's WebView is drawn before it is ready. Fully see-through would
+/// mean not drawn at all, and on iOS a platform view that isn't drawn leaves the
+/// window and has no size: DSH Web would have nothing to lay itself out for.
+double get _hiddenOpacity => defaultTargetPlatform == TargetPlatform.iOS ? 0.01 : 0;
 
 /// Probe islands: the size DSH Web lays itself out for, off screen.
 abstract final class IslandProbeMetrics {
@@ -242,7 +248,7 @@ class _IslandViewState extends ConsumerState<IslandView> {
     switch (message) {
       case IslandLink(:final url):
         if (await _confirmLink(context, url)) {
-          await BrowserLinks.open(url).catchError((_) => false);
+          await launchUrl(url, mode: LaunchMode.externalApplication).catchError((_) => false);
         }
       case IslandOpenSession(:final sessionId):
         await widget.onOpenSession?.call(sessionId);
@@ -267,7 +273,9 @@ class _IslandViewState extends ConsumerState<IslandView> {
       _release();
       _none = false;
     }
-    if (_closed) return _Closed(onReopen: _reopen);
+    if (_closed) {
+      return widget.spec.form == IslandForm.overlay ? widget.fallback(context) : _Closed(onReopen: _reopen);
+    }
     if (_none || _noRoom) return widget.fallback(context);
     final handle = _handle;
     if (handle == null) {
@@ -301,7 +309,7 @@ class _IslandViewState extends ConsumerState<IslandView> {
       IslandForm.overlay => IgnorePointer(
         ignoring: !ready,
         child: Opacity(
-          opacity: ready ? 1 : 0,
+          opacity: ready ? 1 : _hiddenOpacity,
           child: IslandHitRegion(rects: handle.hitRects, child: web),
         ),
       ),
@@ -316,7 +324,10 @@ class _IslandViewState extends ConsumerState<IslandView> {
             maxWidth: IslandProbeMetrics.width,
             minHeight: IslandProbeMetrics.height,
             maxHeight: IslandProbeMetrics.height,
-            child: Opacity(opacity: 0, child: IgnorePointer(child: web)),
+            child: Opacity(
+              opacity: _hiddenOpacity,
+              child: IgnorePointer(child: web),
+            ),
           ),
         ),
       ),
@@ -336,7 +347,7 @@ class _IslandViewState extends ConsumerState<IslandView> {
     children: [
       IgnorePointer(
         ignoring: !ready,
-        child: Opacity(opacity: ready ? 1 : 0, child: web),
+        child: Opacity(opacity: ready ? 1 : _hiddenOpacity, child: web),
       ),
       IgnorePointer(
         child: AnimatedOpacity(
@@ -384,7 +395,7 @@ class _Closed extends StatelessWidget {
 /// 「在浏览器打开 example.com？」
 Future<bool> _confirmLink(BuildContext context, Uri url) async {
   final l10n = context.l10n;
-  final ok = await showDialog<bool>(
+  final ok = await showAppDialog<bool>(
     context: context,
     builder: (dialog) => AlertDialog(
       title: Text(l10n.pluginsOpenBrowserHost(url.host)),
